@@ -133,7 +133,9 @@ def main() -> None:
                                                  "" if run else " (not started)"))
         return build_app(mgr)
 
-    web.run_app(make_app(), host=host, port=a.port, print=None)
+    # shutdown_timeout: open browser connections are closed in on_shutdown; this
+    # only bounds stragglers, well inside the 10 s before `lumix server stop` SIGKILLs
+    web.run_app(make_app(), host=host, port=a.port, print=None, shutdown_timeout=3.0)
 
 
 def re_id(s: str) -> bool:

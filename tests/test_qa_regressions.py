@@ -153,3 +153,30 @@ class FriendlyErrorTest(unittest.TestCase):
         self.assertIn("does not answer", _friendly_error(CamError("TimeoutError: "), "1.2.3.4"))
         self.assertIn("does not answer", _friendly_error(asyncio.TimeoutError(), "1.2.3.4"))
         self.assertEqual(_friendly_error(CamError("HTTP 500 for /x"), "1.2.3.4"), "HTTP 500 for /x")
+
+
+class ShutdownClosesStreamsTest(EmuTestCase):
+    def test_open_ws_and_mjpeg_end_on_shutdown(self):
+        r = self.rig
+
+        async def go():
+            import aiohttp
+            from server.app import OPEN_STREAMS, close_streams
+            await r.wait(lambda: r.sess.cam.liveview.age is not None, 10, "frames")
+            ws = await r.client.ws_connect("/api/ws")
+            await ws.receive()                              # cameras snapshot
+            mj = await r.client.get("/api/liveview.mjpg")
+            await mj.content.readuntil(b"\r\n")              # stream is flowing
+            app = r.client.server.app
+            await r.wait(lambda: len(app[OPEN_STREAMS]) == 2, 5, "both streams registered")
+            await close_streams(app)
+            while True:                                     # status ticks may be queued
+                msg = await asyncio.wait_for(ws.receive(), 3)
+                if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                    break
+            self.assertEqual((msg.type, msg.data), (aiohttp.WSMsgType.CLOSE, 1001))   # GOING_AWAY
+            rest = await asyncio.wait_for(mj.content.read(), 3)   # EOF instead of hanging
+            self.assertIsInstance(rest, bytes)
+            mj.close()
+            await ws.close()
+        self.run_(go(), 30)

@@ -13,7 +13,7 @@ import logging
 import os
 from typing import Any, Callable, Dict, List, Optional
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSCloseCode, WSMsgType, web
 
 from lumix.camera import Busy, Camera
 from lumix.liveview import FrameSource
@@ -24,6 +24,9 @@ log = logging.getLogger("server")
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 SESSIONS = web.AppKey("sessions", SessionManager)
+# Long-lived responses (WebSockets, MJPEG streams), closed first on shutdown so a
+# browser tab never holds the graceful stop past `lumix server stop`'s SIGKILL.
+OPEN_STREAMS = web.AppKey("open_streams", set)
 CAMERA_PREFIX = "/api/cameras/{cam}"
 
 # Quick controls are looked up by the camera's own cmd_type, so they follow
@@ -292,6 +295,8 @@ async def mjpeg(request: web.Request) -> web.StreamResponse:
         "Content-Type": "multipart/x-mixed-replace; boundary=%s" % boundary,
         "Cache-Control": "no-store", "Pragma": "no-cache"})
     await resp.prepare(request)
+    task = asyncio.current_task()
+    request.app[OPEN_STREAMS].add(task)
     src.viewers += 1
     seq = 0
     try:
@@ -306,6 +311,7 @@ async def mjpeg(request: web.Request) -> web.StreamResponse:
         pass
     finally:
         src.viewers -= 1
+        request.app[OPEN_STREAMS].discard(task)
     return resp
 
 
@@ -315,6 +321,15 @@ async def ws(request: web.Request) -> web.WebSocketResponse:
     sess = session(request) if not alias else mgr.active()
     sock = web.WebSocketResponse(heartbeat=20)
     await sock.prepare(request)
+    request.app[OPEN_STREAMS].add(sock)
+    try:
+        return await _ws_session(request, mgr, alias, sess, sock)
+    finally:
+        request.app[OPEN_STREAMS].discard(sock)
+
+
+async def _ws_session(request: web.Request, mgr: SessionManager, alias: bool,
+                      sess: Optional[CameraSession], sock: web.WebSocketResponse) -> web.WebSocketResponse:
     if sess is None:
         await sock.send_json({"type": "status", "data": NO_CAMERA_STATUS})
         await sock.send_json({"type": "cameras", "data": {"active": None, "cameras": []}})
@@ -365,6 +380,7 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
         mgr = SessionManager.single(mgr)
     app = web.Application()
     app[SESSIONS] = mgr
+    app[OPEN_STREAMS] = set()
     r = app.router
     r.add_get("/", index)
     r.add_get("/manifest.webmanifest", manifest)
@@ -413,6 +429,9 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
         await mgr.start()
 
     async def on_shutdown(app: web.Application) -> None:
+        # Browser tabs first: open WebSockets / MJPEG streams would otherwise keep
+        # the graceful stop waiting until the SIGKILL.
+        await close_streams(app)
         # SIGTERM/SIGINT: checkpoint imports, pause timelapses, stop recordings,
         # live view and event subscriptions before the sessions go away. Bounded:
         # `lumix server stop` / a new server SIGKILLs after 10 s.
@@ -425,3 +444,17 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
     app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     return app
+
+
+async def close_streams(app: web.Application) -> None:
+    """Close every open WebSocket (GOING_AWAY) and end every MJPEG stream."""
+    items = list(app[OPEN_STREAMS])
+    socks = [x for x in items if isinstance(x, web.WebSocketResponse)]
+    tasks = [x for x in items if isinstance(x, asyncio.Task)]
+    for t in tasks:
+        t.cancel()
+    if socks:
+        await asyncio.wait([asyncio.ensure_future(w.close(code=WSCloseCode.GOING_AWAY,
+                                                          message=b"server shutdown"))
+                            for w in socks], timeout=2)
+    app[OPEN_STREAMS].clear()
