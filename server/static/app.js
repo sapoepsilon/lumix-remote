@@ -535,6 +535,7 @@ async function toggleRec() {
 function shutterPressed() {
   if (state.mode === "photo") shoot();
   else if (state.mode === "video") toggleRec();
+  else if (state.mode === "timelapse") tlShutter();
 }
 
 // ---------------------------------------------------------------- modes
@@ -544,11 +545,12 @@ function setMode(m, quiet) {
   state.mode = m;
   LS.set("mode", m);
   $("app").dataset.mode = m;
-  $("tlcard").hidden = m !== "timelapse";
+  $("tlpanel").hidden = m !== "timelapse";
   const btns = [...$("modestrack").children];
   btns.forEach((b) => b.classList.toggle("on", b.dataset.mode === m));
   positionModes();
-  $("btnshutter").title = m === "video" ? "Start / stop video (R)" : m === "photo" ? "Take photo (Space)" : "Timelapse is coming soon";
+  $("btnshutter").title = m === "video" ? "Start / stop video (R)" : m === "photo" ? "Take photo (Space)" : "Start / stop timelapse (Space)";
+  if (m === "timelapse") loadTimelapse();
   if (changed && !quiet) {
     haptic();
     if (state.auto.on && m !== "timelapse" && state.auto.target !== m) setAutoTarget(m);
@@ -621,7 +623,6 @@ function lvPoint(ev) {
 }
 
 async function touchFocus(ev) {
-  if (state.mode === "timelapse") return;
   const p = lvPoint(ev);
   if (!p) return;
   const fm = byType("focusmode");
@@ -735,11 +736,15 @@ function wireSheet() {
   paintSeg();
   $("btnreconnect2").addEventListener("click", () => reconnect());
   $("btnsetup").addEventListener("click", () => { closeSheet(); state.skipConnect = false; $("connect").hidden = false; });
-  $("btnpower").addEventListener("click", () => $("powerdlg").showModal());
+  $("btnpower").addEventListener("click", openPowerSheet);
   $("powerdlg").addEventListener("close", async () => {
     if ($("powerdlg").returnValue !== "ok") return;
-    try { const r = await api("/api/power/off", { confirm: true }); toast("Power off: " + r.result); }
-    catch (e) { toast(e.message, true); }
+    try {
+      const r = await api("/api/power/off", { confirm: true });
+      const q = r.quiesce || {};
+      const paused = (q.paused || []).map((x) => x.label);
+      toast(r.result === "ok" ? "Camera powering off" + (paused.length ? ` · paused ${paused.join(", ")}` : "") : "Power off: " + r.result, r.result !== "ok");
+    } catch (e) { toast(e.message, true); }
   });
 }
 
@@ -918,6 +923,11 @@ async function pollJob(id, n) {
     $("jobsub").textContent = (done !== null ? `${done} / ${total}` : `${Math.round(p * 100)}%`) + bytes + skipped;
     if (j.current) $("jobtitle").textContent = `Importing ${j.current}`;
     const st = String(j.state || j.status || "").toLowerCase();
+    if (st === "paused") {
+      $("jobtitle").textContent = "Import paused";
+      $("jobsub").textContent = `${done !== null ? done : 0} / ${total} saved · continues next time you open Files`;
+      break;
+    }
     if (st === "done" || st === "done_with_errors") {
       const failed = j.files_failed || 0;
       $("jobtitle").textContent = failed ? `Imported with ${failed} error${failed === 1 ? "" : "s"}` : "Imported";
@@ -1033,7 +1043,7 @@ function resetForCamera() {
   img.removeAttribute("src");
   img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now();
   connectWs();
-  loadSettings(); loadConnection(); loadPresets();
+  loadSettings(); loadConnection(); loadPresets(); tl.status = null; loadTimelapse();
 }
 
 async function switchCamera(id, fromList) {
@@ -1404,6 +1414,192 @@ function wireWizard() {
   });
 }
 
+// ---------------------------------------------------------------- timelapse
+const TL_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600];
+const TL_COUNTS = [30, 60, 120, 240, 360, 720, 1440];
+const TL_DURATIONS = [300, 600, 1800, 3600, 7200, 14400, 28800];
+const tl = {
+  status: null, skew: 0, busy: false,
+  cfg: Object.assign({ engine: "server", interval: 10, lenmode: "count", count: 360, duration: 3600,
+    ae_lock: false, import: false, video: false, later: false, start: "" }, LS.get("tlcfg", {})),
+};
+const TL_ACTIVE = ["scheduled", "running", "paused", "stopping", "importing", "assembling"];
+function fmtSecs(s) {
+  if (s < 60) return s + "s";
+  if (s < 3600) return (s % 60 ? (s / 60).toFixed(1) : s / 60) + "m";
+  return (s % 3600 ? (s / 3600).toFixed(1) : s / 3600) + "h";
+}
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : m ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+function tlJob() { return tl.status && tl.status.job; }
+function tlActive() { const j = tlJob(); return !!(j && TL_ACTIVE.includes(j.state)); }
+async function loadTimelapse() {
+  try { renderTimelapse(await api("/api/timelapse")); } catch (_) { /* older server / no camera */ }
+}
+function saveTlCfg() { LS.set("tlcfg", tl.cfg); }
+function chipRow(box, values, cur, fmt, onPick) {
+  box.replaceChildren(...values.map((v) => el("button", {
+    class: "chip" + (v === cur ? " on" : ""), onclick: () => { haptic(); onPick(v); },
+  }, fmt(v))));
+  const on = box.querySelector(".chip.on");
+  if (on) on.scrollIntoView({ block: "nearest", inline: "center" });
+}
+function renderTlSetup() {
+  const c = tl.cfg, caps = (tl.status && tl.status.capabilities) || {};
+  if (!caps.native && c.engine === "native") c.engine = "server";
+  [...$("tlengine").children].forEach((b) => {
+    b.classList.toggle("on", b.dataset.v === c.engine);
+    b.disabled = b.dataset.v === "native" && caps.native === false;
+  });
+  chipRow($("tlinterval"), TL_INTERVALS, c.interval, fmtSecs, (v) => { c.interval = v; saveTlCfg(); renderTlSetup(); });
+  [...$("tllenmode").children].forEach((b) => b.classList.toggle("on", b.dataset.v === c.lenmode));
+  if (c.lenmode === "count") chipRow($("tllength"), TL_COUNTS, c.count, String, (v) => { c.count = v; saveTlCfg(); renderTlSetup(); });
+  else chipRow($("tllength"), TL_DURATIONS, c.duration, fmtSecs, (v) => { c.duration = v; saveTlCfg(); renderTlSetup(); });
+  for (const b of $("tlopts").querySelectorAll(".tl-opt")) {
+    const k = b.dataset.opt;
+    b.classList.toggle("on", !!c[k]);
+    b.setAttribute("aria-pressed", c[k] ? "true" : "false");
+    if (k === "video") b.disabled = caps.ffmpeg === false;
+    if (k === "ae_lock") b.disabled = c.engine === "native";
+  }
+  $("tlstart").hidden = !c.later;
+  if (c.later && !$("tlstart").value) $("tlstart").value = c.start || new Date(Date.now() + 3600e3).toTimeString().slice(0, 5);
+  const shots = c.lenmode === "count" ? c.count : Math.floor(c.duration / c.interval) + 1;
+  const run = (shots - 1) * c.interval;
+  const clip = shots / 24;
+  $("tlsum").replaceChildren(el("b", {}, `${shots} shots`), ` · ${fmtDur(run)} · `, el("b", {}, `${clip < 10 ? clip.toFixed(1) : Math.round(clip)} s`), " clip at 24 fps",
+    c.import || c.video ? ` · ${c.video ? "MP4" : "frames"} in ~/Pictures/Lumix` : "",
+    caps.ffmpeg === false && c.video ? " (ffmpeg missing)" : "");
+}
+function renderTlLast() {
+  const j = tlJob(), box = $("tllast");
+  if (!j || TL_ACTIVE.includes(j.state)) { box.hidden = true; return; }
+  const bad = j.state === "failed" || !!j.video_error || !!j.import_error;
+  box.className = "tl-last" + (bad ? " bad" : "");
+  const what = j.video_path ? j.video_path.split("/").slice(-1)[0] : j.frames_total ? `${j.frames_total} frames in ${j.folder.replace(/^.*\/Pictures\//, "~/Pictures/")}` : "frames on the camera's card";
+  const extra = j.video_error || j.import_error || (j.state === "failed" && (j.errors || []).slice(-1)[0]) || "";
+  box.replaceChildren(el("b", {}, `Last run ${j.state}: `), `${j.shots} shots${(j.skipped || 0) + (j.missed || 0) ? ` (${(j.skipped || 0) + (j.missed || 0)} skipped)` : ""} → ${what}`, extra ? ` · ${extra}` : "");
+  box.hidden = false;
+}
+function renderTimelapse(d) {
+  if (d) { tl.status = d; const j = d.job; if (j && j.now) tl.skew = j.now - Date.now() / 1000; }
+  const j = tlJob();
+  const active = tlActive();
+  $("app").classList.toggle("tl-running", !!(j && ["scheduled", "running", "paused"].includes(j.state)));
+  $("tlsetup").hidden = active;
+  $("tlrun").hidden = !active;
+  if (!active) { renderTlSetup(); renderTlLast(); return; }
+  const p = $("tlpanel");
+  p.classList.toggle("paused", j.state === "paused");
+  p.classList.toggle("waiting", !!j.waiting);
+  const C = 326.73;
+  $("tlringfg").style.strokeDashoffset = String(C * (1 - Math.min(1, j.progress || 0)));
+  $("tlring").setAttribute("aria-valuenow", String(Math.round((j.progress || 0) * 100)));
+  $("tlshots").textContent = j.shots;
+  $("tltarget").textContent = j.target ? `of ${j.target}` : "shots";
+  const names = { scheduled: "Starts soon", running: j.engine === "native" ? "In-camera run" : "Shooting", paused: "Paused",
+    stopping: "Stopping…", importing: "Importing frames…", assembling: "Making the video…" };
+  let title = names[j.state] || j.state;
+  if (j.state === "paused" && j.paused_by && j.paused_by !== "user") title += ` (${{ poweroff: "camera off", "server-stop": "server stopped", files: "browsing files" }[j.paused_by] || j.paused_by})`;
+  if (j.waiting) title = "Waiting: " + j.waiting.replace("camera ", "camera is ");
+  $("tlstate").textContent = title;
+  tlTick();
+  const sk = (j.skipped || 0) + (j.missed || 0);
+  const last = (j.skips || []).slice(-1)[0];
+  $("tlskip").textContent = sk ? `${sk} skipped${last ? " · " + last.reason : ""}` : (j.failed ? `${j.failed} failed` : `every ${fmtSecs(j.interval_s)}${j.ae_lock ? " · AE lock" : ""}${j.auto_import ? " · import" : ""}`);
+  const img = $("tlframe");
+  if (d && d.frame_url && j.frame_at) {
+    const src = cp(d.frame_url) + "?t=" + Math.round(j.frame_at * 1000);
+    if (img.dataset.src !== src) { img.dataset.src = src; img.src = src; }
+    img.hidden = false;
+  } else if (!j.has_frame) img.hidden = true;
+  $("tlpause").textContent = j.state === "paused" ? "Resume" : "Pause";
+  $("tlpause").disabled = !["scheduled", "running", "paused"].includes(j.state);
+  $("tlstop").disabled = !["scheduled", "running", "paused"].includes(j.state);
+}
+function tlTick() {
+  const j = tlJob();
+  if (!j || !tlActive()) return;
+  const now = Date.now() / 1000 + tl.skew;
+  if (["scheduled", "running"].includes(j.state) && j.eta_s !== null && j.eta_s !== undefined) {
+    const eta = Math.max(0, j.eta_s - (now - j.now));
+    $("tleta").textContent = `${fmtDur(eta)} left · done ${new Date((now + eta - tl.skew) * 1000).toTimeString().slice(0, 5)}`;
+  } else $("tleta").textContent = j.state === "paused" ? `${j.remaining ?? "?"} shots to go` : "";
+  if (j.state === "scheduled" && j.start_at) $("tlnext").textContent = `starts at ${new Date(j.start_at * 1000).toTimeString().slice(0, 5)}`;
+  else if (j.state === "running" && j.next_shot_at) $("tlnext").textContent = `next shot in ${Math.max(0, Math.ceil(j.next_shot_at - now))}s`;
+  else $("tlnext").textContent = j.state === "importing" ? `${j.frames_total || 0} of ${j.shots} imported` : "";
+}
+setInterval(() => { if (state.mode === "timelapse") tlTick(); }, 1000);
+async function tlCall(path, body, okMsg) {
+  if (tl.busy) return;
+  tl.busy = true;
+  try { renderTimelapse(await api(path, body)); if (okMsg) toast(okMsg); }
+  catch (e) { toast(e.message, true); }
+  finally { tl.busy = false; }
+}
+function tlStart() {
+  const c = tl.cfg;
+  const body = { interval: c.interval, native: c.engine === "native", ae_lock: c.engine !== "native" && c.ae_lock,
+    import: c.import || c.video, video: c.video };
+  if (c.lenmode === "count") body.count = c.count; else body.duration = c.duration;
+  if (c.later && $("tlstart").value) { c.start = $("tlstart").value; saveTlCfg(); body.start_at = c.start; }
+  haptic([8, 30, 8]);
+  return tlCall("/api/timelapse/start", body, c.later ? "Timelapse scheduled" : "Timelapse started");
+}
+function tlShutter() {
+  const j = tlJob();
+  if (j && ["scheduled", "running", "paused"].includes(j.state)) tlCall("/api/timelapse/stop", {}, "Timelapse stopped");
+  else if (!tlActive()) tlStart();
+}
+function wireTimelapse() {
+  $("tlengine").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b || b.disabled) return; tl.cfg.engine = b.dataset.v; saveTlCfg(); haptic(); renderTlSetup(); });
+  $("tllenmode").addEventListener("click", (e) => { const b = e.target.closest("button"); if (!b) return; tl.cfg.lenmode = b.dataset.v; saveTlCfg(); haptic(); renderTlSetup(); });
+  $("tlopts").addEventListener("click", (e) => {
+    const b = e.target.closest(".tl-opt"); if (!b || b.disabled) return;
+    const k = b.dataset.opt; tl.cfg[k] = !tl.cfg[k];
+    if (k === "video" && tl.cfg.video) tl.cfg.import = true;
+    if (k === "import" && !tl.cfg.import) tl.cfg.video = false;
+    saveTlCfg(); haptic(); renderTlSetup();
+  });
+  $("tlstart").addEventListener("change", () => { tl.cfg.start = $("tlstart").value; saveTlCfg(); });
+  $("tlpause").addEventListener("click", () => {
+    const j = tlJob(); if (!j) return;
+    tlCall(j.state === "paused" ? "/api/timelapse/resume" : "/api/timelapse/pause", {});
+  });
+  $("tlstop").addEventListener("click", () => tlCall("/api/timelapse/stop", {}, "Timelapse stopped"));
+}
+
+// ---------------------------------------------------------------- power-off sheet
+const PLAN_ICON = { import: "↓", recording: "●", timelapse: "⏱", liveview: "◉", events: "≋" };
+async function openPowerSheet() {
+  const list = $("powerplan");
+  list.replaceChildren(el("li", { class: "plan-empty" }, "Checking what's running…"));
+  $("powernote").hidden = true;
+  $("powerdlg").showModal();
+  let plan;
+  try { plan = await api("/api/power/plan"); } catch (e) { list.replaceChildren(el("li", { class: "plan-empty" }, e.message)); return; }
+  const items = plan.items || [];
+  const verb = { pause: "Pauses", stop: "Stops", unsubscribe: "Ends" };
+  list.replaceChildren(...(items.length ? items.map((it) => el("li", { class: it.action === "pause" ? "pause" : it.kind === "recording" ? "stop" : "quiet" },
+    el("span", { class: "plan-ico" }, PLAN_ICON[it.kind] || "•"),
+    el("span", { class: "plan-txt" }, el("b", {}, `${verb[it.action] || it.action}: ${it.label}`), it.detail ? el("small", {}, it.detail) : null)))
+    : [el("li", { class: "plan-empty" }, "Nothing running. Safe to power off.")]));
+  const resumable = items.some((it) => it.action === "pause");
+  if (resumable) {
+    $("powernote").textContent = plan.resume_on_reconnect ? "Paused work continues automatically when the camera is back on." : "Paused work stays paused until you resume it.";
+    $("powernote").hidden = false;
+  }
+}
+function quiesceToast(r) {
+  if (!r || r.reason === "poweroff" || r.reason === "server-stop") return;
+  const paused = (r.paused || []).map((x) => x.label), stopped = (r.stopped || []).map((x) => x.label);
+  if (!paused.length && !stopped.length) return;
+  toast((paused.length ? "Paused " + paused.join(", ") : "") + (stopped.length ? (paused.length ? " · stopped " : "Stopped ") + stopped.join(", ") : ""));
+}
+
 // ---------------------------------------------------------------- websocket
 let wsCur = null;
 function connectWs() {
@@ -1417,6 +1613,8 @@ function connectWs() {
     else if (msg.type === "exposure") { state.exposure = msg.data; renderQC(); }
     else if (msg.type === "settings") loadSettings();
     else if (msg.type === "preset") { state.auto = msg.data; renderAuto(); }
+    else if (msg.type === "timelapse") renderTimelapse(msg.data);
+    else if (msg.type === "quiesce") quiesceToast(msg.data);
     else if (msg.type === "event") addLog(msg.data);
     else if (msg.type === "events") { $("log").replaceChildren(); for (const ev of msg.data) addLog(ev); }
   };
@@ -1459,7 +1657,7 @@ function init() {
       return;
     }
     if (!$("files").hidden || !$("viewer").hidden || wz.open) return;
-    if (e.code === "Space") { e.preventDefault(); shoot(); }
+    if (e.code === "Space") { e.preventDefault(); if (state.mode === "timelapse") tlShutter(); else shoot(); }
     else if (k === "r" || k === "R") toggleRec();
     else if (k === "p" || k === "P") (sheetOpen() ? closeSheet() : openSheet());
     else if (k === "a" || k === "A") setAuto(!state.auto.on);
@@ -1471,6 +1669,7 @@ function init() {
   });
   wireCameras();
   wireWizard();
+  wireTimelapse();
   setMode(state.mode, true);
   renderChecklist(DEFAULT_STEPS);
   renderConnect({ status: "starting" });
@@ -1480,6 +1679,7 @@ function init() {
     loadSettings();
     loadConnection();
     loadPresets();
+    loadTimelapse();
     hashRoute();
   });
   window.addEventListener("hashchange", hashRoute);

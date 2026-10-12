@@ -43,12 +43,51 @@
       <img id="lvimg" alt="Live view">
       <div class="lv-empty" id="lvempty"><div class="spinner"></div><span id="lvemptytext">Waiting for live view…</span></div>
       <div class="touchmark" id="touchmark"></div>
-      <div class="tl-card glass" id="tlcard" hidden>
-        <div class="tl-icon">⏱</div>
-        <h3>Timelapse</h3>
-        <p>Interval shooting from here is coming soon.</p>
-      </div>
     </div>
+    <!-- timelapse panel: setup (pickers) or progress (ring, ETA, last frame) -->
+    <section class="tl-panel glass-strong" id="tlpanel" hidden aria-label="Timelapse">
+      <div id="tlsetup">
+        <div class="tl-head">
+          <b>Timelapse</b>
+          <div class="seg" id="tlengine" role="radiogroup" aria-label="Engine">
+            <button data-v="server" title="This Mac takes each photo">Mac</button><button data-v="native" title="The camera's own interval shooting">In-camera</button>
+          </div>
+        </div>
+        <div class="tl-row"><span class="tl-label">Every</span><div class="picker tl-picker" id="tlinterval"></div></div>
+        <div class="tl-row">
+          <div class="seg tl-lenmode" id="tllenmode"><button data-v="count">Shots</button><button data-v="duration">Time</button></div>
+          <div class="picker tl-picker" id="tllength"></div>
+        </div>
+        <div class="tl-opts" id="tlopts">
+          <button class="tl-opt" data-opt="ae_lock" title="Lock exposure and focus for the whole run">AE lock</button>
+          <button class="tl-opt" data-opt="import" title="Copy each frame to ~/Pictures/Lumix/&lt;date&gt;/timelapse-&lt;name&gt;/">Import</button>
+          <button class="tl-opt" data-opt="video" title="Assemble an MP4 with ffmpeg">MP4</button>
+          <button class="tl-opt" data-opt="later" title="Start at a set time">Later</button>
+          <input type="time" id="tlstart" class="tl-time" aria-label="Start time" hidden>
+        </div>
+        <p class="tl-sum" id="tlsum"></p>
+        <p class="tl-last" id="tllast" hidden></p>
+      </div>
+      <div id="tlrun" hidden>
+        <div class="tl-runrow">
+          <div class="ring" id="tlring" role="progressbar" aria-label="Timelapse progress">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><circle class="ring-bg" cx="60" cy="60" r="52"/><circle class="ring-fg" id="tlringfg" cx="60" cy="60" r="52"/></svg>
+            <div class="ring-txt"><b id="tlshots">0</b><small id="tltarget"></small></div>
+          </div>
+          <div class="tl-info">
+            <b id="tlstate">Running</b>
+            <span id="tleta"></span>
+            <small id="tlnext"></small>
+            <small id="tlskip"></small>
+          </div>
+          <img class="tl-frame" id="tlframe" alt="Last frame" hidden>
+        </div>
+        <div class="tl-actions">
+          <button class="tl-btn" id="tlpause">Pause</button>
+          <button class="tl-btn danger" id="tlstop">Stop</button>
+        </div>
+      </div>
+    </section>
     <div class="banner glass" id="banner" hidden>
       <span class="dot" id="bannerdot"></span><span id="bannertext"></span>
       <button class="link" id="bannerbtn">Reconnect</button>
@@ -225,7 +264,7 @@
         <span></span>
       </header>
       <div class="group keys">
-        <div class="cell"><b>Take photo</b><kbd>Space</kbd></div>
+        <div class="cell"><b>Take photo / start-stop timelapse</b><kbd>Space</kbd></div>
         <div class="cell"><b>Start / stop video</b><kbd>R</kbd></div>
         <div class="cell"><b>Photo / Video / Timelapse</b><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd></div>
         <div class="cell"><b>Previous / next mode</b><kbd>←</kbd><kbd>→</kbd></div>
@@ -379,10 +418,12 @@
   <div class="viewer-body" id="vbody"></div>
 </section>
 
-<dialog id="powerdlg" class="alert">
+<dialog id="powerdlg" class="alert power-sheet">
   <form method="dialog">
     <h3>Power off the camera?</h3>
     <p>You'll need to switch it on by hand afterwards. Wi-Fi can't wake it.</p>
+    <ul class="plan" id="powerplan" aria-live="polite"><li class="plan-empty">Checking what's running…</li></ul>
+    <p class="plan-note" id="powernote" hidden></p>
     <menu>
       <button value="cancel" autofocus>Cancel</button>
       <button value="ok" class="destructive">Power Off</button>
