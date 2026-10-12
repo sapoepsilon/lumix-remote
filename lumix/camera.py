@@ -35,6 +35,7 @@ from .protocol import CamError, CamTransport, Reply, parse_ddd, parse_state
 log = logging.getLogger("lumix.camera")
 
 CONFIG_DIR = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/lumix-remote"))
+SUBSCRIBE_SETTLE_S = 30.0      # max wait for the post-SUBSCRIBE mod_Play
 LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
 
 
@@ -126,6 +127,7 @@ class Camera:
         self._lv_backoff = 10.0
         self._busy_ended = False
         self._last_ok = time.monotonic()
+        self._mod_play = asyncio.Event()   # set by the mod_Play NOTIFY
         self._reconnect_req = asyncio.Event()
 
     # ------------------------------------------------------------------ utils
@@ -358,6 +360,8 @@ class Camera:
             await asyncio.sleep(1.0)
         self.log_event("conn", "access granted: %s" % r.text)
         # 3. event subscription, right after the accept (moves the S5 off "Connecting")
+        self._mod_play.clear()
+        sub_at = time.monotonic()
         await self._subscribe_safely(ip)
         await asyncio.sleep(0.2)
         # 4. read-only setup, as LUMIX Sync does it
@@ -371,7 +375,20 @@ class Camera:
         await self._refresh_state(strict=True)
         await t.cgi("setsetting", "device_name", self.cfg.device_name)
         self._last_ok = time.monotonic()
-        # 5. live view start (the only recmode at connect)
+        # 5. The SUBSCRIBE makes the S5 run its own switch into play mode, which
+        # ends with a mod_Play NOTIFY 5-22 s later. Any camcmd/stopstream sent
+        # before that answers err_critical and wedges the camera (seen at 20:41,
+        # 21:24, 22:01 and 22:45 on 2026-10-11). LUMIX Sync never sends recmode
+        # at connect, so it never hits this window. Wait for mod_Play.
+        left = SUBSCRIBE_SETTLE_S - (time.monotonic() - sub_at)
+        if left > 0 and not self._mod_play.is_set():
+            self._set_status("connecting", "waiting for the camera to settle after subscribing")
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._mod_play.wait(), left)
+        self.log_event("conn", "camera settled after SUBSCRIBE in %.1fs (%s)" % (
+            time.monotonic() - sub_at, "mod_Play" if self._mod_play.is_set() else "timeout"))
+        await self._refresh_state(strict=True)
+        # 6. live view start (the only recmode at connect)
         if self.liveview_wanted:
             await self.start_liveview("connect")
         self.connected_at = time.time()
@@ -477,7 +494,9 @@ class Camera:
             self.log_event("lv", "live view start (%s) skipped: camera %s"
                            % (reason, "in use" if self.body_busy else "wedged"))
             return False
-        await self.cmd("stopstream")
+        if self._lv_running:
+            # stopstream with no stream running answers err_critical on the S5
+            await self.cmd("stopstream")
         await self._refresh_state()
         # recmode only when needed: every recmode makes the camera echo
         # lens_Atta/mod_Rec, and recmode churn is part of how the S5 wedges
@@ -641,6 +660,8 @@ class Camera:
                 self.bus.publish("status", self.status_dict())
             elif value == "mod_Play":
                 self._lv_pending = None   # never pull the camera back to rec
+                self._lv_running = False
+                self._mod_play.set()
             # mod_Play: ignored on purpose (never pull the camera back to rec)
             if value.startswith("lens") and self.transport:
                 asyncio.ensure_future(self._safe(self.refresh_lens()))
