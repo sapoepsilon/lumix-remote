@@ -32,6 +32,8 @@ def out(args: argparse.Namespace, data: Any, human: Callable[[Any], Optional[str
 
 
 def _fmt_secs(v: Any) -> str:
+    if v is None or v == "":
+        return "-"
     try:
         s = int(v)
     except (TypeError, ValueError):
@@ -67,7 +69,12 @@ def fmt_status(st: Dict[str, Any]) -> str:
                                       "  [writing]" if sd.get("access") == "on" else ""))
     rec = "recording %s" % (_fmt_secs(st.get("rec_progress")) if st.get("recording") else "no")
     rows.append("  mode       %s, %s" % (st.get("cammode"), rec))
-    rows.append("  remaining  %s photos, video %s" % (st.get("remain_photos"), _fmt_secs(st.get("remain_video_s"))))
+    if st.get("remain_photos") is None and st.get("remain_video_s") is None:
+        rows.append("  remaining  - (not reported in %s)" % ("playback" if st.get("cammode") == "play"
+                                                           else "this state"))
+    else:
+        rows.append("  remaining  %s photos, video %s" % (st.get("remain_photos") or "-",
+                                                         _fmt_secs(st.get("remain_video_s"))))
     rows.append("  lens       %s" % st.get("lens"))
     if st.get("temperature"):
         rows.append("  temp       %s" % st["temperature"])
