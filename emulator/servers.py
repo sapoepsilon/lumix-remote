@@ -15,6 +15,7 @@ import re
 import socket
 from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
 from aiohttp import web
 
 from .camera import EmuCamera, EmuConfig, Identity
@@ -259,13 +260,16 @@ class EmulatorNode:
                 return resp
             pos = start
             rate = cam.cfg.dl_rate
-            while pos <= end:
-                n = min(65536 if not rate else max(1024, min(65536, int(rate / 10))), end - pos + 1)
-                await resp.write(cam.card.read(entry, variant, pos, n))
-                pos += n
-                if rate:
-                    await asyncio.sleep(n / rate)
-            await resp.write_eof()
+            try:
+                while pos <= end:
+                    n = min(65536 if not rate else max(1024, min(65536, int(rate / 10))), end - pos + 1)
+                    await resp.write(cam.card.read(entry, variant, pos, n))
+                    pos += n
+                    if rate:
+                        await asyncio.sleep(n / rate)
+                await resp.write_eof()
+            except (ConnectionResetError, aiohttp.ClientConnectionResetError):
+                pass        # the client stopped reading (paused / cancelled import)
             return resp
 
         app.router.add_route("GET", "/{name}", get_file)

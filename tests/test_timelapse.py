@@ -148,7 +148,11 @@ class ValidationTest(unittest.TestCase):
             self.assertTrue(await e2.auto_resume("reconnect"))
             self.assertEqual(e2.job.state, "running")
             self.assertIsNone(e2.job.anchor_t)       # re-anchored on the next slot
-        asyncio.new_event_loop().run_until_complete(go())
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(go())
+        finally:
+            loop.close()
 
 
 class ImportCheckpointTest(unittest.TestCase):
