@@ -4,17 +4,18 @@ POST /api/presets/auto      {"on": true|false, "target": "photo"|"video"}
 GET  /api/presets           current preset state (auto on/off, saved manual values)
 GET  /api/connection        status + remembered camera + camera-side setup steps
 POST /api/connection/reconnect  {"ip"?: "...", "forget"?: true}
+
+All of them also exist under /api/cameras/{cam}/... (see server.app.camera_route).
 """
 
 from __future__ import annotations
 
 from aiohttp import web
 
-from lumix.presets import AutoPreset
-from server.app import CAMERA, _body, _guard, _json
+from lumix import models
+from server.app import _body, _guard, _json, camera, camera_route, session
 
-AUTO = web.AppKey("auto_preset", AutoPreset)
-
+# Kept for older clients; the steps now come from the camera's model profile.
 CAMERA_STEPS = [
     "Menu → Setup (wrench) → Wi-Fi",
     "Wi-Fi Function → New Connection",
@@ -26,7 +27,7 @@ CAMERA_STEPS = [
 
 
 async def presets(request: web.Request) -> web.Response:
-    return _json({"auto": request.app[AUTO].to_dict()})
+    return _json({"auto": session(request).auto.to_dict()})
 
 
 @_guard
@@ -35,16 +36,25 @@ async def preset_auto(request: web.Request) -> web.Response:
     on = b.get("on", True)
     if not isinstance(on, bool):
         raise ValueError("on must be true or false")
-    return _json(await request.app[AUTO].set(on, str(b.get("target", "photo"))))
+    return _json(await session(request).auto.set(on, str(b.get("target", "photo"))))
 
 
 async def connection(request: web.Request) -> web.Response:
-    cam = request.app[CAMERA]
+    s = session(request)
+    cam = s.cam
     st = cam.status_dict()
-    return _json({"status": st["status"], "message": st["message"], "ip": cam.ip,
+    prof = cam.profile
+    if not cam.ddd and (s.entry.get("model") or "auto") == models.AUTO:
+        prof = models.S5     # not identified yet: show the verified body's exact menu paths
+    steps = [x["title"] for x in prof.setup_wifi] + ["Approve this device on the camera if it asks"]
+    return _json({"camera_id": s.id, "nickname": s.entry.get("nickname"),
+                  "status": st["status"], "message": st["message"], "ip": cam.ip,
                   "ip_fixed": cam.ip_fixed, "last_ip": cam._load_state().get("last_ip"),
                   "camera": st["camera"], "connected_at": st["connected_at"],
-                  "liveview": st["liveview"], "steps": CAMERA_STEPS})
+                  "liveview": st["liveview"], "steps": steps,
+                  "model": {"id": prof.id, "name": prof.name, "setup_wifi": prof.setup_wifi,
+                            "setup_ble": prof.setup_ble, "approve_hint": prof.approve_hint,
+                            "menu_assist": prof.to_dict()["menu_assist"]}})
 
 
 @_guard
@@ -53,14 +63,12 @@ async def reconnect(request: web.Request) -> web.Response:
     ip = b.get("ip")
     if ip is not None and not isinstance(ip, str):
         raise ValueError("ip must be a string")
-    request.app[CAMERA].request_reconnect(ip=(ip or "").strip() or None, forget=bool(b.get("forget")))
+    camera(request).request_reconnect(ip=(ip or "").strip() or None, forget=bool(b.get("forget")))
     return _json({"ok": True})
 
 
 def setup(app: web.Application) -> None:
-    app[AUTO] = AutoPreset(app[CAMERA])
-    r = app.router
-    r.add_get("/api/presets", presets)
-    r.add_post("/api/presets/auto", preset_auto)
-    r.add_get("/api/connection", connection)
-    r.add_post("/api/connection/reconnect", reconnect)
+    camera_route(app, "GET", "/api/presets", presets)
+    camera_route(app, "POST", "/api/presets/auto", preset_auto)
+    camera_route(app, "GET", "/api/connection", connection)
+    camera_route(app, "POST", "/api/connection/reconnect", reconnect)

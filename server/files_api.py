@@ -28,7 +28,10 @@ from lumix.files import FileBrowser, ModeError, NotFound
 
 log = logging.getLogger("server.files")
 
-FILES = web.AppKey("files", FileBrowser)
+
+def _fb(request: web.Request) -> FileBrowser:
+    from server.app import session  # late import: server.app imports this module
+    return session(request).files
 
 
 def _json(data: Any, status: int = 200) -> web.Response:
@@ -39,6 +42,8 @@ def _guard(fn):
     async def wrapper(request: web.Request) -> web.StreamResponse:
         try:
             return await fn(request)
+        except web.HTTPException:
+            raise
         except NotFound as e:
             return _json({"error": "not found: %s" % e}, 404)
         except (Busy, ModeError) as e:
@@ -58,24 +63,24 @@ def _guard(fn):
 @_guard
 async def list_files(request: web.Request) -> web.Response:
     q = request.query
-    return _json(await request.app[FILES].list(
+    return _json(await _fb(request).list(
         offset=int(q.get("offset", 0)), limit=int(q.get("limit", 60)), kind=q.get("kind", "all"),
         refresh=q.get("refresh") in ("1", "true", "yes")))
 
 
 async def files_status(request: web.Request) -> web.Response:
-    return _json(request.app[FILES].status())
+    return _json(_fb(request).status())
 
 
 @_guard
 async def done(request: web.Request) -> web.Response:
-    return _json(await request.app[FILES].leave())
+    return _json(await _fb(request).leave())
 
 
 def _image(which: str):
     @_guard
     async def handler(request: web.Request) -> web.Response:
-        body, ctype = await request.app[FILES].image(request.match_info["id"], which)
+        body, ctype = await _fb(request).image(request.match_info["id"], which)
         return web.Response(body=body, content_type=ctype,
                             headers={"Cache-Control": "private, max-age=3600"})
     return handler
@@ -88,7 +93,7 @@ def _disposition(name: str) -> str:
 
 @_guard
 async def download(request: web.Request) -> web.StreamResponse:
-    fb = request.app[FILES]
+    fb = _fb(request)
     variant = request.query.get("variant", "original")
     rng = request.headers.get("Range")
     async with fb.open_stream(request.match_info["id"], variant, rng) as (r, name, res):
@@ -127,16 +132,16 @@ async def start_import(request: web.Request) -> web.Response:
     ids = body["ids"]
     if not isinstance(ids, list):
         raise ValueError("ids must be a list")
-    job = request.app[FILES].start_import(ids, body.get("dest"), body.get("include_raw", True))
+    job = _fb(request).start_import(ids, body.get("dest"), body.get("include_raw", True))
     return _json(job.to_dict(), 202)
 
 
 async def list_jobs(request: web.Request) -> web.Response:
-    return _json([j.to_dict() for j in reversed(list(request.app[FILES].jobs.values()))])
+    return _json([j.to_dict() for j in reversed(list(_fb(request).jobs.values()))])
 
 
 async def get_job(request: web.Request) -> web.Response:
-    job = request.app[FILES].jobs.get(request.match_info["id"])
+    job = _fb(request).jobs.get(request.match_info["id"])
     if job is None:
         return _json({"error": "no such job"}, 404)
     return _json(job.to_dict())
@@ -144,7 +149,7 @@ async def get_job(request: web.Request) -> web.Response:
 
 async def cancel_job(request: web.Request) -> web.Response:
     try:
-        job = request.app[FILES].cancel_job(request.match_info["id"])
+        job = _fb(request).cancel_job(request.match_info["id"])
     except KeyError:
         return _json({"error": "no such job"}, 404)
     await asyncio.sleep(0.1)
@@ -152,26 +157,18 @@ async def cancel_job(request: web.Request) -> web.Response:
 
 
 def setup(app: web.Application) -> None:
-    from server.app import CAMERA  # late import: server.app imports this module
-    fb = FileBrowser(app[CAMERA])
-    app[FILES] = fb
-    r = app.router
-    r.add_get("/api/files", list_files)
-    r.add_get("/api/files/status", files_status)
-    r.add_post("/api/files/done", done)
-    r.add_post("/api/files/import", start_import)
-    r.add_get("/api/files/{id}/thumb", _image("thumb"))
-    r.add_get("/api/files/{id}/preview", _image("preview"))
-    r.add_get("/api/files/{id}/download", download)
-    r.add_get("/api/jobs", list_jobs)
-    r.add_get("/api/jobs/{id}", get_job)
-    r.add_post("/api/jobs/{id}/cancel", cancel_job)
-
-    async def on_startup(app: web.Application) -> None:
-        fb.start()
-
-    async def on_cleanup(app: web.Application) -> None:
-        await fb.stop()
-
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    """Routes; each camera session owns its FileBrowser (started with the session)."""
+    from server.app import camera_route  # late import: server.app imports this module
+    for method, path, handler in (
+        ("GET", "/api/files", list_files),
+        ("GET", "/api/files/status", files_status),
+        ("POST", "/api/files/done", done),
+        ("POST", "/api/files/import", start_import),
+        ("GET", "/api/files/{id}/thumb", _image("thumb")),
+        ("GET", "/api/files/{id}/preview", _image("preview")),
+        ("GET", "/api/files/{id}/download", download),
+        ("GET", "/api/jobs", list_jobs),
+        ("GET", "/api/jobs/{id}", get_job),
+        ("POST", "/api/jobs/{id}/cancel", cancel_job),
+    ):
+        camera_route(app, method, path, handler)

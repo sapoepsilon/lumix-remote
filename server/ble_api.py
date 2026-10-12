@@ -15,7 +15,14 @@ been wedged (camcmd/startstream answering err_busy, Camera.wedged) for longer
 than LUMIX_BLE_WEDGE_AFTER seconds (60), power-cycle it over BLE. Backoff
 doubles after each cycle that does not clear the wedge (LUMIX_BLE_BACKOFF, 120 s
 start), and at most LUMIX_BLE_MAX_PER_HOUR (3) cycles run per rolling hour.
-LUMIX_BLE_NAME pins the advertised name (e.g. S5-XXXXXX).
+LUMIX_BLE_NAME pins the advertised name (e.g. S5-XXXXXX) when the camera's
+registry entry has none.
+
+Per camera: every route also exists under /api/cameras/{cam}/ble/...; the
+subprocess gets LUMIX_CAMERA_ID so it reads and writes that camera's "ble"
+section of cameras.json. The watchdog switch is stored in the camera's
+settings ("watchdog"). One Bluetooth radio: BLE actions of all cameras are
+serialised by one lock.
 """
 
 from __future__ import annotations
@@ -31,7 +38,7 @@ from typing import Any, Deque, Dict, List, Optional
 from aiohttp import web
 
 from lumix.camera import Camera
-from server.app import CAMERA, _body, _guard, _json
+from server.app import _body, _guard, _json, camera_route, session
 
 log = logging.getLogger("server.ble")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -45,14 +52,19 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_on(name: str) -> bool:
+    return os.environ.get(name, "") in ("1", "true", "yes", "on")
+
+
 class BleManager:
-    def __init__(self, cam: Camera):
+    def __init__(self, cam: Camera, session: Any = None):
         self.cam = cam
-        self.name: Optional[str] = os.environ.get("LUMIX_BLE_NAME") or None
-        self.lock = asyncio.Lock()
+        self.session = session        # server.sessions.CameraSession (None: stand-alone)
+        self.lock: asyncio.Lock = session.mgr.ble_lock if session is not None else asyncio.Lock()
         self.running: Optional[str] = None
         self.history: Deque[Dict[str, Any]] = deque(maxlen=20)
-        self.watchdog_enabled = os.environ.get("LUMIX_BLE_WATCHDOG", "") in ("1", "true", "yes", "on")
+        settings = (session.entry.get("settings") or {}) if session is not None else {}
+        self.watchdog_enabled = bool(settings.get("watchdog")) or _env_on("LUMIX_BLE_WATCHDOG")
         self.wedge_after = _env_float("LUMIX_BLE_WEDGE_AFTER", 60)
         self.max_per_hour = int(_env_float("LUMIX_BLE_MAX_PER_HOUR", 3))
         self.backoff0 = _env_float("LUMIX_BLE_BACKOFF", 120)
@@ -62,18 +74,31 @@ class BleManager:
         self.watchdog_note = ""
         self._task: Optional[asyncio.Task] = None
 
+    @property
+    def name(self) -> Optional[str]:
+        """Advertised BLE name: the camera's registry entry, else LUMIX_BLE_NAME."""
+        if self.session is not None:
+            n = (self.session.reload().get("ble") or {}).get("name")
+            if n:
+                return n
+        return os.environ.get("LUMIX_BLE_NAME") or None
+
     # ---------------------------------------------------------------- runner
     async def run(self, *args: str, timeout: float = 240) -> Dict[str, Any]:
         if not os.access(BLE_BIN, os.X_OK):
             return {"ok": False, "error": "bin/lumix-ble missing"}
-        cmd = [BLE_BIN] + (["--name", self.name] if self.name else []) + list(args)
+        name = self.name
+        cmd = [BLE_BIN] + (["--name", name] if name else []) + list(args)
+        env = dict(os.environ)
+        if self.session is not None:
+            env["LUMIX_CAMERA_ID"] = self.session.id
         async with self.lock:
             self.running = args[0]
             t0 = time.time()
             self.cam.log_event("ble", "lumix-ble %s" % " ".join(args))
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
 
                 async def pump_err() -> List[str]:
                     lines: List[str] = []
@@ -103,6 +128,8 @@ class BleManager:
             entry = {"ts": t0, "cmd": args[0], "ok": bool(res.get("ok")),
                      "elapsed_s": round(time.time() - t0, 1), "error": res.get("error")}
             self.history.append(entry)
+            if self.session is not None:
+                self.session.reload()      # the subprocess may have updated cameras.json
             self.cam.log_event("ble", "%s -> %s (%.0fs)%s" % (
                 args[0], "ok" if entry["ok"] else "FAILED", entry["elapsed_s"],
                 (": %s" % entry["error"]) if entry["error"] else ""))
@@ -182,7 +209,7 @@ class BleManager:
     async def _watch_tick(self) -> None:
         cam = self.cam
         if not cam.wedged:
-            if self.backoff != self.backoff0 and cam.status == "connected":
+            if self.backoff != self.backoff0 and cam.status == "ready":
                 self.backoff = self.backoff0
             self.watchdog_note = ""
             return
@@ -210,7 +237,11 @@ class BleManager:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "name": self.name, "running": self.running, "history": list(self.history),
+            "camera_id": self.session.id if self.session is not None else None,
+            "name": self.name, "running": self.running, "busy": self.lock.locked(),
+            "registered": bool(((self.session.entry.get("ble") or {}) if self.session is not None
+                                else {}).get("registered_at")),
+            "history": list(self.history),
             "watchdog": {"enabled": self.watchdog_enabled, "wedge_after_s": self.wedge_after,
                          "max_per_hour": self.max_per_hour, "cycles_last_hour":
                          sum(1 for t in self.cycles if time.time() - t < 3600),
@@ -219,11 +250,12 @@ class BleManager:
         }
 
 
-BLE = web.AppKey("ble", BleManager)
+def _m(request: web.Request) -> BleManager:
+    return session(request).ble
 
 
 async def ble_status(request: web.Request) -> web.Response:
-    m = request.app[BLE]
+    m = _m(request)
     out = m.to_dict()
     if request.query.get("probe") in ("1", "true"):
         if m.lock.locked():
@@ -235,7 +267,7 @@ async def ble_status(request: web.Request) -> web.Response:
 
 @_guard
 async def ble_wake(request: web.Request) -> web.Response:
-    m = request.app[BLE]
+    m = _m(request)
     if m.lock.locked():
         return _json({"error": "BLE busy (%s)" % m.running}, 409)
     res = await m.wake()
@@ -244,7 +276,7 @@ async def ble_wake(request: web.Request) -> web.Response:
 
 @_guard
 async def ble_power_cycle(request: web.Request) -> web.Response:
-    m = request.app[BLE]
+    m = _m(request)
     if m.lock.locked():
         return _json({"error": "BLE busy (%s)" % m.running}, 409)
     res = await m.power_cycle("api")
@@ -253,10 +285,14 @@ async def ble_power_cycle(request: web.Request) -> web.Response:
 
 @_guard
 async def ble_register(request: web.Request) -> web.Response:
-    m = request.app[BLE]
+    m = _m(request)
     if m.lock.locked():
-        return _json({"error": "BLE busy (%s)" % m.running}, 409)
+        return _json({"error": "BLE busy (%s)" % (m.running or "another camera")}, 409)
     res = await m.run("register", timeout=420)
+    if res.get("ok"):
+        m.cam.log_event("ble", "Bluetooth registration done; this computer can now wake the camera")
+        if m.session is not None:
+            m.session.mgr.notify()
     return _json(res, 200 if res.get("ok") else 502)
 
 
@@ -266,26 +302,17 @@ async def ble_watchdog(request: web.Request) -> web.Response:
     on = b.get("enabled")
     if not isinstance(on, bool):
         raise ValueError("enabled must be true or false")
-    m = request.app[BLE]
+    m = _m(request)
     m.watchdog_enabled = on
+    if m.session is not None:
+        await m.session.mgr.update(m.session.id, settings={"watchdog": on})
     return _json(m.to_dict()["watchdog"])
 
 
 def setup(app: web.Application) -> None:
-    m = BleManager(app[CAMERA])
-    app[BLE] = m
-    r = app.router
-    r.add_get("/api/ble/status", ble_status)
-    r.add_post("/api/ble/wake", ble_wake)
-    r.add_post("/api/ble/power-cycle", ble_power_cycle)
-    r.add_post("/api/ble/watchdog", ble_watchdog)
-    r.add_post("/api/ble/register", ble_register)
-
-    async def on_startup(app: web.Application) -> None:
-        m.start()
-
-    async def on_cleanup(app: web.Application) -> None:
-        await m.stop()
-
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
+    """Routes; each camera session owns its BleManager (started with the session)."""
+    camera_route(app, "GET", "/api/ble/status", ble_status)
+    camera_route(app, "POST", "/api/ble/wake", ble_wake)
+    camera_route(app, "POST", "/api/ble/power-cycle", ble_power_cycle)
+    camera_route(app, "POST", "/api/ble/watchdog", ble_watchdog)
+    camera_route(app, "POST", "/api/ble/register", ble_register)
