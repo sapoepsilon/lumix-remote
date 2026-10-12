@@ -114,6 +114,13 @@ class Camera:
         self._log_fh = None
         self.powered_off = False
         self.rec_started_at: Optional[float] = None
+        # err_busy wedge tracking (see probe-results/FINDINGS.md "err_busy root cause")
+        self.busy_streak = 0               # consecutive err_busy/err_critical to camcmd/startstream
+        self.wedged = False                # camcmd stuck in err_busy; only a power cycle clears it
+        self.wedged_since: Optional[float] = None
+        self.body_busy = False             # camera NOTIFY "busy": someone is operating the body
+        # Called once per wedge episode (e.g. a Bluetooth power-cycle hook).
+        self.wedge_hooks: List[Any] = []
         self._reconnect_req = asyncio.Event()
 
     # ------------------------------------------------------------------ utils
@@ -130,6 +137,7 @@ class Camera:
         self.bus.publish("event", ev)
 
     def _trace(self, q: str, rep: Reply) -> None:
+        self._track_busy(q, rep)
         if self._log_fh is None:
             return
         if q == "mode=getstate" and rep.ok:
@@ -139,6 +147,31 @@ class Camera:
             _oneline(rep.text))
         self._log_fh.write(line)
         self._log_fh.flush()
+
+    def _track_busy(self, q: str, rep: Reply) -> None:
+        """Detect the S5 'camcmd wedge': every camcmd (and often startstream)
+        answers err_busy until the camera is power-cycled."""
+        if not (q.startswith("mode=camcmd") or q.startswith("mode=startstream")):
+            return
+        if "value=poweroff" in q:
+            return
+        if rep.result == "ok":
+            if self.wedged:
+                self.log_event("conn", "camera accepts commands again (wedge cleared)")
+            self.busy_streak = 0
+            self.wedged, self.wedged_since = False, None
+            return
+        if rep.result not in ("err_busy", "err_critical"):
+            return
+        self.busy_streak += 1
+        if self.busy_streak >= 4 and not self.wedged and not self.body_busy:
+            self.wedged, self.wedged_since = True, time.time()
+            self.log_event("warn", "camera is stuck answering err_busy to camcmd/startstream "
+                                   "(shutter, video, mode switch, live view). Only a camera "
+                                   "power cycle clears it.", wedged=True)
+            self.bus.publish("status", self.status_dict())
+            for hook in list(self.wedge_hooks):
+                asyncio.ensure_future(self._safe(hook(self)))
 
     def status_dict(self) -> Dict[str, Any]:
         st = self.state
@@ -157,6 +190,7 @@ class Camera:
             "temperature": st.get("temperature"), "lens": self.lens.get("name"),
             "liveview": self.liveview.stats(), "events_sub": bool(self.listener.sid),
             "powered_off": self.powered_off,
+            "wedged": self.wedged, "wedged_since": self.wedged_since, "body_busy": self.body_busy,
         }
 
     # ------------------------------------------------------------- lifecycle
@@ -297,11 +331,9 @@ class Camera:
         self.log_event("conn", "access granted: %s" % r.text)
         await t.cgi("setsetting", "device_name", self.cfg.device_name)
         # 3. event subscription (moves the S5 off its "Connecting" screen)
-        try:
-            sub = await self.listener.subscribe(ip)
-            self.log_event("conn", "event subscription: %s" % sub)
-        except (OSError, asyncio.TimeoutError) as e:
-            self.log_event("warn", "event subscription failed: %s" % e)
+        self.busy_streak = 0
+        self.wedged, self.wedged_since, self.body_busy = False, None, False
+        await self._subscribe_safely(ip)
         # 4. capabilities, menus, lens
         cap = await t.cgi("getinfo", "capability")
         self.capability = _capability_dict(cap)
@@ -350,6 +382,52 @@ class Camera:
         assert self.transport
         r = await self.transport.cgi("getinfo", "lens")
         self.lens = exposure.parse_lens(r.csv) if r.csv else {}
+
+    async def _subscribe_safely(self, ip: str) -> None:
+        """SUBSCRIBE only while the camera is in play mode, then let it settle.
+
+        On the S5 a fresh SUBSCRIBE while the camera is in *rec* mode makes it
+        switch itself to play; a recmode sent during that switch answers
+        err_critical and leaves every later camcmd answering err_busy until a
+        power cycle (reproduced 2026-10-11 21:24). After boot the camera is in
+        play mode, so the normal connect is unaffected; this matters for
+        re-subscribing on a running session.
+        """
+        assert self.transport
+        await self._refresh_state()
+        if self.state.get("cammode") == "rec":
+            r = await self.transport.cgi("camcmd", value="playmode")
+            for _ in range(10):
+                await asyncio.sleep(0.4)
+                await self._refresh_state()
+                if self.state.get("cammode") == "play":
+                    break
+            self.log_event("conn", "playmode before SUBSCRIBE -> %s (cammode=%s)"
+                           % (r.result, self.state.get("cammode")))
+        try:
+            sub = await self.listener.subscribe(ip)
+            self.log_event("conn", "event subscription: %s" % sub)
+        except (OSError, asyncio.TimeoutError) as e:
+            self.log_event("warn", "event subscription failed: %s" % e)
+            return
+        # Give the camera's own reaction to the subscription time to finish.
+        modes = []
+        for _ in range(6):
+            await asyncio.sleep(0.5)
+            await self._refresh_state()
+            modes.append(self.state.get("cammode"))
+        self.log_event("conn", "after SUBSCRIBE cammode %s" % "/".join(str(m) for m in modes))
+
+    async def _resubscribe(self) -> None:
+        """Subscription lost (renew refused): pause live view, re-subscribe from
+        play mode, then back to rec + live view."""
+        assert self.transport and self.ip
+        async with self.exclusive("resubscribe"):
+            await self.transport.cgi("stopstream", timeout=4)
+            await self._subscribe_safely(self.ip)
+            if self.liveview_wanted:
+                await self.ensure_rec()
+                await self._start_stream()
 
     async def ensure_rec(self) -> bool:
         """Put the camera in record mode. err_busy can mean 'already in rec'."""
@@ -431,7 +509,10 @@ class Camera:
                 if self.state.get("cammode") == "rec" and tick % 2 == 0:
                     await self.refresh_exposure()
                 if self.listener.needs_renew():
-                    await self.listener.renew()
+                    rr = await self.listener.renew(fallback=False)
+                    if rr.get("status") != 200:
+                        self.log_event("warn", "subscription renew refused (%s); re-subscribing" % rr)
+                        await self._resubscribe()
                 if self._menu_dirty.is_set() or time.monotonic() - last_menu > 15:
                     self._menu_dirty.clear()
                     last_menu = time.monotonic()
@@ -460,6 +541,8 @@ class Camera:
             self.log_event("notify", "%s=%s" % (name, value), name=name, value=value)
             if name == "X_Panasonic_Cam_Sync":
                 self._menu_dirty.set()
+                # "busy" = someone operates the camera body; "update"/lens_* when done
+                self.body_busy = value == "busy"
                 if value.startswith("lens") and self.transport:
                     asyncio.ensure_future(self._safe(self.refresh_lens()))
 

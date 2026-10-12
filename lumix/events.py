@@ -147,14 +147,22 @@ class EventListener:
                 self.timeout_s = int(m.group(1))
         return {"status": r["status"], "sid": self.sid, "callback_ip": me}
 
-    async def renew(self) -> Dict[str, object]:
-        """Renew with the SID; fall back to a fresh subscription."""
+    async def renew(self, fallback: bool = True) -> Dict[str, object]:
+        """Renew with the SID; optionally fall back to a fresh subscription.
+
+        Callers on the S5 should pass fallback=False and re-subscribe from play
+        mode themselves (a fresh SUBSCRIBE in rec mode wedges camcmd)."""
         if self.sid and self.sub_ip:
             r = await raw_request(self.sub_ip, 60606, "SUBSCRIBE", "/Server0/CMS_event", [
                 ("User-Agent", UA), ("SID", self.sid), ("TIMEOUT", "Second-%d" % self.timeout_s)])
             if r["status"] == 200:
                 self.sub_time = time.time()
                 return {"status": 200, "sid": self.sid, "renewed": True}
+            if not fallback:
+                self.sid = None
+                return {"status": r["status"], "sid": None, "renewed": False}
+        if not fallback:
+            return {"status": 0, "sid": None, "renewed": False}
         assert self.sub_ip
         return await self.subscribe(self.sub_ip)
 

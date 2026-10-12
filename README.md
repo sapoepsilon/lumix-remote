@@ -204,6 +204,39 @@ sources can be added.
 Aperture and shutter codes are APEX x 256: aperture `Av*256` (f = 2^(Av/2),
 `939/256` = F3.5), shutter `Tv*256` (t = 2^-Tv s, `3328/256` = 1/8000).
 
+### Files API (card browsing, download, import)
+
+The camera serves its card only in play mode, and live view only runs in rec
+mode. The first files request switches the camera to play mode and pauses live
+view; `POST /api/files/done`, or 120 s without any files request, switches back
+to rec mode and live view resumes. A running download or import keeps play
+mode (the idle timer waits). Mode switches take the camera lock, so they never
+interleave with a capture or setting change. If the camera refuses play mode
+the API answers 409 with the camera's reply (see Known issues).
+
+| Method & path | What |
+|---|---|
+| `GET /api/files?offset=0&limit=60&kind=all\|photo\|video` | `{total, items:[...]}`, newest first. `&refresh=1` re-reads the card |
+| `GET /api/files/{id}/thumb` | Thumbnail JPEG (camera `DT` file, cached) |
+| `GET /api/files/{id}/preview` | Large preview JPEG (camera `DL` file, cached; thumbnail if none) |
+| `GET /api/files/{id}/download?variant=original\|raw` | Streams the file with `Content-Disposition: attachment; filename=...`; `Range` is passed through (206) |
+| `POST /api/files/import` `{"ids":[...], "dest":"~/Pictures/Lumix", "include_raw":true}` | Background import, 202 + job. Files go to `<dest>/YYYY-MM-DD/<name>` (shot date); default dest `~/Pictures/Lumix`; a file with the same name and size is skipped; `.part` + Range resume on errors |
+| `GET /api/jobs`, `GET /api/jobs/{id}` | Job progress: `state` (`queued`, `running`, `done`, `done_with_errors`, `failed`, `cancelled`), `files_total/done/skipped/failed`, `bytes_total/done`, `progress` 0..1, `current`, `saved`, `errors` |
+| `POST /api/jobs/{id}/cancel` | Cancel an import |
+| `POST /api/files/done` | Leave file browsing: rec mode + live view |
+| `GET /api/files/status` | `{active, cammode, pins, idle_left_s, cached_items, last_error, jobs}` |
+
+Item: `{"id", "name", "kind": "photo"|"video", "date", "size", "has_raw",
+"thumb_url", "preview_url", "download_url", "raw_url"?}`. `raw_url` is only
+present for RAW+JPEG shots; a RAW-only shot has the `.RW2` as its original.
+The WebSocket also pushes `files` (status) and `job` (finished job) messages.
+Deleting files on the card is deliberately not implemented.
+
+How it works: `camcmd playmode`, then UPnP ContentDirectory `Browse` on
+`:60606/Server0/CDS_control` (recursive from ObjectID 0, 50 per page, listing
+cached for the browsing session and re-validated by `TotalMatches`); files come
+from `http://<camera>:50001/<DO|DL|DT><n>.<ext>`.
+
 ## Layout
 
 ```
@@ -217,6 +250,8 @@ lumix/            camera client library (no web code)
   exposure.py     aperture/shutter code tables, lens limits
   discovery.py    SSDP listener, ddd probe, subnet scan
   presets.py      Auto preset: save manual values, apply, restore
+  didl.py         ContentDirectory Browse SOAP + DIDL-Lite parser
+  files.py        FileBrowser: play-mode session, listing cache, thumbs, downloads, import jobs
 server/           aiohttp app (API, MJPEG, WebSocket) + static UI
   ui_api.py       /api/presets, /api/connection routes
   static/         web UI (index.html, app.js, style.css, manifest, icons)
@@ -247,9 +282,10 @@ tools/            stand-alone protocol probe
   multi-step operation against UI commands. Take it per step (one shot), not for
   the whole timelapse, so the UI stays usable between shots. `camera.op_owner`
   shows who holds it.
-- **Mode switching:** `camera.ensure_rec()` exists; a file browser would add an
-  `ensure_play()` and set `camera.liveview_wanted = False` while browsing (the
-  watchdog otherwise switches back to rec), restoring it afterwards.
+- **Mode switching:** `camera.ensure_rec()`; the file browser's
+  `FileBrowser.ensure_play()` sets `camera.liveview_wanted = False` while
+  browsing (the watchdog otherwise switches back to rec) and restores it in
+  `leave()`.
 - **Frame sources:** subclass `lumix.liveview.FrameSource`, call `publish(jpeg)`,
   register it in `app[SOURCES]["hdmi"]`; `/api/liveview.mjpg?source=hdmi` works.
 - **Features:** append a `setup(app)` to `server.app.FEATURES` to add routes.
@@ -258,10 +294,15 @@ tools/            stand-alone protocol probe
 
 ## Known issues
 
-- On the test S5, after a `mod_Play` event the camera started answering
-  `err_busy` to every `camcmd` (capture, video, recmode, playmode, oneshot_af)
-  while settings, touch and live view kept working. The UI shows a hint. A camera
-  power cycle (by hand) is the suspected fix; not yet confirmed.
+- **camcmd wedge (S5):** a UPnP `SUBSCRIBE` sent while the camera is in rec
+  mode makes it switch itself to play; a `recmode` landing during that switch
+  answers `err_critical`, and from then on every `camcmd` (capture, video,
+  recmode, playmode, AF) and often `startstream` answer `err_busy` until the
+  camera is power-cycled. Settings and touch keep working. Reproduced on a clean
+  boot; nothing in-band clears it (re-`accctrl`, re-subscribe, unsubscribe,
+  drive mode). The server now only subscribes from play mode and renews by SID;
+  it flags `"wedged": true` in `/api/status` after 4 straight `err_busy` replies
+  and calls `Camera.wedge_hooks` (used by the Bluetooth power-cycle watchdog).
 - No Bluetooth: power-on and auto-connect are not possible.
 - Kelvin white balance and photo-style fine adjustments (`__value__` parameters)
   are not editable yet.

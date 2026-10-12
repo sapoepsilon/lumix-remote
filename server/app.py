@@ -292,6 +292,8 @@ def build_app(cam: Camera) -> web.Application:
     r.add_get("/api/ws", ws)
     from server import ui_api  # presets + connection (imports this module)
     ui_api.setup(app)
+    from server import files_api  # card files + import jobs (imports this module)
+    files_api.setup(app)
     for setup in FEATURES:
         setup(app)
 
