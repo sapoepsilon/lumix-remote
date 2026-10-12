@@ -180,3 +180,20 @@ class ShutdownClosesStreamsTest(EmuTestCase):
             mj.close()
             await ws.close()
         self.run_(go(), 30)
+
+
+class IndexAssetVersionTest(unittest.TestCase):
+    def test_index_references_versioned_assets(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            from aiohttp.test_utils import make_mocked_request
+            from server.app import index
+            resp = loop.run_until_complete(index(make_mocked_request("GET", "/")))
+            html = resp.text
+            self.assertRegex(html, r'src="/static/app\.js\?v=[0-9a-f]+"')
+            self.assertRegex(html, r'href="/static/style\.css\?v=[0-9a-f]+"')
+            self.assertEqual(resp.headers["Cache-Control"], "no-cache")
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)

@@ -100,9 +100,26 @@ async def _body(request: web.Request) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------------ handlers
-async def index(request: web.Request) -> web.FileResponse:
-    return web.FileResponse(os.path.join(STATIC, "index.html"),
-                            headers={"Cache-Control": "no-cache"})
+def _asset_version() -> str:
+    """Changes whenever app.js / style.css change (cache-busting query)."""
+    m = 0.0
+    for name in ("app.js", "style.css"):
+        try:
+            m = max(m, os.path.getmtime(os.path.join(STATIC, name)))
+        except OSError:
+            pass
+    return "%x" % int(m)
+
+
+async def index(request: web.Request) -> web.Response:
+    # Versioned asset URLs: a home-screen web app must not keep running a cached
+    # app.js against a newer server.
+    with open(os.path.join(STATIC, "index.html"), encoding="utf-8") as f:
+        html = f.read()
+    v = _asset_version()
+    for asset in ("/static/app.js", "/static/style.css"):
+        html = html.replace('"%s"' % asset, '"%s?v=%s"' % (asset, v))
+    return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
 async def manifest(request: web.Request) -> web.FileResponse:
