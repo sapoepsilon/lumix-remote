@@ -252,3 +252,126 @@ class ShutterFromPlaybackTest(EmuTestCase):
             self.assertEqual(d.get("note"), "was not recording")
             self.assertFalse(any("video_recstop" in e["q"] for e in r.emu.log if e["kind"] == "cgi"))
         self.run_(go(), 40)
+
+
+def _subscribes(emu):
+    return [e for e in emu.log if e["kind"] == "upnp" and e["q"].startswith("SUBSCRIBE new")]
+
+
+class OneConnectOneHandshakeTest(EmuTestCase):
+    """2026-10-12 09:23-09:25 on the S5: a reconnect request that arrived while a
+    handshake was running stayed latched, and the supervisor threw the brand-new
+    session away ~1.5 s after "ready" ("Disconnected('reconnect requested')"),
+    three times in a row. Each round re-ran req_acc, SUBSCRIBE and the
+    playmode -> recmode switch: the window that wedges the camera."""
+
+    def _hook_mid_handshake(self, cam, action):
+        orig = cam.listener.subscribe
+        out = {}
+
+        async def subscribe(ip):
+            res = await orig(ip)
+            if "done" not in out:
+                out["done"] = True
+                out["result"] = await action()
+            return res
+        cam.listener.subscribe = subscribe
+        return out
+
+    def test_reconnect_request_during_connect_keeps_the_new_session(self):
+        r = self.rig
+
+        async def go():
+            cam = r.sess.cam
+            out = self._hook_mid_handshake(cam, lambda: r.call("POST", "/api/connection/reconnect", {}))
+            cam.request_reconnect()                       # one explicit reconnect while ready
+            await r.wait(lambda: "result" in out, 15, "reconnect POSTed mid-handshake")
+            st, d = out["result"]
+            self.assertEqual(st, 200)
+            await r.wait(lambda: cam.status == "ready", 20, "ready")
+            subs = len(_subscribes(r.emu))
+            lost = sum("connection lost" in e["text"] for e in cam.events)
+            await asyncio.sleep(4)                        # several supervisor ticks
+            self.assertEqual(cam.status, "ready")
+            self.assertEqual(len(_subscribes(r.emu)), subs, "the new session was torn down")
+            self.assertEqual(sum("connection lost" in e["text"] for e in cam.events), lost)
+            self.assertTrue(d.get("already_connecting"), d)
+            self.assertTrue(any("already connecting" in e["text"] for e in cam.events))
+        self.run_(go(), 60)
+
+    def test_reconnect_to_another_address_mid_connect_still_happens(self):
+        r = self.rig
+
+        async def go():
+            cam = r.sess.cam
+            out = self._hook_mid_handshake(cam, lambda: asyncio.sleep(0, cam.request_reconnect(ip="127.0.0.9")))
+            cam.request_reconnect()
+            await r.wait(lambda: "result" in out, 15, "second request mid-handshake")
+            self.assertTrue(out["result"])
+            await r.wait(lambda: cam.ip == "127.0.0.9" and cam.status != "ready", 15, "moved on")
+        self.run_(go(), 60)
+
+    def test_ble_wake_after_the_camera_already_connected_keeps_the_session(self):
+        r = self.rig
+
+        async def go():
+            cam = r.sess.cam
+            ble = r.sess.ble
+
+            async def fake_run(*args, **kw):
+                return {"ok": True, "ip": cam.ip}
+            ble.run = fake_run
+            subs = len(_subscribes(r.emu))
+            res = await ble.wake()
+            await asyncio.sleep(3)
+            self.assertEqual(cam.status, "ready")
+            self.assertEqual(len(_subscribes(r.emu)), subs, "BLE wake threw the session away")
+            self.assertEqual(res.get("reconnect"), "already connected")
+        self.run_(go(), 30)
+
+
+class AccessRequestCancelTest(unittest.TestCase):
+    """LUMIX Sync cancels a req_acc the camera is still researching
+    (accctrl req_acc_can) instead of leaving the camera waiting for us."""
+
+    def test_stop_while_waiting_for_approval_sends_req_acc_can(self):
+        from emulator.camera import Identity
+        from emulator.servers import EmulatorNode
+        from test_timelapse_emu import emu_cfg, free_udp_port
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            async def go():
+                node = EmulatorNode("127.0.0.1", 0, 0, 0, 0, Identity(), emu_cfg(approval="prompt"))
+                await node.start()
+                p = node.ports
+                cam = Camera(CameraConfig(ip="127.0.0.1", lv_port=free_udp_port(), event_port=0,
+                                          http_port=p["http"], upnp_port=p["upnp"], files_port=p["dl"],
+                                          scan=False, store=_MemStore()))
+                cam.start()
+                try:
+                    for _ in range(100):
+                        if cam.status == "waiting_approval":
+                            break
+                        await asyncio.sleep(0.1)
+                    self.assertEqual(cam.status, "waiting_approval")
+                finally:
+                    await cam.stop()
+                    await node.stop()
+                return [e for e in node.cam.log if e["kind"] == "cgi" and "type=req_acc_can" in e["q"]]
+            cans = loop.run_until_complete(asyncio.wait_for(go(), 30))
+            self.assertEqual(len(cans), 1, cans)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+
+class _MemStore:
+    def __init__(self):
+        self.d = {}
+
+    def load(self):
+        return dict(self.d)
+
+    def save(self, **kw):
+        self.d.update(kw)

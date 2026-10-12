@@ -356,6 +356,7 @@ async function setAuto(on) {
 }
 
 // ---------------------------------------------------------------- status
+const HANDSHAKING = ["connecting", "waiting_approval"];   // a connect is running
 function statusInfo(s) {
   const st = s ? s.status : "offline";
   const msg = (s && s.message) || "";
@@ -428,7 +429,10 @@ function renderStatus(s) {
   // banner: dropped connection after first connect, or camera busy
   const busy = ready && !live && Date.now() - state.lastBusyAt < 30000;
   const banner = $("banner");
-  $("bannerbtn").hidden = false;
+  // no Reconnect while a handshake runs: it can take 30 s on the S5, and
+  // restarting it re-runs the SUBSCRIBE / mode-switch window that wedges the camera
+  const handshaking = HANDSHAKING.includes(s.status);
+  $("bannerbtn").hidden = handshaking;
   if (!ready && (state.everReady || state.skipConnect)) {
     banner.hidden = false; $("bannerdot").className = "dot " + info.dot; $("bannertext").textContent = info.title;
   } else if (ready && s.wedged) {
@@ -495,7 +499,7 @@ function renderConnect(s) {
     remBox.textContent = `Last camera: ${rem.model || ""} ${rem.name}${rem.ip ? " · " + rem.ip : ""}`;
   } else remBox.hidden = true;
   const none = s.status === "no_camera";
-  $("btnreconnect").hidden = none;
+  $("btnreconnect").hidden = none || HANDSHAKING.includes(s.status);
   $("btnwizard").textContent = none ? "Add a camera" : "Set up step by step";
   $("btnwizard").classList.toggle("primary", none);
   for (const d of c.querySelectorAll(".cs-more")) d.hidden = none;
@@ -516,7 +520,8 @@ function renderConnect(s) {
 async function reconnect(ip, forget) {
   haptic();
   try {
-    await api("/api/connection/reconnect", { ip: ip || null, forget: !!forget });
+    const r = await api("/api/connection/reconnect", { ip: ip || null, forget: !!forget });
+    if (r && r.already_connecting) { toast("Already connecting; the camera needs up to 30 s"); return; }
     toast(forget ? "Forgot the camera; searching again" : ip ? `Connecting to ${ip}…` : "Reconnecting…");
   } catch (e) { toast(e.message, true); }
 }
@@ -1586,6 +1591,10 @@ function renderTimelapse(d) {
   const sk = (j.skipped || 0) + (j.missed || 0);
   const last = (j.skips || []).slice(-1)[0];
   $("tlskip").textContent = sk ? `${sk} skipped${last ? " · " + last.reason : ""}` : (j.failed ? `${j.failed} failed` : `every ${fmtSecs(j.interval_s)}${j.ae_lock ? " · AE lock" : ""}${j.auto_import ? " · import" : ""}`);
+  // in-camera start refused: the server took over (job.message says why)
+  const fb = j.native && j.native.fallback;
+  if (fb) $("tlskip").textContent = "Camera wouldn't start its own interval; server-timed shots · " + $("tlskip").textContent;
+  if (fb && tl.fallbackShown !== j.id) { tl.fallbackShown = j.id; toast(j.message || "In-camera interval unavailable; the server is taking the shots", true); }
   const img = $("tlframe");
   if (d && d.frame_url && j.frame_at) {
     const src = cp(d.frame_url) + "?t=" + Math.round(j.frame_at * 1000);

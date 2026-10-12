@@ -143,7 +143,16 @@ class BleManager:
             args += ["--camera-ip", self.cam.ip]
         res = await self.run(*args)
         if res.get("ok"):
-            self.cam.request_reconnect(ip=res.get("ip") or None)
+            ip = res.get("ip") or None
+            cam = self.cam
+            if cam.status == "ready" and (ip is None or ip == cam.ip):
+                # The wake takes 30-90 s; the supervisor usually finds the camera
+                # and finishes the handshake before it returns. A reconnect now
+                # would throw that session away and run req_acc/SUBSCRIBE again.
+                res["reconnect"] = "already connected"
+            else:
+                res["reconnect"] = ("requested" if cam.request_reconnect(ip=ip)
+                                    else "already connecting")
         return res
 
     async def power_cycle(self, reason: str = "manual") -> Dict[str, Any]:

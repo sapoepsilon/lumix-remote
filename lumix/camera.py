@@ -161,6 +161,12 @@ class Camera:
         self._last_ok = time.monotonic()
         self._mod_play = asyncio.Event()   # set by the mod_Play NOTIFY
         self._reconnect_req = asyncio.Event()
+        # Address of the handshake in progress (None outside _connect): a
+        # reconnect request for the same camera during it is already satisfied.
+        self._connecting_ip: Optional[str] = None
+        # (type, value) of an accctrl request the camera is still researching:
+        # stop() cancels it with req_acc_can, as LUMIX Sync does.
+        self._acc_waiting: Optional[tuple] = None
         # Called (ensure_future) every time a connect reaches "ready": resume hooks.
         self.ready_hooks: List[Callable[["Camera"], Any]] = []
         # Set while an in-camera interval (time-lapse) run is armed or running:
@@ -177,7 +183,7 @@ class Camera:
     @property
     def interval_active(self) -> bool:
         return (self.interval_owner is not None
-                or self.state.get("interval_status") in ("run", "pause"))
+                or self.state.get("interval_status") in ("run", "rec", "pause"))  # S5 running = rec
 
     # ------------------------------------------------------------------ utils
     def _set_status(self, status: str, msg: str = "") -> None:
@@ -300,6 +306,7 @@ class Camera:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
         await self._cancel_background()
+        await self._cancel_access_request()
         if self.transport is not None:
             if self._lv_running or not self.profile.connect.stopstream_only_if_running:
                 # stopstream with no stream answers err_critical on the S5
@@ -367,9 +374,19 @@ class Camera:
                 self._set_status("error", repr(e))
                 await asyncio.sleep(5)
 
-    def request_reconnect(self, ip: Optional[str] = None, forget: bool = False) -> None:
+    def request_reconnect(self, ip: Optional[str] = None, forget: bool = False) -> bool:
         """Drop the session and connect again (to ``ip`` if given; ``forget``
-        clears the remembered camera so discovery starts from scratch)."""
+        clears the remembered camera so discovery starts from scratch).
+
+        While a handshake to the same camera is already running the request is
+        dropped (returns False): it used to stay latched and tear the brand-new
+        session down ~1 s after "ready", re-running req_acc, SUBSCRIBE and the
+        playmode/recmode switch that wedges the S5 (2026-10-12 09:23-09:25:
+        three needless full reconnects in a row). One connect = one handshake."""
+        if self._connecting_ip is not None and not forget and (not ip or ip == self._connecting_ip):
+            self.log_event("conn", "reconnect request ignored: already connecting to %s"
+                           % self._connecting_ip)
+            return False
         if forget:
             self._save_state(last_ip=None, udn=None)
             self.cfg.udn = None
@@ -380,6 +397,7 @@ class Camera:
         elif not self.ip_fixed and self.status != "ready":
             self.ip = None
         self._reconnect_req.set()
+        return True
 
     async def _pause(self, seconds: float) -> None:
         """Sleep, but wake up early on request_reconnect()."""
@@ -439,6 +457,17 @@ class Camera:
 
     # ------------------------------------------------------------- handshake
     async def _connect(self, ip: str) -> None:
+        # Requests made before this handshake started are satisfied by it; a
+        # leftover flag would drop the session right after "ready".
+        self._reconnect_req.clear()
+        self._acc_waiting = None
+        self._connecting_ip = ip
+        try:
+            await self._handshake(ip)
+        finally:
+            self._connecting_ip = None
+
+    async def _handshake(self, ip: str) -> None:
         """Connect in LUMIX Sync's order (docs/lumix-sync-wifi-flow.md section 4):
         ddd, req_acc (1 s loop), SUBSCRIBE, 200 ms, raw_img_send, capability,
         allmenu, curmenu, lens, touch_type, getstate, device_name; then the
@@ -479,13 +508,17 @@ class Camera:
         while True:
             r = await t.cgi("accctrl", acc_type, acc_v1, acc_v2)
             if r.text.startswith("ok,"):
+                self._acc_waiting = None
                 break
             if r.text.startswith("ok_under_research"):
+                self._acc_waiting = (acc_type, acc_v1)
                 hint = "" if "no_msg" in r.text else " (approve the connection on the camera)"
                 self._set_status("waiting_approval", "camera is registering this device" + hint)
             else:
+                self._acc_waiting = None
                 self._set_status("connecting", "req_acc -> %s" % r.text)
             if time.monotonic() > deadline:
+                await self._cancel_access_request()
                 raise CamError("access not granted: %s" % r.text)
             await asyncio.sleep(1.0)
         self.log_event("conn", "access granted: %s" % r.text)
@@ -532,6 +565,17 @@ class Camera:
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
         for hook in list(self.ready_hooks):
             self._spawn(hook(self))
+
+    async def _cancel_access_request(self) -> None:
+        """LUMIX Sync: giving up while the camera still researches our req_acc
+        (it may be showing an approve prompt) sends ``accctrl req_acc_can`` so
+        the camera does not keep waiting for a controller that is gone."""
+        pending, self._acc_waiting = self._acc_waiting, None
+        if pending is None or self.transport is None:
+            return
+        with contextlib.suppress(Exception):
+            r = await self.transport.cgi("accctrl", "req_acc_can", pending[1], timeout=2)
+            self.log_event("conn", "access request cancelled: req_acc_can -> %s" % r.text[:40])
 
     async def _access_values(self, t: CamTransport) -> "tuple[str, str, str]":
         """accctrl type and values for this body: plain req_acc, or LUMIX Sync's

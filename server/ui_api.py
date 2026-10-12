@@ -65,14 +65,16 @@ async def reconnect(request: web.Request) -> web.Response:
         raise ValueError("ip must be a string")
     sess = session(request)
     forget = bool(b.get("forget"))
-    sess.cam.request_reconnect(ip=(ip or "").strip() or None, forget=forget)
+    started = sess.cam.request_reconnect(ip=(ip or "").strip() or None, forget=forget)
     if forget and sess.entry.get("fixed_ip") and not ip:
         # "search from scratch" must not leave a fixed address behind in cameras.json
         # (the session would ignore it, and setting the same address again later
         # would not reconnect); this restarts the session without it
         from server.app import SESSIONS
         await request.app[SESSIONS].update(sess.id, fixed_ip=None)
-    return _json({"ok": True})
+    # already_connecting: a handshake to this camera is running; it is not
+    # restarted (that would re-run req_acc/SUBSCRIBE, the S5 wedge window)
+    return _json({"ok": True, "already_connecting": not started})
 
 
 def setup(app: web.Application) -> None:
