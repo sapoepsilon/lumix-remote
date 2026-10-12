@@ -268,7 +268,7 @@ class EmulatorNode:
                     if rate:
                         await asyncio.sleep(n / rate)
                 await resp.write_eof()
-            except (ConnectionResetError, aiohttp.ClientConnectionResetError):
+            except (ConnectionError, aiohttp.ClientConnectionResetError, aiohttp.ClientOSError):
                 pass        # the client stopped reading (paused / cancelled import)
             return resp
 
