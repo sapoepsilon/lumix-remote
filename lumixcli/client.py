@@ -50,8 +50,12 @@ class HttpError(CliError):
 class CameraError(CliError):
     """The camera answered something other than ok (err_busy, err_param, ...)."""
 
+    HINTS = {"err_local_recmode_guard": "not sent: 3 mode switches in the last 20 s already "
+                                        "(protects the camera from the recmode wedge); try again shortly"}
+
     def __init__(self, result: str, payload: Any = None, what: str = ""):
-        super().__init__("%scamera answered %s" % (what + ": " if what else "", result), payload)
+        text = self.HINTS.get(result, "camera answered %s" % result)
+        super().__init__("%s%s" % (what + ": " if what else "", text), payload)
         self.result = result
 
 

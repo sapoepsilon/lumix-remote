@@ -55,6 +55,7 @@ const RESULT_TEXT = {
   err_param: "The camera rejected that value.",
   err_critical: "The camera couldn't do that right now.",
   err_nonsupport: "This camera doesn't support that remotely.",
+  err_local_recmode_guard: "Held back a mode switch to protect the camera (too many in 20 s). Try again in a few seconds.",
 };
 const WEDGED_TEXT = "The camera is stuck (it answers \"busy\" to every command). Switch it off and on again.";
 function explain(result) {

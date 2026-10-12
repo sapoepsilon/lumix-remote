@@ -125,26 +125,45 @@ class WedgeTest(unittest.TestCase):
         self.run_fast(cam2.cmd("camcmd", value="capture"))
         self.assertFalse(cam2.wedged)
 
+    def test_recmode_churn_guard_waits_for_a_slot(self):
+        cam = self.make(cammode="play", answer="ok")
+        waits = []
+        real_sleep = asyncio.sleep
+
+        async def fake_sleep(s, *a, **k):
+            waits.append(s)
+            for i in range(len(cam._recmode_sent)):          # time passes
+                cam._recmode_sent[i] -= s
+            await real_sleep(0)
+
+        with mock.patch("lumix.camera.asyncio.sleep", fake_sleep):
+            for _ in range(4):
+                self.loop.run_until_complete(cam.cmd("camcmd", value="recmode"))
+        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 4)
+        self.assertEqual(len(waits), 1)                      # only the 4th waited
+        self.assertGreater(waits[0], 19)                     # ~20 s after the first one
+        now = __import__("time").monotonic()
+        self.assertLessEqual(sum(now - t < Camera.RECMODE_WINDOW_S for t in cam._recmode_sent), 3)
+
+    def test_recmode_guard_refuses_when_it_may_not_wait(self):
+        cam = self.make(cammode="play", answer="ok")
+        cam.RECMODE_MAX_WAIT_S = 0
+        for _ in range(4):
+            r = self.run_fast(cam.cmd("camcmd", value="recmode"))
+        self.assertEqual(r.result, "err_local_recmode_guard")
+        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 3)
+        cam.transport.answer = "err_busy"
+        self.assertFalse(self.run_fast(cam.ensure_rec()))
+        self.assertFalse(cam.wedged)                         # withheld, not refused
+
+    def test_no_recmode_passthrough_in_rec_and_no_stray_recstop(self):
+        cam = self.make(cammode="rec", answer="ok")
+        cam.status = "ready"
+        cam.state = {"cammode": "rec", "rec": "off"}
+        self.assertIn("not sent", self.run_fast(cam.camcmd("recmode"))["text"])
+        self.assertEqual(self.run_fast(cam.video(False))["note"], "was not recording")
+        self.assertEqual(cam.transport.sent, [])
+
 
 if __name__ == "__main__":
     unittest.main()
-
-    def test_recmode_churn_guard_never_sends_a_fourth_in_20s(self):
-        cam = self.make(cammode="play", answer="ok")
-        for _ in range(5):
-            self.run_fast(cam.cmd("camcmd", value="recmode"))
-        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 3)
-        r = self.run_fast(cam.cmd("camcmd", value="recmode"))
-        self.assertEqual(r.result, "err_local_recmode_guard")
-        self.assertFalse(cam.wedged)                     # withheld, not refused
-        cam._recmode_sent.clear()                        # 20 s later
-        self.assertEqual(self.run_fast(cam.cmd("camcmd", value="recmode")).result, "ok")
-
-    def test_guarded_recmode_does_not_flag_a_wedge(self):
-        cam = self.make(cammode="play", answer="ok")
-        for _ in range(3):
-            self.run_fast(cam.cmd("camcmd", value="recmode"))
-        cam.transport.answer = "err_busy"
-        self.assertFalse(self.run_fast(cam.ensure_rec()))
-        self.assertFalse(cam.wedged)
-

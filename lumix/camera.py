@@ -112,6 +112,7 @@ class Camera:
     RECMODE_MAX = 3
     RECMODE_WINDOW_S = 20.0
     RECMODE_TRIES = 3              # err_busy retries for recmode (stays inside the guard)
+    RECMODE_MAX_WAIT_S = 20.0      # a guarded recmode waits for a slot at most this long
 
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
@@ -644,12 +645,21 @@ class Camera:
         assert self.transport
         if mode == "camcmd" and value == "recmode":
             now = time.monotonic()
-            recent = [t for t in self._recmode_sent if now - t < self.RECMODE_WINDOW_S]
+            recent = sorted(t for t in self._recmode_sent if now - t < self.RECMODE_WINDOW_S)
             if len(recent) >= self.RECMODE_MAX:
-                self.log_event("warn", "recmode not sent: %d already in the last %.0f s (wedge guard)"
-                               % (len(recent), self.RECMODE_WINDOW_S))
-                q = "mode=camcmd&value=recmode"
-                return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>" % RECMODE_GUARD.encode(), 0.0)
+                # wait for a slot instead of failing (a recmode that never comes leaves
+                # the camera in playback), but never longer than the guard window
+                wait = recent[-self.RECMODE_MAX] + self.RECMODE_WINDOW_S - now
+                if wait > self.RECMODE_MAX_WAIT_S:
+                    self.log_event("warn", "recmode not sent: %d already in the last %.0f s (wedge guard)"
+                                   % (len(recent), self.RECMODE_WINDOW_S))
+                    q = "mode=camcmd&value=recmode"
+                    return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>"
+                                       % RECMODE_GUARD.encode(), 0.0)
+                self.log_event("lv", "recmode in %.0f s: %d already in the last %.0f s (wedge guard)"
+                               % (wait, len(recent), self.RECMODE_WINDOW_S))
+                await asyncio.sleep(wait)
+                now = time.monotonic()
             self._recmode_sent.append(now)
         return await self.transport.cgi(mode, type, value, value2, timeout=timeout)
 
@@ -941,6 +951,9 @@ class Camera:
                     "remain_after": self.state.get("remaincapacity"), "count_changed": changed}
 
     async def video(self, start: bool) -> Dict[str, Any]:
+        if not start and self.state.get("rec") == "off":
+            # nothing to stop; the S5 answers err_reject to a stray video_recstop
+            return {"result": "ok", "recording": False, "note": "was not recording"}
         async with self.exclusive("video") as t:
             if start:
                 self._check_usable()
@@ -998,6 +1011,12 @@ class Camera:
         """Any camcmd (capture, video_recstart, oneshot_af, recmode, playmode, ...)."""
         if value == "poweroff":
             return await self.poweroff()
+        mode_now = self.state.get("cammode")
+        if (self.profile.connect.recmode_only_if_needed
+                and ((value == "recmode" and mode_now == "rec") or (value == "playmode" and mode_now == "play"))):
+            # pointless and not harmless: recmode in rec with a stream answers err_busy and
+            # counts towards the recmode churn that wedges the S5
+            return {"result": "ok", "text": "already in %s mode (not sent)" % mode_now}
         async with self.exclusive("camcmd") as t:
             r = await self.cmd("camcmd", value=value, timeout=15)
             self.log_event("cmd", "camcmd %s -> %s" % (value, r.result))

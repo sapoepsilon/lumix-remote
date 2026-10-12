@@ -235,3 +235,20 @@ class PausedStatusTest(EmuTestCase):
             self.assertEqual(d["status"], "paused")
             self.assertIn("Connect automatically is off", d["message"])
         self.run_(go(), 30)
+
+
+class ShutterFromPlaybackTest(EmuTestCase):
+    def test_capture_after_body_playback_switches_back(self):
+        r = self.rig
+
+        async def go():
+            await r.wait(lambda: r.sess.cam.liveview.age is not None, 10, "frames")
+            await r.ctl("/emu/body/play")             # someone pressed playback on the body
+            await r.wait(lambda: r.sess.cam.state.get("cammode") == "play", 10, "camera in play")
+            st, d = await r.call("POST", "/api/capture")
+            self.assertEqual((st, d.get("result")), (200, "ok"), d)
+            self.assertEqual(r.sess.cam.state.get("cammode"), "rec")
+            st, d = await r.call("POST", "/api/video/stop")          # not recording: nothing sent
+            self.assertEqual(d.get("note"), "was not recording")
+            self.assertFalse(any("video_recstop" in e["q"] for e in r.emu.log if e["kind"] == "cgi"))
+        self.run_(go(), 40)

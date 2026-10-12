@@ -231,7 +231,16 @@ async def _shooting(request: web.Request) -> Camera:
         r = await fb.leave()
         if not r.get("left") or s.cam.state.get("cammode") != "rec":
             raise Busy("the camera did not switch back from playback (%s)" % r.get("recmode", r.get("reason")))
-    return s.cam
+    cam = s.cam
+    if cam.state.get("cammode") == "play" and cam.liveview_wanted and not cam.interval_active:
+        # playback chosen on the body (or a mode switch that didn't happen): a shutter
+        # press is an explicit request to shoot, so switch back like leaving Files does
+        async with cam.exclusive("shooting"):
+            ok = await cam.start_liveview("shutter pressed in playback")
+        if not ok and cam.state.get("cammode") != "rec":
+            raise Busy("the camera stays in playback (%s); switch it to shooting on the body"
+                       % ("wedged" if cam.wedged else "recmode refused"))
+    return cam
 
 
 @_guard
