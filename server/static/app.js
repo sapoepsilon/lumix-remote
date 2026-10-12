@@ -380,7 +380,7 @@ function renderStatus(s) {
   state.status = s;
   const info = statusInfo(s);
   const ready = s.status === "ready";
-  $("dot").className = "dot " + info.dot;
+  $("dot").className = "dot " + (ready && s.wedged ? "bad" : ready && s.body_busy ? "wait" : info.dot);
   const cam = s.camera || {};
   const me = currentCamera();
   const nick = me && me.nickname && !me.provisional ? me.nickname : null;
@@ -411,7 +411,8 @@ function renderStatus(s) {
   const lv = s.liveview || {};
   const live = lv.age !== null && lv.age !== undefined && lv.age < 3;
   $("lvempty").hidden = live;
-  $("lvemptytext").textContent = !ready ? info.title : "Waiting for live view…";
+  $("lvemptytext").textContent = !ready ? info.title : s.wedged ? "Live view stopped: the camera is stuck"
+    : s.body_busy ? "Live view paused while the camera is in use" : s.cammode === "play" ? "Camera is in playback" : "Waiting for live view…";
   // recording
   const rec = !!s.recording;
   $("app").classList.toggle("recording", rec);
