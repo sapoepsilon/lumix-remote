@@ -38,7 +38,12 @@ async function api(path, body, method) {
 }
 
 function friendlyHttp(code, msg) {
-  if (code === 409) return msg && /not connected/.test(msg) ? "Camera isn't connected yet." : "Camera is busy with another command. Try again in a moment.";
+  if (code === 409) {
+    if (!msg || /^camera busy \(/.test(msg)) return "Camera is busy with another command. Try again in a moment.";
+    if (/not connected/.test(msg)) return "Camera isn't connected yet.";
+    // the server's own explanation (wedged, operated on the body, interval run, Auto refused, ...)
+    return msg.charAt(0).toUpperCase() + msg.slice(1) + (/[.!?]$/.test(msg) ? "" : ".");
+  }
   if (code === 502) return "Couldn't reach the camera" + (msg ? ` (${msg.split(":")[0]})` : ".");
   return msg || "Request failed (" + code + ")";
 }
