@@ -30,7 +30,8 @@ from .events import EventListener
 from .liveview import LiveViewReceiver
 from .menu import MenuModel
 from .models import ModelProfile
-from .protocol import CamError, CamTransport, Reply, encrypt_acc, parse_ddd, parse_nonce, parse_state
+from .protocol import (CamError, CamTransport, Reply, encrypt_acc, parse_ddd, parse_nonce, parse_reply,
+                       parse_state)
 from .registry import JsonStore
 
 log = logging.getLogger("lumix.camera")
@@ -39,6 +40,7 @@ CONFIG_DIR = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/l
 SUBSCRIBE_SETTLE_S = 30.0      # default max wait for the post-SUBSCRIBE mod_Play (see models)
 LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
 SESSION_PROBE = "mode=getsetting&type=touch_type"   # needs an accepted session
+RECMODE_GUARD = "err_local_recmode_guard"            # recmode withheld by the churn guard
 
 
 class Disconnected(Exception):
@@ -106,6 +108,10 @@ class Camera:
     PROBE_STALE_S = 15.0
     PROBE_EVERY_S = 60.0
     PROBE_FRAME_AGE_S = 10.0       # live view counts as missing after this
+    # recmode churn guard: the 4th recmode within 20 s wedged the S5 (FINDINGS 22:01)
+    RECMODE_MAX = 3
+    RECMODE_WINDOW_S = 20.0
+    RECMODE_TRIES = 3              # err_busy retries for recmode (stays inside the guard)
 
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
@@ -164,6 +170,7 @@ class Camera:
         # can cancel and await them instead of leaving pending tasks behind.
         self._bg: Set[asyncio.Task] = set()
         self._probe_at = 0.0               # last periodic session probe (supervisor)
+        self._recmode_sent: Deque[float] = deque(maxlen=8)
         self._reject_probe_at = float("-inf")  # last session probe after an err_reject (monotonic may start near 0)
 
     @property
@@ -615,11 +622,11 @@ class Camera:
         ``judge_wedge=False``: a short budget that runs out is not the wedge
         (time-lapse shots use fewer tries and skip instead)."""
         assert self.transport
-        r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+        r = await self._send(mode, type, value, value2, timeout)
         n = 1
         while r.result == "err_busy" and n < tries and not self.wedged:
             await asyncio.sleep(1.0)
-            r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+            r = await self._send(mode, type, value, value2, timeout)
             n += 1
         # One camcmd/startstream refused for LUMIX Sync's whole retry budget is the
         # wedge (2026-10-11: capture err_busy x5 never cleared without a power
@@ -630,10 +637,26 @@ class Camera:
             self._mark_wedged("%s %s refused %d times" % (mode, value or "", n))
         return r
 
-    async def ensure_rec(self) -> bool:
-        """camcmd recmode (5 x 1 s on err_busy); True when getstate says rec."""
+    async def _send(self, mode: str, type: Optional[str], value: Optional[str],
+                    value2: Optional[str], timeout: float) -> Reply:
+        """One request; recmode goes through the churn guard (never more than
+        RECMODE_MAX in RECMODE_WINDOW_S, whoever asks: retries, watchdog, UI)."""
         assert self.transport
-        r = await self.cmd("camcmd", value="recmode")
+        if mode == "camcmd" and value == "recmode":
+            now = time.monotonic()
+            recent = [t for t in self._recmode_sent if now - t < self.RECMODE_WINDOW_S]
+            if len(recent) >= self.RECMODE_MAX:
+                self.log_event("warn", "recmode not sent: %d already in the last %.0f s (wedge guard)"
+                               % (len(recent), self.RECMODE_WINDOW_S))
+                q = "mode=camcmd&value=recmode"
+                return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>" % RECMODE_GUARD.encode(), 0.0)
+            self._recmode_sent.append(now)
+        return await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+
+    async def ensure_rec(self) -> bool:
+        """camcmd recmode (3 x 1 s on err_busy); True when getstate says rec."""
+        assert self.transport
+        r = await self.cmd("camcmd", value="recmode", tries=self.RECMODE_TRIES)
         for _ in range(8):
             await asyncio.sleep(0.4)
             await self._refresh_state()

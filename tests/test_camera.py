@@ -58,7 +58,7 @@ class WedgeTest(unittest.TestCase):
         ok = self.run_fast(cam.ensure_rec())
         self.assertFalse(ok)
         self.assertTrue(cam.wedged)
-        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 5)
+        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), Camera.RECMODE_TRIES)
 
     def test_recmode_ok_does_not_flag(self):
         cam = self.make(cammode="rec", answer="ok")
@@ -128,3 +128,23 @@ class WedgeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_recmode_churn_guard_never_sends_a_fourth_in_20s(self):
+        cam = self.make(cammode="play", answer="ok")
+        for _ in range(5):
+            self.run_fast(cam.cmd("camcmd", value="recmode"))
+        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 3)
+        r = self.run_fast(cam.cmd("camcmd", value="recmode"))
+        self.assertEqual(r.result, "err_local_recmode_guard")
+        self.assertFalse(cam.wedged)                     # withheld, not refused
+        cam._recmode_sent.clear()                        # 20 s later
+        self.assertEqual(self.run_fast(cam.cmd("camcmd", value="recmode")).result, "ok")
+
+    def test_guarded_recmode_does_not_flag_a_wedge(self):
+        cam = self.make(cammode="play", answer="ok")
+        for _ in range(3):
+            self.run_fast(cam.cmd("camcmd", value="recmode"))
+        cam.transport.answer = "err_busy"
+        self.assertFalse(self.run_fast(cam.ensure_rec()))
+        self.assertFalse(cam.wedged)
+
