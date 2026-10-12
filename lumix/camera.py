@@ -173,14 +173,19 @@ class Camera:
         self.busy_streak += 1
         # cmd() retries err_busy 5 x 1 s, so 10 = two commands that exhausted
         # LUMIX Sync's whole retry budget while the body is not reported busy
-        if self.busy_streak >= 10 and not self.wedged and not self.body_busy:
-            self.wedged, self.wedged_since = True, time.time()
-            self.log_event("warn", "camera is stuck answering err_busy to camcmd/startstream "
-                                   "(shutter, video, mode switch, live view). Only a camera "
-                                   "power cycle clears it.", wedged=True)
-            self.bus.publish("status", self.status_dict())
-            for hook in list(self.wedge_hooks):
-                asyncio.ensure_future(self._safe(hook(self)))
+        if self.busy_streak >= 10:
+            self._mark_wedged("camcmd/startstream")
+
+    def _mark_wedged(self, why: str) -> None:
+        if self.wedged or self.body_busy:
+            return
+        self.wedged, self.wedged_since = True, time.time()
+        self.log_event("warn", "camera is stuck answering err_busy to camcmd/startstream "
+                               "(shutter, video, mode switch, live view; seen on %s). Only a "
+                               "camera power cycle clears it." % why, wedged=True)
+        self.bus.publish("status", self.status_dict())
+        for hook in list(self.wedge_hooks):
+            asyncio.ensure_future(self._safe(hook(self)))
 
     def status_dict(self) -> Dict[str, Any]:
         st = self.state
@@ -483,6 +488,13 @@ class Camera:
                 return True
         if r.result not in ("ok",):
             self.log_event("warn", "recmode -> %s" % r.result)
+        # A healthy S5 in play always accepts recmode; one that refuses it for the
+        # whole retry budget is wedged (2026-10-11 22:46/23:08: err_busy x5 from
+        # play, power cycle needed). Flag it now instead of after a second command,
+        # so nothing else (watchdog, UI, scripts) keeps sending camcmds.
+        if (r.result in ("err_busy", "err_critical")
+                and self.state.get("cammode") == "play"):
+            self._mark_wedged("recmode from play")
         return False
 
     async def start_liveview(self, reason: str) -> bool:
@@ -511,7 +523,10 @@ class Camera:
         return r.ok
 
     async def stop_liveview(self, reason: str) -> None:
-        if self.transport is None:
+        if self.transport is None or not self._lv_running:
+            # stopstream with no stream running answers err_critical on the S5
+            # (22:45:23 on 2026-10-11, right before the recmode that wedged it);
+            # LUMIX Sync only stops a stream it started
             return
         self._lv_running = False
         with contextlib.suppress(CamError):

@@ -372,7 +372,8 @@ back-off (10 s .. 120 s), never while the camera is busy or wedged.
   `recmode` during the camera's own switch to play, and rapid `recmode`
   re-sends (our old watchdog and an event loop on `lens_Atta`). Nothing in-band
   clears it. The server avoids the triggers (see Connection sequence), flags
-  `"wedged": true` in `/api/status` after two commands exhausted their retries,
+  `"wedged": true` in `/api/status` after two commands exhausted their retries
+  (or one `recmode` refused for its whole retry budget while in play),
   and calls `Camera.wedge_hooks` (the Bluetooth watchdog power-cycles from there).
 - No Bluetooth: power-on and auto-connect are not possible.
 - Kelvin white balance and photo-style fine adjustments (`__value__` parameters)
