@@ -38,6 +38,7 @@ log = logging.getLogger("lumix.camera")
 CONFIG_DIR = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/lumix-remote"))
 SUBSCRIBE_SETTLE_S = 30.0      # default max wait for the post-SUBSCRIBE mod_Play (see models)
 LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
+SESSION_PROBE = "mode=getsetting&type=touch_type"   # needs an accepted session
 
 
 class Disconnected(Exception):
@@ -101,6 +102,11 @@ def _client_uuid() -> str:
 
 
 class Camera:
+    # session probe (getsetting) cadence: while live view frames are missing / otherwise
+    PROBE_STALE_S = 15.0
+    PROBE_EVERY_S = 60.0
+    PROBE_FRAME_AGE_S = 10.0       # live view counts as missing after this
+
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
         self.store = cfg.store if cfg.store is not None else JsonStore(os.path.join(CONFIG_DIR, "state.json"))
@@ -154,6 +160,11 @@ class Camera:
         # the body answers err_busy to capture/recmode/playmode then, which is
         # not the wedge.
         self.interval_owner: Optional[str] = None
+        # Fire-and-forget helpers (NOTIFY reactions, hooks): tracked so stop()
+        # can cancel and await them instead of leaving pending tasks behind.
+        self._bg: Set[asyncio.Task] = set()
+        self._probe_at = 0.0               # last periodic session probe (supervisor)
+        self._reject_probe_at = float("-inf")  # last session probe after an err_reject (monotonic may start near 0)
 
     @property
     def interval_active(self) -> bool:
@@ -175,6 +186,7 @@ class Camera:
 
     def _trace(self, q: str, rep: Reply) -> None:
         self._track_busy(q, rep)
+        self._check_reject(q, rep)
         if self._log_fh is None:
             return
         if q == "mode=getstate" and rep.ok:
@@ -184,6 +196,29 @@ class Camera:
             _oneline(rep.text))
         self._log_fh.write(line)
         self._log_fh.flush()
+
+    def _check_reject(self, q: str, rep: Reply) -> None:
+        """A camera that rebooted (or dropped us) between two keepalives still
+        answers getstate/getinfo before a new req_acc, so the 1 Hz getstate never
+        notices; every other command answers err_reject. After such an answer,
+        probe the session once (rate-limited) and reconnect if it is gone."""
+        if rep.result != "err_reject" or self.status != "ready":
+            return
+        if q.startswith(("mode=getstate", "mode=getinfo", "mode=accctrl")):
+            return
+        if q == SESSION_PROBE or time.monotonic() - self._reject_probe_at < 5.0:
+            return
+        self._reject_probe_at = time.monotonic()
+        self._spawn(self._probe_session())
+
+    async def _probe_session(self) -> None:
+        if self.transport is None:
+            return
+        r = await self.transport.cgi("getsetting", "touch_type", timeout=4)
+        if r.result == "err_reject" and self.status == "ready":
+            self.log_event("conn", "camera no longer accepts this session (it restarted or "
+                                   "dropped us); reconnecting")
+            self._reconnect_req.set()
 
     def _track_busy(self, q: str, rep: Reply) -> None:
         """Detect the S5 'camcmd wedge': every camcmd (and often startstream)
@@ -217,7 +252,7 @@ class Camera:
                                "camera power cycle clears it." % why, wedged=True)
         self.bus.publish("status", self.status_dict())
         for hook in list(self.wedge_hooks):
-            asyncio.ensure_future(self._safe(hook(self)))
+            self._spawn(hook(self))
 
     def status_dict(self) -> Dict[str, Any]:
         st = self.state
@@ -256,9 +291,13 @@ class Camera:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
+        await self._cancel_background()
         if self.transport is not None:
-            with contextlib.suppress(Exception):
-                await self.transport.cgi("stopstream", timeout=2)
+            if self._lv_running or not self.profile.connect.stopstream_only_if_running:
+                # stopstream with no stream answers err_critical on the S5
+                with contextlib.suppress(Exception):
+                    await self.transport.cgi("stopstream", timeout=2)
+            self._lv_running = False
             await self.transport.close()
         await self.listener.unsubscribe()
         await self.listener.stop()
@@ -299,9 +338,11 @@ class Camera:
             except (CamError, Disconnected, OSError, asyncio.TimeoutError) as e:
                 failures += 1
                 self.connected_at = None
-                self._lv_running = False
+                was_streaming, self._lv_running = self._lv_running, False
                 # LUMIX Sync: on disconnect stopstream + UNSUBSCRIBE, then full reconnect
-                if self.transport is not None:
+                # (stopstream only for a stream we started: else err_critical on the S5)
+                if self.transport is not None and (
+                        was_streaming or not self.profile.connect.stopstream_only_if_running):
                     with contextlib.suppress(Exception):
                         await self.transport.cgi("stopstream", timeout=2)
                 with contextlib.suppress(Exception):
@@ -476,10 +517,11 @@ class Camera:
         if self.liveview_wanted:
             await self.start_liveview("connect")
         self.connected_at = time.time()
+        self._probe_at = time.monotonic()
         self._save_state(connected_at=int(self.connected_at), provisional=False)
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
         for hook in list(self.ready_hooks):
-            asyncio.ensure_future(self._safe(hook(self)))
+            self._spawn(hook(self))
 
     async def _access_values(self, t: CamTransport) -> "tuple[str, str, str]":
         """accctrl type and values for this body: plain req_acc, or LUMIX Sync's
@@ -710,6 +752,16 @@ class Camera:
                 continue
             if time.monotonic() - self._last_ok > 30:
                 raise Disconnected("no good getstate for 30 s")
+            # getstate answers even without a session (camera rebooted between two
+            # polls): check the session now and then, sooner while frames are missing
+            age = self.liveview.age
+            every = (self.PROBE_STALE_S if (self.liveview_wanted and (age is None or age > self.PROBE_FRAME_AGE_S))
+                     else self.PROBE_EVERY_S)
+            if time.monotonic() - self._probe_at > every and not self._op_lock.locked():
+                self._probe_at = time.monotonic()
+                await self._probe_session()
+                if self._reconnect_req.is_set():
+                    raise Disconnected("camera dropped the session")
             if (self._lv_pending and not self._op_lock.locked()
                     and time.monotonic() - self._lv_restart_at > 5):
                 reason, self._lv_pending = self._lv_pending, None
@@ -775,7 +827,7 @@ class Camera:
                     self.body_busy = True
                     self.bus.publish("status", self.status_dict())
                     if self._lv_running:
-                        asyncio.ensure_future(self._safe(self.stop_liveview("camera in use")))
+                        self._spawn(self.stop_liveview("camera in use"))
             elif value == "update":
                 self._busy_ended = self.body_busy
                 self.body_busy = False
@@ -798,12 +850,27 @@ class Camera:
                 self._mod_play.set()
             # mod_Play: ignored on purpose (never pull the camera back to rec)
             if value.startswith("lens") and self.transport:
-                asyncio.ensure_future(self._safe(self.refresh_lens()))
+                self._spawn(self.refresh_lens())
 
     @staticmethod
     async def _safe(coro) -> None:
         with contextlib.suppress(Exception):
             await coro
+
+    def _spawn(self, coro) -> "asyncio.Task":
+        """Run ``coro`` in the background (errors swallowed), tracked in _bg."""
+        t = asyncio.ensure_future(self._safe(coro))
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+        return t
+
+    async def _cancel_background(self) -> None:
+        tasks = [t for t in self._bg if not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._bg.clear()
 
     # ----------------------------------------------------------- exclusive
     @contextlib.asynccontextmanager
@@ -827,7 +894,7 @@ class Camera:
         if self.body_busy:
             raise Busy("camera is being operated on the body (waiting for it to finish)")
         if self.wedged:
-            raise Busy("camera is stuck answering err_busy; power-cycle it")
+            raise Busy("camera is stuck answering err_busy; switch it off and on again")
         if self.interval_active:
             raise Busy("an in-camera interval run is in progress (stop the timelapse first)")
 
