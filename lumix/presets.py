@@ -25,6 +25,7 @@ not exposure decisions.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -62,6 +63,9 @@ class AutoPreset:
         self.cam = cam
         self.path = path or os.path.join(CONFIG_DIR, "presets.json")
         self.state: Dict[str, Any] = self._load()
+        # One preset change at a time: an "on" racing an "off" must not drop
+        # the saved manual values.
+        self._lock = asyncio.Lock()
 
     # ---------------------------------------------------------------- state
     def _load(self) -> Dict[str, Any]:
@@ -130,9 +134,10 @@ class AutoPreset:
     async def set(self, on: bool, target: str = "photo") -> Dict[str, Any]:
         if target not in AUTO:
             raise ValueError("target must be photo or video")
-        if on:
-            return await self._apply(target)
-        return await self._restore()
+        async with self._lock:
+            if on:
+                return await self._apply(target)
+            return await self._restore()
 
     async def _apply(self, target: str) -> Dict[str, Any]:
         cam = self.cam
