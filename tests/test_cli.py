@@ -646,3 +646,15 @@ class ServerManagerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EventPrinterCamerasTest(unittest.TestCase):
+    def test_cameras_message_is_one_line(self):
+        from lumixcli.main import EventPrinter
+        msg = {"type": "cameras", "data": {"active": "a", "cameras": [{"id": "a", "status": "ready"},
+                                                                       {"id": "b", "status": "reconnecting"}]}}
+        lines = EventPrinter(False, True).handle(msg)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].endswith("cameras *a ready, b reconnecting"))
+        self.assertEqual(EventPrinter(False, False).handle(msg), [])
+        self.assertEqual(json.loads(EventPrinter(True, True).handle(msg)[0])["type"], "cameras")

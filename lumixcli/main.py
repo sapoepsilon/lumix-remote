@@ -396,8 +396,15 @@ class EventPrinter:
                 lines.append(json.dumps(msg, default=str) if self.as_json else
                              "%s exposure %s %s" % (time.strftime("%H:%M:%S"), d.get("focal_title"),
                                                      d.get("shtrspeed_title")))
+        elif t == "cameras" and isinstance(d, dict):
+            if self.show_all:
+                lines.append(json.dumps(msg, default=str) if self.as_json else
+                             "%s cameras %s" % (time.strftime("%H:%M:%S"), ", ".join(
+                                 "%s%s %s" % ("*" if c.get("id") == d.get("active") else "", c.get("id"),
+                                              c.get("status")) for c in d.get("cameras") or [])))
         elif self.show_all:
-            lines.append(json.dumps(msg, default=str))
+            lines.append(json.dumps(msg, default=str) if self.as_json else
+                         "%s %-7s %s" % (time.strftime("%H:%M:%S"), t, json.dumps(d, default=str)[:160]))
         return lines
 
 
