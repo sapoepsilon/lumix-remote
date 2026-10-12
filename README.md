@@ -226,6 +226,13 @@ the API answers 409 with the camera's reply (see Known issues).
 | `POST /api/files/done` | Leave file browsing: rec mode + live view |
 | `GET /api/files/status` | `{active, cammode, pins, idle_left_s, cached_items, last_error, jobs}` |
 
+Card layout on the S5: the top level holds single files plus groups (time
+lapse / burst, `pana:X_RecGroupType`, up to ~1000 frames each). The listing
+pages through the top level (cheap) and expands only the groups a page touches,
+so the first page of a 7980-file card takes ~5 s. Groups count as photos for
+`kind`. Names are the card names (`P1024091.JPG` for the camera title
+`102-4091`). `.MOV` clips carry no date and are imported into `undated/`.
+
 Item: `{"id", "name", "kind": "photo"|"video", "date", "size", "has_raw",
 "thumb_url", "preview_url", "download_url", "raw_url"?}`. `raw_url` is only
 present for RAW+JPEG shots; a RAW-only shot has the `.RW2` as its original.
@@ -264,17 +271,31 @@ tools/            stand-alone protocol probe
 
 ### Connection sequence (what the server does)
 
+It mirrors LUMIX Sync 2.0.17 (`docs/lumix-sync-wifi-flow.md`); every cam.cgi
+request carries `User-Agent: LUMIX Sync` and only one is in flight at a time.
+
 1. `GET :60606/Lumix/Server0/ddd` (device description).
-2. `accctrl req_acc` with a LUMIX Sync-style id and device name; retry while the
-   camera answers `ok_under_research*` until `ok,<name>,remote,...`.
-3. `setsetting device_name`.
-4. `SUBSCRIBE :60606/Server0/CMS_event` with a callback to our event server; the
-   camera then POSTs `NOTIFY` events (`X_Panasonic_Cam_Sync`: `lens_Atta`,
-   `mod_Play`, ...). On the S5 this is what gets live view going after a cold start.
-5. `getinfo capability|allmenu|curmenu|lens`, `getsetting touch_type`.
-6. `camcmd recmode` (`err_busy` can just mean "already in rec"), `startstream`.
-7. `getstate` every second as keepalive; subscription renewed before expiry;
-   live view restarted if frames stop; full reconnect after 3 failed keepalives.
+2. `accctrl req_acc` with a LUMIX Sync-style id and device name, every 1 s while
+   the camera answers `ok_under_research*`, until `ok,<name>,remote,...`.
+3. `SUBSCRIBE :60606/Server0/CMS_event` (once per session, only while the camera
+   is in play mode, which it is right after the accept), then 200 ms. The camera
+   POSTs `NOTIFY` events (`X_Panasonic_Cam_Sync`: `busy`, `update`, `lens_Atta`,
+   `mod_Play`, `mod_Rec`, ...). Without it the S5 never sends live view frames.
+4. `setsetting raw_img_send`, `getinfo capability|allmenu|curmenu|lens`,
+   `getsetting touch_type`, `getstate`, `setsetting device_name`.
+5. Live view start, once: `stopstream`, `camcmd recmode` (only if not in rec),
+   `startstream`.
+6. `getstate` every second. `err_reject`, 3 failed polls or 30 s without a good
+   reply = disconnected: `stopstream`, `UNSUBSCRIBE`, full reconnect. Renewal is
+   by SID only; a refused renewal also means full reconnect.
+
+Every command retries `err_busy` 5 times, 1 s apart, then reports it. Camera
+events drive live view: `busy` (someone is using the body) stops it and blocks
+shutter/video/AF with 409; `update` + `lens_Atta` after such a window restart it
+once; `mod_Play` (camera switched to playback) is respected, nothing pulls the
+camera back to rec except an explicit command or leaving the file browser. If
+frames stop while in rec, the watchdog restarts the stream with a growing
+back-off (10 s .. 120 s), never while the camera is busy or wedged.
 
 ### Extension points (timelapse, file browser, HDMI capture)
 
@@ -294,15 +315,15 @@ tools/            stand-alone protocol probe
 
 ## Known issues
 
-- **camcmd wedge (S5):** a UPnP `SUBSCRIBE` sent while the camera is in rec
-  mode makes it switch itself to play; a `recmode` landing during that switch
-  answers `err_critical`, and from then on every `camcmd` (capture, video,
-  recmode, playmode, AF) and often `startstream` answer `err_busy` until the
-  camera is power-cycled. Settings and touch keep working. Reproduced on a clean
-  boot; nothing in-band clears it (re-`accctrl`, re-subscribe, unsubscribe,
-  drive mode). The server now only subscribes from play mode and renews by SID;
-  it flags `"wedged": true` in `/api/status` after 4 straight `err_busy` replies
-  and calls `Camera.wedge_hooks` (used by the Bluetooth power-cycle watchdog).
+- **camcmd wedge (S5):** the camera can get into a state where every `camcmd`
+  (capture, video, recmode, playmode, AF) and often `startstream` answer
+  `err_busy` until it is power-cycled; settings and touch keep working.
+  Reproduced triggers: a `SUBSCRIBE` while the camera is in rec mode followed by
+  `recmode` during the camera's own switch to play, and rapid `recmode`
+  re-sends (our old watchdog and an event loop on `lens_Atta`). Nothing in-band
+  clears it. The server avoids the triggers (see Connection sequence), flags
+  `"wedged": true` in `/api/status` after two commands exhausted their retries,
+  and calls `Camera.wedge_hooks` (the Bluetooth watchdog power-cycles from there).
 - No Bluetooth: power-on and auto-connect are not possible.
 - Kelvin white balance and photo-style fine adjustments (`__value__` parameters)
   are not editable yet.
