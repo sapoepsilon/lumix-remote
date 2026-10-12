@@ -538,8 +538,10 @@ the active camera. `{id}` may also be the nickname. `/api/status` answers
 | `POST /api/timelapse` or `/api/timelapse/start` `{"interval", "count"?, "duration"?, "start_at"?, "native"?, "ae_lock"?, "import"?, "import_mode"?: "auto"\|"each"\|"end", "video"?, "fps"?, "name"?, "dest"?}` | Start (201). `start_at`: epoch, ISO time, `HH:MM` or `+SECONDS`. 409 when one is already active |
 | `POST /api/timelapse/pause`, `/resume`, `/stop` | Pause (after the shot in flight), resume (re-anchors the grid), stop early |
 | `GET /api/timelapse/frame.jpg` | Last frame (live view at the last shot) |
-| `GET /api/liveview.jpg` | Latest live view frame |
+| `GET /api/liveview.jpg[?after=<seq>]` | Latest live view frame; headers `X-Frame-Seq`, `X-Frame-Width`, `X-Frame-Height`; `after` waits for a newer frame (see [docs/liveview.md](docs/liveview.md)) |
 | `GET /api/liveview.mjpg` | MJPEG stream (`multipart/x-mixed-replace`) |
+| `GET /api/liveview/stats` | Frame source stats (fps, size, bytes) + UDP receiver counters and the latest datagram header |
+| `GET /api/liveview/quality`, `POST /api/liveview/quality` `{"liveview_quality": "vga"\|"qvga"}` | Live view size (S5: vga = 640x360, the default and largest; qvga = 320x184). Saved per camera, set at connect, applied with a stream restart |
 | `GET /api/ws` | WebSocket push: `status`, `exposure`, `settings` (changed ids), `event`, `events`, `preset`, `cameras` (list changed); the plain `/api/ws` closes with `active` when the active camera changes |
 | `GET /api/presets` | Preset state: `{"auto": {on, target, saved, applied, recmode_used, since}}` |
 | `POST /api/presets/auto` `{"on": true, "target": "photo"\|"video"}` | Auto on (saves manual values first) / off (`{"on": false}` restores them). Returns `steps` (each setsetting + result), `before`, `after` |

@@ -18,7 +18,7 @@ MODELS: Dict[str, Dict[str, str]] = {
         "version": "VD4.30",
         "lens": ("ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,"
                  "LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256"),
-        # 254-byte live-view header (frame 1, run 20261011-203625); bytes 0-1 = LE16
+        # 254-byte live-view header (frame 1, run 20261011-203625); bytes 0-1 = BE16
         # datagram length and 9-14 = camera MAC are filled in per frame.
         "lv_header": (
             "79200100ffffffff000000000000000021ffffffffffffffffffffffffff00de"

@@ -1,0 +1,243 @@
+{
+ "camera": "DC-S5 fw 2.03, real body, Via Network (camera on the home Wi-Fi, Mac on 6 GHz Wi-Fi)",
+ "date": "2026-10-12",
+ "source": "logs/camera-2026-10-12.log 15:30-15:47 (scrubbed) + /api/liveview/stats + /api/liveview.mjpg 20-60 s reads",
+ "curmenu_items": [
+  "<item id=\"menu_item_id_liveview_quality\" enable=\"yes\" value=\"vga\" />",
+  "<item id=\"menu_item_id_liveviewsize_vga\" enable=\"yes\" />",
+  "<item id=\"menu_item_id_liveviewsize_qvga\" enable=\"yes\" />"
+ ],
+ "commands": [
+  [
+   "15:30:06.774",
+   "mode=getsetting&type=liveviewsize",
+   "ok",
+   "vga"
+  ],
+  [
+   "15:32:02.923",
+   "mode=setsetting&type=liveviewsize&value=qvga",
+   "ok",
+   null
+  ],
+  [
+   "15:32:31.580",
+   "mode=getsetting&type=liveviewsize",
+   "ok",
+   "qvga"
+  ],
+  [
+   "15:40:59.874",
+   "mode=setsetting&type=liveviewsize&value=vga",
+   "ok",
+   null
+  ],
+  [
+   "15:41:03.952",
+   "mode=startstream&value=49199",
+   "ok",
+   null
+  ],
+  [
+   "15:42:28.514",
+   "mode=setsetting&type=liveviewsize&value=qvga",
+   "ok",
+   null
+  ],
+  [
+   "15:42:32.467",
+   "mode=stopstream",
+   "ok",
+   null
+  ],
+  [
+   "15:42:32.722",
+   "mode=startstream&value=49199",
+   "ok",
+   null
+  ],
+  [
+   "15:43:21.876",
+   "mode=setsetting&type=liveviewsize&value=hd",
+   "err_param",
+   null
+  ],
+  [
+   "15:43:25.896",
+   "mode=getsetting&type=liveviewsize",
+   "ok",
+   "qvga"
+  ],
+  [
+   "15:46:22.196",
+   "mode=setsetting&type=liveviewsize&value=vga",
+   "ok",
+   null
+  ],
+  [
+   "15:46:25.253",
+   "mode=stopstream",
+   "ok",
+   null
+  ],
+  [
+   "15:46:26.067",
+   "mode=startstream&value=49199",
+   "ok",
+   null
+  ]
+ ],
+ "notes": [
+  "setsetting liveviewsize during a running stream changes nothing until the next startstream (15:32:02 qvga set, the stream stayed 640x360 for the next 20 s)",
+  "one UDP datagram per frame at both sizes: rx_datagrams == frames, 0 unparsable, IP fragments reassembled 1:1 (19 fragments at vga, 10 at qvga)",
+  "header bytes 0-1 = datagram length BE16 (0x695d = 26973); no frame counter in the header (only bytes 0-1 change between frames)",
+  "curmenu liveview_quality once said qvga (15:30:08) while getsetting and the stream said vga; getsetting is the truth",
+  "frames arrive in bursts: ~0.6 s of frames, then a ~0.73 s stall, every ~1.37 s at both sizes; ping to the camera 5-800 ms (avg 268 ms) vs 3-72 ms to the router = the camera's Wi-Fi link, not the Mac"
+ ],
+ "vga_header_hex_scrubbed": "695d0100ffffffff00024c58e000010021ffffffffffffffffffffffffff00de000c000a0001feffffff01010100fe010216006903610226ffffff01000000000900010003ab010003ab01000d000100fa0001000600010000010100000101000001010000001400ff01007608000001000000000000000000000005000000000004000002000000000000000f000000000000000000000000ff00000000000000000000000000000000000000000000000000000000000000000000000000000000010502000700000000000000010002051501ff01000000010000000000000000000000010000000300001b0000000000000000000000000000000000",
+ "vga_datagram_bytes": 26973,
+ "runs": {
+  "qvga_a": {
+   "mjpeg": {
+    "frames": 397,
+    "secs": 19.36,
+    "fps": 20.46,
+    "res": {
+     "(320, 184)": 397
+    },
+    "kB_avg": 12.9,
+    "kB_min": 12.8,
+    "kB_max": 13.0,
+    "gap_max_ms": 765,
+    "gaps_over_100ms": 17
+   },
+   "rx_datagrams": 430,
+   "rx_bad": 0,
+   "frames": 430,
+   "datagram_bytes": 13479,
+   "frags_per_frame": 10,
+   "ip_frags": 4300,
+   "ip_reassembled": 430,
+   "est_lost_frames": 0.0,
+   "udp_full_buf": 0,
+   "width": 320,
+   "height": 184
+  },
+  "qvga_b": {
+   "mjpeg": {
+    "frames": 370,
+    "secs": 19.39,
+    "fps": 19.03,
+    "res": {
+     "(320, 184)": 370
+    },
+    "kB_avg": 13.1,
+    "kB_min": 12.9,
+    "kB_max": 13.6,
+    "gap_max_ms": 803,
+    "gaps_over_100ms": 17
+   },
+   "rx_datagrams": 432,
+   "rx_bad": 0,
+   "frames": 432,
+   "datagram_bytes": 13572,
+   "frags_per_frame": 10,
+   "ip_frags": 4300,
+   "ip_reassembled": 430,
+   "est_lost_frames": 0.0,
+   "udp_full_buf": 0,
+   "width": 320,
+   "height": 184
+  },
+  "vga_a": {
+   "mjpeg": {
+    "frames": 343,
+    "secs": 19.96,
+    "fps": 17.13,
+    "res": {
+     "(640, 360)": 343
+    },
+    "kB_avg": 26.1,
+    "kB_min": 25.9,
+    "kB_max": 26.2,
+    "gap_max_ms": 732,
+    "gaps_over_100ms": 18
+   },
+   "rx_datagrams": 349,
+   "rx_bad": 0,
+   "frames": 349,
+   "datagram_bytes": 26970,
+   "frags_per_frame": 19,
+   "ip_frags": 6612,
+   "ip_reassembled": 348,
+   "est_lost_frames": 0.0,
+   "udp_full_buf": 0,
+   "width": 640,
+   "height": 360
+  },
+  "vga_b": {
+   "mjpeg": {
+    "frames": 326,
+    "secs": 20.0,
+    "fps": 16.25,
+    "res": {
+     "(640, 360)": 326
+    },
+    "kB_avg": 26.2,
+    "kB_min": 26.0,
+    "kB_max": 26.3,
+    "gap_max_ms": 771,
+    "gaps_over_100ms": 21
+   },
+   "rx_datagrams": 342,
+   "rx_bad": 0,
+   "frames": 342,
+   "datagram_bytes": 27009,
+   "frags_per_frame": 19,
+   "ip_frags": 6500,
+   "ip_reassembled": 343,
+   "est_lost_frames": -0.9,
+   "udp_full_buf": 0,
+   "width": 640,
+   "height": 360
+  },
+  "vga_long": {
+   "mjpeg": {
+    "frames": 978,
+    "secs": 60.0,
+    "fps": 16.28,
+    "res": {
+     "(640, 360)": 978
+    },
+    "kB_avg": 26.0,
+    "kB_min": 25.8,
+    "kB_max": 26.3,
+    "gap_max_ms": 799,
+    "gaps_over_100ms": 57
+   },
+   "rx_datagrams": 1007,
+   "rx_bad": 0,
+   "frames": 1007,
+   "datagram_bytes": 26957,
+   "frags_per_frame": 19,
+   "ip_frags": 19116,
+   "ip_reassembled": 1007,
+   "est_lost_frames": -0.9,
+   "udp_full_buf": 0,
+   "width": 640,
+   "height": 360
+  },
+  "vga_before_server_change": {
+   "mjpeg": {
+    "frames": 333,
+    "secs": 19.95,
+    "fps": 16.64,
+    "res": {
+     "(640, 360)": 333
+    },
+    "kB_avg": 26.3,
+    "gap_max_ms": 780
+   }
+  }
+ }
+}

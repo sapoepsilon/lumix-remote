@@ -89,7 +89,10 @@ GETSETTING_DEFAULTS = {
     "touch_type": ("5", ""), "ex_tele_conv": ("off", ""), "peaking": ("off", ""),
     "photostyle": ("vivid", ""), "colormode": ("off", ""), "qmenu_disp_style": ("normal", ""),
     "play_sort_mode": ("folder", ""),
+    "liveviewsize": ("vga", ""),
 }
+# live view sizes the real S5 accepts (setsetting liveviewsize=hd -> err_param, 2026-10-12)
+LIVEVIEW_SIZES = ("vga", "qvga")
 # setsetting types accepted besides every cmd_type found in allmenu
 SETSETTING_EXTRA = {"device_name", "raw_img_send", "current_sd", "photostyle", "photostyle2",
                     "colormode", "peaking", "overlay", "focal", "shtrspeed", "iso", "exposure",
@@ -216,6 +219,7 @@ class EmuCamera:
         self.body_busy = False
         self.recmodes: Deque[float] = deque(maxlen=16)
         self.stream_open = False        # startstream ok and no stopstream since
+        self.stream_size = "vga"         # liveviewsize when the stream was started
         self.stream_alive = False       # frames actually flowing
         self.stream_target: Optional[Tuple[str, int]] = None
         self.stream_toggle = False
@@ -590,6 +594,8 @@ class EmuCamera:
             return self._xml("err_param")
         if typ not in self.menu_types and typ not in SETSETTING_EXTRA:
             return self._xml("err_param")
+        if typ == "liveviewsize" and value not in LIVEVIEW_SIZES:
+            return self._xml("err_param")
         if (typ, value) in self.menu_map:
             for item in self.menu_map[(typ, value)]:
                 cur = self.curmenu_value(item)
@@ -843,6 +849,9 @@ class EmuCamera:
             return self._xml("err_reject")              # guess: no stream outside rec
         self.stream_open = True
         self.stream_target = (ip, port)
+        # the size is taken at startstream: a setsetting liveviewsize during a stream
+        # changes nothing until the next startstream (real S5, 2026-10-12)
+        self.stream_size = self.settings.get("liveviewsize", ("vga", ""))[0]
         # before any SUBSCRIBE the S5 sits on "Connecting": ok, but 0 datagrams (20:36 run)
         self.stream_alive = self.subscribed or not self.cfg.wedge_realism
         if self.streamer:

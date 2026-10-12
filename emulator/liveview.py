@@ -1,7 +1,8 @@
 """UDP live-view sender: recorded S5 header + generated JPEG, ~25 fps.
 
 Datagram layout (from probe-results/20261011-203625/liveview_headers.txt):
-254-byte header, then the JPEG. Header bytes 0-1 = datagram length (LE16),
+254-byte header, then the JPEG. Header bytes 0-1 = datagram length (BE16;
+real S5 2026-10-12: 0x695d with a 26973-byte datagram),
 9-14 = camera MAC, 15-16 = 0x0021 (packet type 33 = image), 30-31 = BE16 0x00de
 (JPEG offset - 32). Frames are sent from an ephemeral source port to the IP that
 sent ``startstream`` and the port it named, one frame per datagram.
@@ -30,7 +31,8 @@ class Streamer:
         hdr[9:15] = bytes.fromhex(cam.ident.mac_hex)
         self.header = bytes(hdr)
         hue = (zlib.crc32(cam.ident.serial.encode()) % 1000) / 1000.0
-        self.frames = FrameCache(hue)
+        # liveviewsize vga = 640x360 (80x45 blocks), qvga = 320x184 (40x23), as the real S5
+        self.caches = {"vga": FrameCache(hue), "qvga": FrameCache(hue, w=40, h=23)}
         self.seq = 0
         self.errors = 0
         self._task: Optional[asyncio.Task] = None
@@ -51,10 +53,13 @@ class Streamer:
     def datagram(self) -> bytes:
         self.seq += 1
         stamp = "%s %d" % (time.strftime("%H:%M:%S"), self.seq % 10000)
-        pad = 22700 + (self.seq * 7919) % 8300           # real frames: 22.7-31.0 KB
-        jpeg = self.frames.frame(self.seq, stamp, pad_to=pad - len(self.header))
+        if getattr(self.cam, "stream_size", "vga") == "qvga":
+            cache, pad = self.caches["qvga"], 12800 + (self.seq * 7919) % 900    # real: 12.8-13.6 KB
+        else:
+            cache, pad = self.caches["vga"], 22700 + (self.seq * 7919) % 8300    # real: 22.7-31.0 KB
+        jpeg = cache.frame(self.seq, stamp, pad_to=pad - len(self.header))
         total = len(self.header) + len(jpeg)
-        return struct.pack("<H", total & 0xFFFF) + self.header[2:] + jpeg
+        return struct.pack(">H", total & 0xFFFF) + self.header[2:] + jpeg
 
     async def _run(self) -> None:
         cam = self.cam

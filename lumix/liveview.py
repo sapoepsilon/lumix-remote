@@ -22,6 +22,28 @@ from typing import Any, Deque, Optional, Tuple
 log = logging.getLogger("lumix.liveview")
 
 
+def jpeg_size(j: bytes) -> Optional[Tuple[int, int]]:
+    """(width, height) from a JPEG's SOF marker, None if there is none."""
+    i, n = 2, len(j)
+    while i + 9 <= n:
+        if j[i] != 0xFF:
+            i += 1
+            continue
+        m = j[i + 1]
+        if m in (0xC0, 0xC1, 0xC2):
+            h, w = struct.unpack(">HH", j[i + 5:i + 9])
+            return w, h
+        if m == 0xFF:
+            i += 1
+        elif m in (0xD8, 0x01) or 0xD0 <= m <= 0xD7:
+            i += 2
+        elif m == 0xDA:              # start of scan: no SOF before it
+            return None
+        else:
+            i += 2 + struct.unpack(">H", j[i + 2:i + 4])[0]
+    return None
+
+
 def extract_jpeg(d: bytes, rules: Any = None) -> Optional[bytes]:
     """JPEG inside one live view datagram; ``rules`` is a
     lumix.models.LiveViewRules (None = the S5/GMaster layout)."""
@@ -55,10 +77,12 @@ class FrameSource:
         self._cond = asyncio.Condition()
         self._times: Deque[float] = deque(maxlen=60)
         self.viewers = 0
+        self.size: Optional[Tuple[int, int]] = None   # (w, h) of the latest frame
 
     async def publish(self, jpeg: bytes) -> None:
         now = time.time()
         async with self._cond:
+            self.size = jpeg_size(jpeg) or self.size     # header walk: a few markers
             self.frame = jpeg
             self.seq += 1
             self.ts = now
@@ -88,7 +112,9 @@ class FrameSource:
     def stats(self) -> dict:
         return {"source": self.name, "seq": self.seq, "fps": self.fps,
                 "age": round(self.age, 2) if self.age is not None else None,
-                "bytes": len(self.frame) if self.frame else 0, "viewers": self.viewers}
+                "bytes": len(self.frame) if self.frame else 0, "viewers": self.viewers,
+                "width": self.size[0] if self.size else None,
+                "height": self.size[1] if self.size else None}
 
 
 class _Proto(asyncio.DatagramProtocol):
@@ -111,6 +137,8 @@ class LiveViewReceiver(FrameSource):
         self.datagrams = 0
         self.bad = 0
         self.last_header: bytes = b""
+        self.last_len = 0           # size of the latest datagram (one datagram = one frame)
+        self.last_trailer = 0       # bytes after the JPEG's EOI in that datagram
 
     async def open(self) -> None:
         if self._transport is not None:
@@ -139,5 +167,16 @@ class LiveViewReceiver(FrameSource):
         if jpeg is None:
             self.bad += 1
             return
-        self.last_header = data[:len(data) - len(jpeg)] if data.endswith(jpeg) else data[:64]
+        start = data.find(jpeg[:64])
+        self.last_header = data[:start] if start >= 0 else data[:64]
+        self.last_len = len(data)
+        self.last_trailer = len(data) - start - len(jpeg) if start >= 0 else 0
         asyncio.ensure_future(self.publish(jpeg))
+
+    def debug(self) -> dict:
+        """Receiver counters + the latest datagram's header, for /api/liveview/stats."""
+        d = self.stats()
+        d.update(port=self.port, datagrams=self.datagrams, bad=self.bad,
+                 datagram_bytes=self.last_len, header_bytes=len(self.last_header),
+                 trailer_bytes=self.last_trailer, header_hex=self.last_header.hex())
+        return d

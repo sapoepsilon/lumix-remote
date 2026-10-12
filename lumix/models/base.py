@@ -74,8 +74,12 @@ class LiveViewRules:
     min_datagram: int = 64
     # Bytes in the header that carry the camera MAC (informational).
     mac_bytes: Optional[Tuple[int, int]] = None
-    # startstream value: the UDP port; the camera sends 16:9 640x360 "vga" by default.
+    # Live view size (setsetting/getsetting liveviewsize). The camera keeps the
+    # value and applies it at the next startstream. default_quality is what the
+    # server sets at connect unless the user picked another one.
     default_quality: str = "vga"
+    # Sizes to offer before a curmenu was read (curmenu menu_item_id_liveviewsize_*).
+    qualities: Tuple[str, ...] = ("vga", "qvga")
 
 
 @dataclass

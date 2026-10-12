@@ -339,6 +339,35 @@ function renderAuto() {
   renderReadout();
 }
 
+// Live view quality (setsetting liveviewsize): vga = 640x360, qvga = 320x184 on the S5.
+const LVQ_LABEL = { vga: "640×360", qvga: "320×184" };
+function paintLvQuality(s) {
+  const q = (s && s.liveview_quality) || {};
+  const seg = $("lvq");
+  if (!seg) return;
+  const opts = q.options || [];
+  [...seg.children].forEach((b) => {
+    b.hidden = opts.length > 0 && !opts.includes(b.dataset.v);
+    b.classList.toggle("on", b.dataset.v === (q.current || q.wanted));
+  });
+  const lv = (s && s.liveview) || {};
+  $("lvqsub").textContent = lv.width && lv.fps
+    ? `Streaming ${lv.width}×${lv.height} at ${lv.fps} fps, ${Math.round((lv.bytes || 0) / 1024)} kB per frame.`
+    : "What the camera streams over Wi-Fi (also for /api/liveview.mjpg).";
+}
+async function setLvQuality(v) {
+  const seg = $("lvq");
+  if (seg.classList.contains("busy")) return;
+  seg.classList.add("busy");
+  try {
+    const r = await api("/api/liveview/quality", { liveview_quality: v });
+    const why = explain(r.result);
+    if (why) toast(why, true);
+    else toast(r.applied ? `Live view ${LVQ_LABEL[v] || v}` : `Live view ${LVQ_LABEL[v] || v} at the next connect`);
+  } catch (e) { toast(e.message, true); }
+  finally { seg.classList.remove("busy"); }
+}
+
 async function setAuto(on) {
   if (state.autoBusy) return;
   state.autoBusy = true; renderAuto(); haptic(on ? [8, 30, 8] : 8);
@@ -415,6 +444,7 @@ function renderStatus(s) {
   // live view
   const lv = s.liveview || {};
   const live = lv.age !== null && lv.age !== undefined && lv.age < 3;
+  paintLvQuality(s);
   $("lvempty").hidden = live;
   // in-camera interval run (from getstate, so it shows after a server restart too)
   const iv = ready && s.interval && s.interval.running ? s.interval : null;
@@ -788,6 +818,10 @@ function wireSheet() {
     state.mftap = b.dataset.v; LS.set("mftap", state.mftap); paintSeg(); haptic();
   });
   paintSeg();
+  $("lvq").addEventListener("click", (e) => {
+    const b = e.target.closest("button"); if (!b || b.classList.contains("on")) return;
+    haptic(); setLvQuality(b.dataset.v);
+  });
   $("btnreconnect2").addEventListener("click", () => reconnect());
   $("btnsetup").addEventListener("click", () => { closeSheet(); state.skipConnect = false; $("connect").hidden = false; });
   $("btnpower").addEventListener("click", openPowerSheet);

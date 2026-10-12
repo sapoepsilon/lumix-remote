@@ -50,7 +50,7 @@ Playback / download:
 - `mode=camcmd&value=recmode`, bind a UDP socket, then `mode=startstream&value=<udp port>` (49152 and 49199 are used by implementations; avoid 50001/60606). Stop: `mode=stopstream`.
 - Camera sends UDP datagrams to the client IP/port. Each datagram is one frame: a binary header then a JPEG (SOI `FF D8 FF` ... EOI `FF D9`). Simplest robust parse (pylumix, Aikhjarto, libgphoto2): find the first `FF D8`, take until the last `FF D9`.
 - GMaster [GH3/GH4]: JPEG start = big-endian uint16 at byte offset 30, plus 32; sanity-check `imageStart > 60`. The header before that also carries exposure info (ISO/shutter/aperture at fixed offsets, model-specific). Header length therefore varies; do not hard-code.
-- Size VGA 640x480 (QVGA 320x240 or 320x184 on some bodies). Frames fit in one datagram in practice (recv buffer 65536).
+- Size VGA 640x480 (QVGA 320x240 or 320x184 on some bodies). Frames fit in one datagram in practice (recv buffer 65536). S5 (verified 2026-10-12): `setsetting&type=liveviewsize&value=vga|qvga` = 640x360 or 320x184, taken at the next startstream; see docs/liveview.md.
 - Keep-alive: `getstate` every 1-2 s (liblumix 1 s; pylumix on each 2 s UDP timeout). Without it the camera stops streaming and drops the session.
 - Stream only runs in recmode, and not while in playmode or menus.
 

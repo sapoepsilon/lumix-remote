@@ -333,13 +333,47 @@ def _source(request: web.Request) -> FrameSource:
 
 
 async def frame(request: web.Request) -> web.Response:
+    """Latest JPEG. ``?after=<seq>`` waits (up to 5 s) for a newer frame than
+    the X-Frame-Seq a poller saw last, so polling never returns duplicates."""
     src = _source(request)
-    if src.frame is None:
-        got = await src.next_frame(0, timeout=5)
+    try:
+        after = int(request.query.get("after", "0"))
+    except ValueError:
+        raise web.HTTPBadRequest(text="after must be an integer frame sequence")
+    seq, jpg = src.seq, src.frame
+    if jpg is None or seq <= after:
+        got = await src.next_frame(max(after, 0) if jpg is not None else 0, timeout=5)
         if got is None:
-            return _json({"error": "no live view frame yet"}, 503)
-    return web.Response(body=src.frame, content_type="image/jpeg",
-                        headers={"Cache-Control": "no-store"})
+            return _json({"error": "no live view frame yet" if jpg is None else "no newer frame"}, 503)
+        seq, jpg = got
+    hdr = {"Cache-Control": "no-store", "X-Frame-Seq": str(seq)}
+    if src.size:
+        hdr["X-Frame-Width"], hdr["X-Frame-Height"] = str(src.size[0]), str(src.size[1])
+    return web.Response(body=jpg, content_type="image/jpeg", headers=hdr)
+
+
+async def lv_quality(request: web.Request) -> web.Response:
+    return _json(camera(request).lv_quality_info())
+
+
+@_guard
+async def set_lv_quality(request: web.Request) -> web.Response:
+    """{"liveview_quality": "vga"|"qvga"}: saved, set on the camera, stream restarted."""
+    b = await _body(request)
+    q = b.get("liveview_quality", b.get("quality"))
+    if not isinstance(q, str):
+        raise ValueError("send {\"liveview_quality\": \"vga\"}")
+    return _json(await camera(request).set_liveview_quality(q))
+
+
+async def lv_stats(request: web.Request) -> web.Response:
+    """Frame source stats; for the Wi-Fi source also the UDP receiver counters and
+    the latest datagram header (hex)."""
+    src = _source(request)
+    d = src.debug() if hasattr(src, "debug") else src.stats()
+    if src is session(request).cam.liveview:
+        d["liveview_quality"] = session(request).cam.lv_quality_info()
+    return _json(d)
 
 
 async def mjpeg(request: web.Request) -> web.StreamResponse:
@@ -464,6 +498,9 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
         ("GET", "/api/events", events),
         ("GET", "/api/liveview.jpg", frame),
         ("GET", "/api/liveview.mjpg", mjpeg),
+        ("GET", "/api/liveview/stats", lv_stats),
+        ("GET", "/api/liveview/quality", lv_quality),
+        ("POST", "/api/liveview/quality", set_lv_quality),
         ("GET", "/api/ws", ws),
     ):
         camera_route(app, method, path, handler)

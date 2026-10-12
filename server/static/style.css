@@ -376,6 +376,7 @@ button.cell:active, .nav-cell:active { background: var(--cell-hi); }
 
 .seg { display: inline-flex; background: rgba(118, 118, 128, .24); border-radius: 9px; padding: 2px; flex: none; }
 .seg button { padding: 5px 12px; border-radius: 7px; font-size: 13px; font-weight: 500; transition: background .25s, color .25s; }
+.seg.busy { opacity: .5; pointer-events: none; }
 .seg button.on { background: rgba(99, 99, 102, .9); box-shadow: 0 3px 8px rgba(0, 0, 0, .2); }
 
 /* quick controls */

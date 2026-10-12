@@ -19,6 +19,7 @@ import contextlib
 import datetime as dt
 import logging
 import os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -111,6 +112,12 @@ def _client_uuid() -> str:
     return default_client_uuid()
 
 
+def parse_lv_quality_options(curmenu: str) -> List[str]:
+    """Live view sizes a curmenu offers (``menu_item_id_liveviewsize_<v>`` with
+    enable="yes"), in the camera's order (the S5: vga, qvga)."""
+    return re.findall(r'id="menu_item_id_liveviewsize_([A-Za-z0-9_]+)"\s+enable="yes"', curmenu)
+
+
 class Camera:
     # session probe (getsetting) cadence: while live view frames are missing / otherwise
     PROBE_STALE_S = 15.0
@@ -121,6 +128,7 @@ class Camera:
     RECMODE_WINDOW_S = 20.0
     RECMODE_TRIES = 3              # err_busy retries for recmode (stays inside the guard)
     RECMODE_MAX_WAIT_S = 20.0      # a guarded recmode waits for a slot at most this long
+    LV_QUALITY_GAP_S = 2.0         # pause between setsetting liveviewsize and the stream restart
 
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
@@ -142,6 +150,10 @@ class Camera:
         self.connected_at: Optional[float] = None
         self.liveview = LiveViewReceiver(cfg.lv_port, self.profile.liveview)
         self.liveview_wanted = True
+        # live view size (setsetting liveviewsize): what the camera reports and the
+        # values its curmenu offers (menu_item_id_liveviewsize_*, best first)
+        self.lv_quality: Optional[str] = None
+        self.lv_quality_options: List[str] = []
         self.listener = EventListener(cfg.event_port, self._on_notify, path=cfg.event_path,
                                       upnp_port=cfg.upnp_port)
         self.transport: Optional[CamTransport] = None
@@ -386,6 +398,7 @@ class Camera:
                    "sd2_full": st.get("sd2_full"), "access": st.get("sd_access")},
             "temperature": st.get("temperature"), "lens": self.lens.get("name"),
             "liveview": self.liveview.stats(), "events_sub": bool(self.listener.sid),
+            "liveview_quality": self.lv_quality_info(),
             "powered_off": self.powered_off,
             "wedged": self.wedged, "wedged_since": self.wedged_since, "body_busy": self.body_busy,
             "mid_operation": self.mid_operation(), "readonly": self.readonly,
@@ -683,8 +696,9 @@ class Camera:
             time.monotonic() - sub_at, (q.settle_event or "settle") if self._mod_play.is_set() else "timeout"))
         await self._refresh_state(strict=True)
         self.readonly, self._readonly_idle_since = None, None
-        # 6. live view start (the only recmode at connect)
+        # 6. live view start (the only recmode at connect), at the saved size
         if self.liveview_wanted:
+            await self._apply_lv_quality()
             await self.start_liveview("connect")
         self._probe_at = time.monotonic()
         if deferred:
@@ -834,6 +848,9 @@ class Camera:
         if not r.ok:
             return []
         changed = self.menu.apply_curmenu(r.text.encode())
+        opts = parse_lv_quality_options(r.text)
+        if opts:
+            self.lv_quality_options = opts
         if changed:
             self.bus.publish("settings", {"changed": changed})
         return changed
@@ -971,6 +988,60 @@ class Camera:
         self._lv_running = r.ok
         self.log_event("lv", "live view start (%s): startstream -> %s" % (reason, r.result))
         return r.ok
+
+    # ------------------------------------------------------ live view quality
+    def lv_quality_wanted(self) -> str:
+        """The saved live view size, else the model default (the best stable one)."""
+        q = self._load_state().get("liveview_quality")
+        return q if isinstance(q, str) and q else self.profile.liveview.default_quality
+
+    def lv_quality_info(self) -> Dict[str, Any]:
+        return {"current": self.lv_quality, "wanted": self.lv_quality_wanted(),
+                "options": self.lv_quality_options or list(self.profile.liveview.qualities),
+                "default": self.profile.liveview.default_quality}
+
+    async def _apply_lv_quality(self) -> None:
+        """At connect, before the live-view start: read liveviewsize and set the
+        saved size if the camera has another one (2 s before the next command)."""
+        assert self.transport
+        r = await self.transport.cgi("getsetting", "liveviewsize")
+        self.lv_quality = r.setting_value("liveviewsize") if r.ok else None
+        want = self.lv_quality_wanted()
+        opts = self.lv_quality_options or list(self.profile.liveview.qualities)
+        if self.lv_quality is None or want == self.lv_quality or want not in opts:
+            return
+        r = await self.transport.cgi("setsetting", "liveviewsize", want)
+        self.log_event("lv", "live view quality %s -> %s: %s" % (self.lv_quality, want, r.result))
+        if r.ok:
+            self.lv_quality = want
+        await asyncio.sleep(self.LV_QUALITY_GAP_S)
+
+    async def set_liveview_quality(self, quality: str) -> Dict[str, Any]:
+        """Save + apply a live view size: setsetting liveviewsize, then (2 s later)
+        the usual stopstream -> startstream restart; the S5 keeps sending the
+        old size until the stream is restarted. Not connected: saved for the
+        next connect."""
+        opts = self.lv_quality_options or list(self.profile.liveview.qualities)
+        if quality not in opts:
+            raise ValueError("liveview_quality must be one of %s" % ", ".join(opts))
+        self._save_state(liveview_quality=quality)
+        if self.transport is None or self.status != "ready" or self.readonly:
+            return {"result": "saved", "applied": False, "liveview_quality": self.lv_quality_info()}
+        await self.refuse_mid_run("Changing the live view quality")
+        async with self.exclusive("liveview-quality") as t:
+            self._check_usable()
+            r = await t.cgi("setsetting", "liveviewsize", quality)
+            self.log_event("cmd", "setsetting liveviewsize=%s -> %s" % (quality, r.result))
+            if not r.ok:
+                return {"result": r.result, "applied": False, "liveview_quality": self.lv_quality_info()}
+            self.lv_quality = quality
+            restarted = None
+            if self.liveview_wanted and self._lv_running:
+                await asyncio.sleep(self.LV_QUALITY_GAP_S)
+                restarted = await self.start_liveview("live view quality %s" % quality)
+        self.bus.publish("status", self.status_dict())
+        return {"result": "ok", "applied": True, "restarted": restarted,
+                "liveview_quality": self.lv_quality_info()}
 
     async def stop_liveview(self, reason: str) -> None:
         if self.transport is None or (not self._lv_running

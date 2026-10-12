@@ -364,7 +364,7 @@ class LiveViewTest(EmuTestBase):
             self.assertGreaterEqual(n, 18)             # ~25 fps
             self.assertLessEqual(n, 40)
             _, d, _ = sink.packets[3]
-            self.assertEqual(struct.unpack("<H", d[0:2])[0], len(d) & 0xFFFF)
+            self.assertEqual(struct.unpack(">H", d[0:2])[0], len(d) & 0xFFFF)
             self.assertEqual(d[9:15].hex().upper(), "024C58E00001")
             self.assertEqual(d[15:17], b"\x00\x21")
             start = struct.unpack(">H", d[30:32])[0] + 32

@@ -389,7 +389,7 @@ class RegistryStore:
     """What a Camera remembers (last IP, identity) stored in its registry entry."""
 
     KEYS = ("last_ip", "udn", "model_number", "friendly_name", "firmware", "connected_at",
-            "provisional")
+            "provisional", "liveview_quality")
 
     def __init__(self, reg: Registry, cam_id: str):
         self.reg, self.cam_id = reg, cam_id
