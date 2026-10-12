@@ -94,7 +94,8 @@ class Client:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                 return r.status, r.headers.get("Content-Type", ""), r.read()
         except urllib.error.HTTPError as e:
-            return e.code, e.headers.get("Content-Type", "") if e.headers else "", e.read()
+            with e:
+                return e.code, e.headers.get("Content-Type", "") if e.headers else "", e.read()
         except (urllib.error.URLError, ConnectionError, socket.timeout, OSError) as e:
             reason = getattr(e, "reason", e)
             raise ServerUnreachable(
@@ -139,7 +140,8 @@ class Client:
         try:
             r = urllib.request.urlopen(req, timeout=self.timeout)
         except urllib.error.HTTPError as e:
-            raw = e.read()
+            with e:
+                raw = e.read()
             try:
                 msg = json.loads(raw.decode()).get("error")
             except Exception:
