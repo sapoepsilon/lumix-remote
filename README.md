@@ -98,7 +98,8 @@ Before anything disruptive the server **quiesces** the camera session
 | Back to shooting (`POST /api/files/done`, starting a timelapse) | paused | - | resumed | - |
 
 Steps, each with a timeout (the whole thing stays under the 10 s a new server
-waits before SIGKILL): import jobs are checkpointed (the transfer stops, the
+waits before SIGKILL; open browser WebSockets and live view streams are closed
+first, so a tab never holds the stop): import jobs are checkpointed (the transfer stops, the
 `.part` file stays and continues later with a `Range` request; checkpoints live
 in `cameras/<id>/imports.json`), the timelapse is paused after the shot in flight
 (in-camera runs: `camctrl interval pause`), a video recording is stopped with
@@ -251,7 +252,7 @@ lumix --camera b-cam shoot       # one command against another camera
 
 lumix server start               # background ./run.sh; log logs/lumix-server.log, pid ~/.config/lumix-remote/server.pid
 lumix server start -- --camera-ip 192.168.1.50
-lumix server status              # also: lumix server stop (only stops a server it started)
+lumix server status              # also: lumix server stop (the server in the pidfile, also one from ./run.sh)
 
 lumix status                     # battery, cards, mode, remaining shots/video, live view
 lumix status --json | jq .remain_photos
@@ -295,13 +296,43 @@ Setting names and option tokens are shell-safe for completion
 completion: `eval "$(lumix completion bash)"`, or for zsh
 `autoload -U +X bashcompinit && bashcompinit && eval "$(lumix completion zsh)"`.
 
-`lumix files` is a placeholder; the files API below works.
+```sh
+lumix files list [--kind photo|video] [--limit 60 --offset 0 | --all] [--names]
+lumix files download P1000123.JPG 11000124 -o ~/Desktop [--raw]   # by card name or id
+lumix files download --latest 3 -o .        # a file of the same size is skipped (--force)
+lumix files import --latest 10 [--dest DIR] [--no-raw] [--no-wait]  # server-side job, follows it
+lumix files jobs | cancel JOB | pause JOB | resume JOB [--wait]
+lumix files status                          # browsing on/off, default import folder
+lumix files done                            # back to shooting (pauses running imports)
+```
+
+Listing switches the camera to playback (see "Files API"); shooting commands
+(`shoot`, `video start`, `af`, `focus`) switch back by themselves, or answer
+409 while an import is still copying from the card. `download` streams through
+the server to a local folder (`.part`, renamed when complete); `import` writes
+on the server's machine under `<dest>/<date>/` (default `~/Pictures/Lumix`, or
+`LUMIX_IMPORT_DEST`).
+
+### Morning smoke test on the real camera
+
+`scripts/real-camera-smoke.sh` (camera at `192.0.2.28`, or `LUMIX_SMOKE_IP`):
+stops the server, starts it fresh with `--camera-ip ... --no-scan`, waits for
+the camera to settle, checks live view, takes one photo with drive mode Single
+(the old drive mode is put back), records 4 s of video, lists the card and goes
+back to shooting. It stops at the first sign of a wedge, someone using the body,
+an `err_*` answer, a running timelapse/import or a camera that doesn't connect,
+and then sends nothing more. Log in `logs/smoke-*.log`.
 
 ### Tests
 
 ```sh
 .venv/bin/python -m unittest discover -s tests
 ```
+
+`tests/test_qa_regressions.py` holds the regressions from the emulator QA pass
+(`docs/qa-matrix.md`): camera restart between keepalives, stopstream
+discipline, Auto refused, shooting while browsing, forget/fixed IP, shutdown
+with open browser tabs, readable errors.
 
 `tests/test_cli.py` runs every CLI command against a fake server (aiohttp in a
 background thread), including the WebSocket feed and `server start/stop` with a
@@ -333,7 +364,7 @@ the active camera. `{id}` may also be the nickname. `/api/status` answers
 | `DELETE /api/cameras/{id}` | Forget the camera |
 | `POST /api/cameras/{id}/activate` | Make it the active camera |
 | `GET /api/models`, `GET /api/models/{id}` | Model profiles (short list / full: setup steps, quirks, capabilities) |
-| `GET /api/status` | Connection status, camera, battery, card, recording, live view stats |
+| `GET /api/status` | Connection status, camera, battery, card, recording, live view stats, `wedged`, `body_busy`, `powered_off` (`status: "paused"` + reason for a camera the server doesn't run) |
 | `GET /api/state` | Raw `getstate` fields |
 | `GET /api/info` | Device description, capabilities, lens, touch type, aperture/shutter options |
 | `GET /api/events` | Recent event log (commands, camera NOTIFY events, state changes) |
@@ -389,7 +420,7 @@ the API answers 409 with the camera's reply (see Known issues).
 | `GET /api/files/{id}/thumb` | Thumbnail JPEG (camera `DT` file, cached) |
 | `GET /api/files/{id}/preview` | Large preview JPEG (camera `DL` file, cached; thumbnail if none) |
 | `GET /api/files/{id}/download?variant=original\|raw` | Streams the file with `Content-Disposition: attachment; filename=...`; `Range` is passed through (206) |
-| `POST /api/files/import` `{"ids":[...], "dest":"~/Pictures/Lumix", "include_raw":true}` | Background import, 202 + job. Files go to `<dest>/YYYY-MM-DD/<name>` (shot date); default dest `~/Pictures/Lumix`; a file with the same name and size is skipped; `.part` + Range resume on errors |
+| `POST /api/files/import` `{"ids":[...], "dest":"~/Pictures/Lumix", "include_raw":true}` | Background import, 202 + job. Files go to `<dest>/YYYY-MM-DD/<name>` (shot date); default dest `~/Pictures/Lumix` (`LUMIX_IMPORT_DEST` changes it; `GET /api/files/status` has `default_dest`); a file with the same name and size is skipped; `.part` + Range resume on errors |
 | `GET /api/jobs`, `GET /api/jobs/{id}` | Job progress: `state` (`queued`, `running`, `paused`, `done`, `done_with_errors`, `failed`, `cancelled`), `paused_by`, `files_total/done/skipped/failed`, `bytes_total/done`, `progress` 0..1, `current`, `saved`, `errors` |
 | `POST /api/jobs/{id}/cancel` | Cancel an import (also a paused one) |
 | `POST /api/jobs/{id}/pause`, `/resume` | Checkpoint / continue an import (`.part` + Range) |
@@ -526,7 +557,13 @@ request carries `User-Agent: LUMIX Sync` and only one is in flight at a time.
    reply = disconnected: `stopstream`, `UNSUBSCRIBE`, full reconnect. Renewal is
    by SID only; a refused renewal also means full reconnect.
 
-Every command retries `err_busy` 5 times, 1 s apart, then reports it. Camera
+Every command retries `err_busy` 5 times, 1 s apart, then reports it (`recmode`
+3 times; no caller can send more than 3 `recmode` in 20 s, the 4th is withheld
+as `err_local_recmode_guard`, because recmode churn wedges the S5). An
+unexpected `err_reject` (and, every 15 s while frames are missing / 60 s
+otherwise, a `getsetting touch_type`) checks that the camera still knows the
+session: a body that restarted between two keepalives still answers `getstate`
+before a new `req_acc`, so only that notices it and reconnects. Camera
 events drive live view: `busy` (someone is using the body) stops it and blocks
 shutter/video/AF with 409; `update` + `lens_Atta` after such a window restart it
 once; `mod_Play` (camera switched to playback) is respected, nothing pulls the
@@ -563,7 +600,7 @@ back-off (10 s .. 120 s), never while the camera is busy or wedged.
   re-sends (our old watchdog and an event loop on `lens_Atta`). Nothing in-band
   clears it. The server avoids the triggers (see Connection sequence), flags
   `"wedged": true` in `/api/status` as soon as one camcmd/startstream (or a
-  `recmode` from play) is refused for LUMIX Sync's whole retry budget (5 x 1 s)
+  `recmode` from play) is refused for the whole retry budget (5 x 1 s; recmode 3 x 1 s)
   while the body is not reported busy (profile flag `busy_budget_exhausted_is_wedge`),
   and calls `Camera.wedge_hooks` (the Bluetooth watchdog power-cycles from there).
 - Bluetooth wake is experimental (see "Bluetooth"); only the S5 has a BLE map.
