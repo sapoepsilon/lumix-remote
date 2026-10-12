@@ -117,6 +117,9 @@ class EmuConfig:
     churn_count: int = 4             # recmode #4 within churn_window_s -> err_critical + wedge
     churn_window_s: float = 20.0
     interval_scale: float = 1.0      # time-lapse interval multiplier (0.01 = 100x faster)
+    # setsetting drivemode answers ok but the body keeps Time Lapse (seen on the real
+    # S5 on 2026-10-12, curmenu drivemode enable="no"; worked the evening before)
+    drive_locked: bool = False
     browse_max: int = 100            # max items per Browse page (guess)
     dl_range: bool = True            # honour Range on :50001 (unverified on the S5)
     dl_rate: float = 0.0             # :50001 throughput cap in bytes/s (0 = unlimited; for QA)
@@ -572,8 +575,17 @@ class EmuCamera:
             self._curmenu_set(self.value_items[typ], value)
         elif typ not in SETSETTING_EXTRA and (typ, "__value__") not in self.menu_map:
             return self._xml("err_param")            # not a value allmenu offers
-        old_text = self.settings.get(typ, ("", ""))[1]
-        self.settings[typ] = (value, old_text if typ == "afmode" else "")
+        old_value, old_text = self.settings.get(typ, ("", ""))
+        if (typ == "drivemode" and self.cfg.drive_locked and old_value == "stopmotion_interval"
+                and value != "stopmotion_interval"):
+            return self._xml("ok")
+        if typ == "drivemode":
+            # getsetting answers value2 as the element text ("interval"); the body
+            # keeps the Time Lapse/Animation choice when only the value is sent
+            text = value2 or (old_text if old_value == value else "")
+        else:
+            text = old_text if typ == "afmode" else ""
+        self.settings[typ] = (value, text)
         if typ == "drivemode" and value != "stopmotion_interval":
             self._interval_stop("enable")
         return self._xml("ok")
@@ -603,9 +615,15 @@ class EmuCamera:
         if realism and self.is_busy():
             return self._xml("err_busy")
         iv = self.interval
-        if iv["state"] in ("run", "pause") and value in ("capture", "recmode", "playmode",
+        if iv["state"] == "rec" and value == "capture" and self._interval_drive():
+            # real S5 2026-10-12 11:38:17: shutter during a run -> ok, the run starts
+            # over with the full image count (tests/fixtures/real-s5-interval-2026-10-12.log)
+            self._interval_stop("enable")
+            self._interval_start()
+            return self._xml("ok")
+        if iv["state"] in ("rec", "pause") and value in ("capture", "recmode", "playmode",
                                                          "video_recstart"):
-            return self._xml("err_busy")
+            return self._xml("err_busy")    # assumption, not verified on the body
         if value == "recmode":
             return self._recmode()
         if value == "playmode":
@@ -620,7 +638,8 @@ class EmuCamera:
                 return self._xml("err_reject")
             if self.recording:
                 return self._xml("err_reject")          # movie_shot_disable
-            if iv["armed"] and self.settings["drivemode"][0] == "stopmotion_interval":
+            if self._interval_drive():
+                # S5: in Time Lapse drive the shutter starts the run (no "set" needed)
                 self._interval_start()
                 return self._xml("ok")
             self.card.add_photo(now=True)
@@ -691,29 +710,33 @@ class EmuCamera:
         return self._xml("err_param")
 
     # ---------------------------------------------------------------- interval
+    def _interval_drive(self) -> bool:
+        d = self.settings.get("drivemode", ("", ""))
+        return d[0] == "stopmotion_interval" and d[1] in ("interval", "")
+
     def _interval_ctrl(self, value: str) -> Tuple[str, str, str]:
+        """Real DC-S5 fw 2.03 (2026-10-12, tests/fixtures/real-s5-interval-2026-10-12.log;
+        cancel's warn is not verified): ``set`` answers err_reject while
+        interval_status is ``enable`` (armed by the drive mode); the shutter alone
+        starts the run. Running = ``rec``; pause -> ``pause`` (+ warn
+        interval_pause); restart -> ``rec`` with a shot right away; stop ->
+        ``enable``; a finished run shows ``off`` + interval_finish for a moment."""
         iv = self.interval
         if value == "set":
-            if self.settings["drivemode"][0] != "stopmotion_interval":
-                return self._xml("err_reject")
-            if not iv["research"] and not iv["armed"]:
-                iv["research"] = True                   # app repeats "set" while this lasts
-                return self._xml("ok_under_research")
-            iv["research"], iv["armed"] = False, True
-            iv.pop("warn", None)
-            return self._xml("ok")
-        if value == "pause" and iv["state"] == "run":
+            return self._xml("err_reject")
+        if value == "pause" and iv["state"] == "rec":
             iv["state"] = "pause"
+            iv["warn"] = "interval_pause"
             return self._xml("ok")
         if value in ("restart", "continue") and iv["state"] == "pause":
-            iv["state"] = "run"
+            iv["state"] = "rec"
+            iv.pop("warn", None)
+            iv["shoot_now"] = True
             return self._xml("ok")
         if value in ("cancel", "stop"):
-            if iv["state"] in ("run", "pause"):
-                self._interval_stop("enable", warn="interval_canceled" if value == "cancel" else
-                                    "interval_finish")
+            if iv["state"] in ("rec", "pause"):
+                self._interval_stop("enable", warn="interval_canceled" if value == "cancel" else None)
                 return self._xml("ok")
-            iv["armed"] = iv["research"] = False
             return self._xml("ok")
         return self._xml("err_reject")
 
@@ -721,19 +744,27 @@ class EmuCamera:
         iv = self.interval
         num = int(self.curmenu_value("menu_item_id_interval_shoot_num") or 1080)
         secs = float(self.curmenu_value("menu_item_id_interval_shoot_interval") or 30)
-        iv.update(state="run", remain=num, armed=False, group=self.card.start_group("Interval"))
+        iv.update(state="rec", remain=num, armed=False, group=self.card.start_group("Interval"))
         iv.pop("warn", None)
         period = max(0.05, secs * self.cfg.interval_scale)
 
         async def run() -> None:
             while iv["remain"] > 0:
-                if iv["state"] == "run":
+                if iv["state"] == "rec":
+                    iv["shoot_now"] = False
                     self.card.add_photo(group=iv["group"], now=True)
                     iv["remain"] -= 1
                     if self.cfg.wedge_realism:
                         self.busy_until = self.now() + min(self.cfg.capture_busy_s, period / 2)
-                await asyncio.sleep(period)
-            self._interval_stop("enable", warn="interval_finish")
+                    if iv["remain"] <= 0:
+                        break
+                end = self.now() + period
+                while self.now() < end and not iv.get("shoot_now"):
+                    await asyncio.sleep(min(0.05, period))
+            iv.update(state="off", task=None, warn="interval_finish", remain=0)
+            await asyncio.sleep(max(0.2, 5.0 * min(1.0, self.cfg.interval_scale * 4)))  # real S5: off -> enable 4-6 s
+            if iv["state"] == "off":
+                self._interval_stop("enable")
         task = asyncio.ensure_future(run())
         iv["task"] = task
         self._tasks.add(task)
@@ -744,9 +775,11 @@ class EmuCamera:
         t = iv.get("task")
         if t is not None and t is not asyncio.current_task():
             t.cancel()
-        iv.update(state=state, armed=False, research=False, task=None, remain=0)
+        iv.update(state=state, armed=False, research=False, task=None, remain=0, shoot_now=False)
         if warn:
             iv["warn"] = warn
+        else:
+            iv.pop("warn", None)
 
     # -------------------------------------------------------------- live view
     def _startstream(self, ip: str, value: Optional[str]) -> Tuple[str, str, str]:

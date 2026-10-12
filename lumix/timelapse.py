@@ -18,12 +18,19 @@
     ``duration`` caps the run on the slot grid (pauses do not count).
 
 ``native`` engine
-    The camera's own interval shooting, as LUMIX Sync drives it
-    (docs/lumix-sync-wifi-flow.md section 10): drive mode ``stopmotion_interval``,
-    ``interval_shoot_interval`` / ``interval_shoot_num``, ``camctrl interval set``
-    (repeated while ``ok_under_research``), then the shutter starts the run;
-    ``camctrl interval pause|restart|stop``. Progress comes from getstate
-    ``interval_status`` / ``interval_remain_num``. Only for profiles with
+    The camera's own interval shooting: drive mode ``stopmotion_interval``
+    (value2 ``interval``), ``interval_shoot_interval`` / ``interval_shoot_num`` /
+    ``interval_start_time``, then the shutter (``camcmd capture``) starts the run;
+    ``camctrl interval pause|restart|stop``. LUMIX Sync also sends ``camctrl
+    interval set`` before the shutter (docs/lumix-sync-wifi-flow.md section 10),
+    but a DC-S5 (fw 2.03) answers ``err_reject`` to it whenever getstate already
+    says ``interval_status=enable`` (verified 2026-10-12: set -> err_reject, then
+    capture -> ok started a 3-shot run), so it is only sent when the camera is not
+    ready yet. getstate ``interval_status``: ``enable`` (armed, idle), ``rec``
+    (running; other models may say ``run``), ``pause``, ``off`` (just finished,
+    warn_disp ``interval_finish``), then ``enable`` again; ``interval_remain_num``
+    counts down. When the run cannot be armed the job falls back to the server
+    engine instead of failing (``job.message`` says why). Only for profiles with
     ``capabilities["interval_native"]``. While it runs the body answers
     ``err_busy`` to capture/mode switches, so the UI's shutter and file browsing
     are refused (``Camera.interval_active``). A run the camera lost (power
@@ -70,8 +77,24 @@ REC_RETRY_S = 60.0             # at most one live-view (recmode) restart per min
 RECONNECT_RESUMABLE = ("poweroff", "server-stop", "reconnect")
 
 
+# getstate interval_status while an in-camera run is going (S5: rec / pause)
+INTERVAL_RUNNING = ("run", "rec", "pause")
+INTERVAL_SHOOTING = ("run", "rec")
+
+
 class TimelapseError(ValueError):
     pass
+
+
+def _drive_value(r: Any) -> Optional[List[Optional[str]]]:
+    """getsetting drivemode -> [value, value2]: the S5 answers
+    ``<settingvalue drivemode="stopmotion_interval">interval</settingvalue>``."""
+    if not getattr(r, "ok", False) or getattr(r, "xml", None) is None:
+        return None
+    el = r.xml.find("settingvalue")
+    if el is None or el.get("drivemode") is None:
+        return None
+    return [el.get("drivemode"), (el.text or "").strip() or None]
 
 
 def _slug(text: str) -> str:
@@ -636,6 +659,8 @@ class TimelapseEngine:
         self._epoch = cam.connected_at
         if cam.status != "ready":
             return
+        if j.engine == "server":
+            await self._single_drive(j)
         if j.ae_lock and j.engine == "server":
             from .camera import Busy
             try:
@@ -655,6 +680,52 @@ class TimelapseEngine:
             except Busy as e:
                 j.errors.append("AE lock: %s" % e)
         self._changed()
+
+    async def _single_drive(self, j: TimelapseJob) -> None:
+        """Server engine: one capture must be one photo. In Time Lapse drive the
+        shutter starts the camera's own interval run instead (burst / self-timer
+        are wrong too), so the run uses single drive and the user's drive mode is
+        put back when it ends (``_restore_drive``).
+
+        Some S5 sessions answer ``setsetting drivemode=normal`` with ok and keep
+        Time Lapse (2026-10-12, curmenu drivemode enable="no"). Then every shot is
+        a one-shot in-camera run: ``interval_shoot_num=1``, capture only while
+        ``interval_status`` is ``enable`` (the camera needs ~5 s after each shot),
+        and the user's image count is restored at the end."""
+        from .camera import Busy
+        cam = self.cam
+        if j.native.get("oneshot"):
+            return
+        try:
+            async with cam.exclusive("timelapse", timeout=10) as t:
+                r = await t.cgi("getsetting", "drivemode", timeout=4)
+                cur = _drive_value(r)
+                if cur is None or cur[0] == "normal":
+                    return
+                j.native.setdefault("drive_saved", cur)
+                r = await t.cgi("setsetting", "drivemode", "normal", timeout=6)
+                await asyncio.sleep(0.5)
+                now = _drive_value(await t.cgi("getsetting", "drivemode", timeout=4))
+                cam.log_event("timelapse", "timelapse %s: drive mode %s -> single for the server "
+                                           "engine: %s (now %s)" % (
+                                               j.name, "/".join(v for v in cur if v), r.result,
+                                               "/".join(v for v in now if v) if now else "?"))
+                if now is None or now[0] == "normal":
+                    return
+                j.native.pop("drive_saved", None)       # unchanged: nothing to put back
+                if now[0] != "stopmotion_interval" or now[1] not in ("interval", None):
+                    return
+                if cam.state.get("interval_status") == "enable":
+                    j.native.setdefault("shoot_num_saved", cam.state.get("interval_remain_num"))
+                for typ, v in (("interval_shoot_num", "1"), ("interval_start_time", "-1")):
+                    r = await t.cgi("setsetting", typ, v, timeout=6)
+                    if not r.ok:
+                        raise TimelapseError("camera refused %s=%s (%s)" % (typ, v, r.result))
+                j.native["oneshot"] = True
+                cam.log_event("timelapse", "timelapse %s: the camera keeps Time Lapse drive; every "
+                                           "shot is a one-shot in-camera run" % j.name)
+        except Busy as e:
+            j.errors.append("drive mode: %s" % e)
 
     async def _ensure_rec(self, j: TimelapseJob) -> bool:
         cam = self.cam
@@ -690,6 +761,14 @@ class TimelapseEngine:
                 reason = "camera busy (in use on the body)"
         if reason is None and not await self._ensure_rec(j):
             reason = "camera not in rec mode (%s)" % cam.state.get("cammode")
+        if reason is None and j.native.get("oneshot"):
+            # a capture now would land on a run that is still finishing
+            deadline = time.monotonic() + tol
+            while cam.state.get("interval_status") != "enable" and time.monotonic() < deadline:
+                await asyncio.sleep(0.25)
+            if cam.state.get("interval_status") != "enable":
+                reason = "camera still finishing the last shot (interval_status %s)" % (
+                    cam.state.get("interval_status"))
         if reason:
             self._skip(j, reason)
             return
@@ -743,6 +822,8 @@ class TimelapseEngine:
 
     # ----------------------------------------------------------- native engine
     async def _native_arm(self, j: TimelapseJob, count: int) -> None:
+        """Arm and start an in-camera run of ``count`` shots (TimelapseError when
+        the camera does not start it)."""
         from .camera import Busy
         cam = self.cam
         try:
@@ -750,30 +831,60 @@ class TimelapseEngine:
                 cam.interval_owner = "timelapse"
                 if cam.state.get("cammode") != "rec":
                     await cam.ensure_rec()
-                if "drivemode_saved" not in j.native:
-                    r = await t.cgi("getsetting", "drivemode", timeout=4)
-                    j.native["drivemode_saved"] = r.setting_value("drivemode") if r.ok else None
-                steps = [("drivemode", "stopmotion_interval", "interval"),
-                         ("interval_shoot_interval", str(int(j.interval_s)), None),
-                         ("interval_shoot_num", str(count), None),
-                         ("interval_start_time", "-1", None)]
+                r = await t.cgi("getsetting", "drivemode", timeout=4)
+                cur = _drive_value(r)
+                if "drive_saved" not in j.native and "drivemode_saved" not in j.native:
+                    j.native["drive_saved"] = cur
+                steps = [] if cur == ["stopmotion_interval", "interval"] else \
+                    [("drivemode", "stopmotion_interval", "interval")]
+                steps += [("interval_shoot_interval", str(int(j.interval_s)), None),
+                          ("interval_shoot_num", str(count), None),
+                          ("interval_start_time", "-1", None)]
                 for typ, v, v2 in steps:
                     r = await t.cgi("setsetting", typ, v, v2, timeout=6)
                     cam.log_event("timelapse", "native: setsetting %s=%s -> %s" % (typ, v, r.result))
-                    if not r.ok and typ == "drivemode":
-                        raise TimelapseError("camera refused interval drive mode (%s)" % r.result)
-                for _ in range(10):
-                    r = await t.cgi("camctrl", "interval", "set", timeout=6)
-                    if not r.result.startswith("ok_under_research"):
+                    if not r.ok:
+                        raise TimelapseError("camera refused %s=%s (%s)" % (typ, v, r.result))
+                await asyncio.sleep(0.3)
+                with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                    await cam._refresh_state()
+                st = cam.state.get("interval_status")
+                for _ in range(20):
+                    if st != "off":
                         break
-                    await asyncio.sleep(1.0)
-                cam.log_event("timelapse", "native: camctrl interval set -> %s" % r.result)
-                if r.result != "ok":
-                    raise TimelapseError("camctrl interval set -> %s" % r.result)
+                    await asyncio.sleep(0.5)            # last run just finished (~5 s)
+                    with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                        await cam._refresh_state()
+                    st = cam.state.get("interval_status")
+                if st != "enable":
+                    # not armed yet (LUMIX Sync's step; the S5 rejects it once armed)
+                    for _ in range(10):
+                        r = await t.cgi("camctrl", "interval", "set", timeout=6)
+                        if not r.result.startswith("ok_under_research"):
+                            break
+                        await asyncio.sleep(1.0)
+                    cam.log_event("timelapse", "native: camctrl interval set (status %s) -> %s"
+                                  % (st, r.result))
+                    if r.result != "ok":
+                        raise TimelapseError("camctrl interval set -> %s (interval_status %s)"
+                                             % (r.result, st))
                 r = await cam.cmd("camcmd", value="capture", timeout=10, tries=3, judge_wedge=False)
                 cam.log_event("timelapse", "native: shutter (starts the run) -> %s" % r.result)
                 if not r.ok:
                     raise TimelapseError("starting the interval run: capture -> %s" % r.result)
+                # the run shows up in getstate within a second or two
+                started = False
+                for _ in range(10):
+                    await asyncio.sleep(0.5)
+                    with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                        await cam._refresh_state()
+                    st = cam.state.get("interval_status")
+                    if st in INTERVAL_RUNNING or (st == "off" and count <= 1):
+                        started = True
+                        break
+                if not started:
+                    raise TimelapseError("the camera took the shutter but did not start an interval "
+                                         "run (interval_status %s)" % st)
         except Busy as e:
             cam.interval_owner = None
             raise TimelapseError(str(e))
@@ -799,15 +910,57 @@ class TimelapseEngine:
         return r.result
 
     async def _native_restore(self, j: TimelapseJob) -> None:
-        saved = j.native.get("drivemode_saved")
         self.cam.interval_owner = None
-        if not saved or saved == "stopmotion_interval" or self.cam.status != "ready":
+        await self._restore_drive(j)
+
+    async def _restore_drive(self, j: TimelapseJob) -> None:
+        """Put back the drive mode the run started from (native: the user's mode if
+        it was not Time Lapse; server: Time Lapse etc. after single drive) and the
+        image count a one-shot server run replaced."""
+        num = j.native.get("shoot_num_saved")
+        if num and self.cam.status == "ready":
+            from .camera import Busy
+            with contextlib.suppress(Busy, Exception):
+                deadline = time.monotonic() + 10
+                while (self.cam.state.get("interval_status") in INTERVAL_RUNNING + ("off",)
+                       and time.monotonic() < deadline):
+                    await asyncio.sleep(0.5)            # let the last one-shot run end
+                async with self.cam.exclusive("timelapse", timeout=8) as t:
+                    r = await t.cgi("setsetting", "interval_shoot_num", str(num), timeout=6)
+                    self.cam.log_event("timelapse", "timelapse %s: image count back to %s -> %s"
+                                       % (j.name, num, r.result))
+                    if r.ok:
+                        j.native.pop("shoot_num_saved", None)
+        saved = j.native.get("drive_saved")
+        if saved is None and j.native.get("drivemode_saved"):     # jobs saved before 2026-10-12
+            saved = [j.native["drivemode_saved"], None]
+        if not saved or not saved[0] or self.cam.status != "ready":
             return
+        if j.engine == "native" and saved[0] == "stopmotion_interval":
+            return                                  # the run left it there
         from .camera import Busy
         with contextlib.suppress(Busy, Exception):
             async with self.cam.exclusive("timelapse", timeout=8) as t:
-                r = await t.cgi("setsetting", "drivemode", saved, timeout=6)
-                self.cam.log_event("timelapse", "native: drive mode back to %s -> %s" % (saved, r.result))
+                r = await t.cgi("setsetting", "drivemode", saved[0], saved[1], timeout=6)
+                self.cam.log_event("timelapse", "timelapse %s: drive mode back to %s -> %s"
+                                   % (j.name, "/".join(v for v in saved if v), r.result))
+                if r.ok:
+                    j.native.pop("drive_saved", None)
+                    j.native.pop("drivemode_saved", None)
+
+    async def _fallback_to_server(self, j: TimelapseJob, why: str) -> None:
+        """The in-camera run could not be started: shoot from the server instead."""
+        self.cam.interval_owner = None
+        j.errors.append("in-camera: %s" % why)
+        j.engine = "server"
+        j.native["fallback"] = why
+        j.message = ("In-camera interval could not be started (%s); the server is taking "
+                     "the shots instead" % why)
+        self.cam.log_event("warn", "timelapse %s: %s" % (j.name, j.message))
+        if j.anchor_t is None:
+            j.reanchor()
+        self._changed()
+        await self._run_server(j)
 
     async def _run_native(self, j: TimelapseJob) -> None:
         cam = self.cam
@@ -822,21 +975,31 @@ class TimelapseEngine:
             if st == "pause":
                 cam.interval_owner = "timelapse"
                 await self._native_ctrl(j, "restart")
-            elif st != "run":
+            elif st not in INTERVAL_SHOOTING:
                 nat["armed"] = False
         if not nat.get("armed"):
             left = (j.count or 0) - j.shots
             if left <= 0:
                 await self._finish(j, "done")
                 return
-            await self._native_arm(j, left)
+            try:
+                await self._native_arm(j, left)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:      # TimelapseError, CamError, OSError, timeouts
+                log.warning("native arm failed, falling back to the server engine: %s", e)
+                if cam.state.get("interval_status") in INTERVAL_SHOOTING:
+                    # never leave a half-started camera run behind the server's shots
+                    await self._native_ctrl(j, "stop")
+                await self._fallback_to_server(j, str(e) or type(e).__name__)
+                return
         cam.interval_owner = "timelapse"
         last_remain = nat.get("remain")
         while True:
             await asyncio.sleep(1.0)
             if await self._wait_ready(j):
                 st = cam.state.get("interval_status")
-                if st not in ("run", "pause"):
+                if st not in INTERVAL_RUNNING:
                     left = (j.count or 0) - j.shots
                     cam.log_event("timelapse", "native: the camera lost the interval run "
                                                "(power cycle?); re-arming %d shot(s)" % left)
@@ -855,7 +1018,7 @@ class TimelapseEngine:
                 remain = int(cam.state.get("interval_remain_num") or -1)
             except ValueError:
                 remain = -1
-            if st in ("run", "pause"):
+            if st in INTERVAL_RUNNING:
                 nat["seen_run"] = True
                 w = "interval run paused on the camera" if st == "pause" else None
                 if w != j.waiting:
@@ -891,6 +1054,8 @@ class TimelapseEngine:
             await self._native_ctrl(j, "stop")
             j.native["armed"] = False
             await self._native_restore(j)
+        elif j.engine == "server" and (j.native.get("drive_saved") or j.native.get("shoot_num_saved")):
+            await self._restore_drive(j)
         if self.cam.interval_owner == "timelapse":
             self.cam.interval_owner = None
         if j.auto_import and j.shots > j.frames_imported:

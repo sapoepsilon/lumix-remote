@@ -307,7 +307,7 @@ class NativeEngineTest(EmuTestCase):
                                  {"interval": 2, "count": 4, "native": True, "import": True,
                                   "dest": self.dest, "name": "nat"})
             self.assertEqual(st, 201, d)
-            await r.wait(lambda: r.emu.interval["state"] == "run", 10, "camera interval run")
+            await r.wait(lambda: r.emu.interval["state"] == "rec", 10, "camera interval run")
             self.assertEqual(r.emu.curmenu_value("menu_item_id_interval_shoot_num"), "4")
             self.assertEqual(r.emu.curmenu_value("menu_item_id_interval_shoot_interval"), "2")
             # the UI shutter is refused while the body runs its own interval (not the wedge)
@@ -318,7 +318,7 @@ class NativeEngineTest(EmuTestCase):
             self.assertEqual(d["job"]["state"], "paused")
             self.assertEqual(r.emu.interval["state"], "pause")
             st, d = await r.call("POST", "/api/timelapse/resume")
-            await r.wait(lambda: r.emu.interval["state"] == "run", 5, "camera run again")
+            await r.wait(lambda: r.emu.interval["state"] == "rec", 5, "camera run again")
             await r.wait(lambda: r.job().state == "done", 40, "done")
             j = r.job()
             self.assertEqual(j.shots, 4)
@@ -330,6 +330,82 @@ class NativeEngineTest(EmuTestCase):
             names = [os.path.basename(f) for f in j.frames]
             self.assertEqual(names, sorted(names))
         self.run_(go(), 90)
+
+
+class NativeFallbackTest(EmuTestCase):
+    cfg = emu_cfg(interval_scale=1.0)
+
+    def test_native_arm_failure_falls_back_to_server_engine(self):
+        """Failure handling (forced in the emulator; the real S5 started every run in
+        tests/fixtures/real-s5-interval-2026-10-12.log). A camera that takes the
+        shutter but never starts its interval run (or
+        refuses any arming step): the job keeps going on the server engine, in
+        single drive, and the user's Time Lapse drive mode comes back at the end."""
+        r = self.rig
+
+        async def go():
+            await r.call("POST", "/api/setting", {"type": "drivemode", "value": "stopmotion_interval",
+                                                  "value2": "interval"})
+            r.emu._interval_drive = lambda: False       # shutter = one photo, no run
+            st, d = await r.call("POST", "/api/timelapse/start",
+                                 {"interval": 2, "count": 3, "native": True, "name": "fb"})
+            self.assertEqual(st, 201, d)
+            await r.wait(lambda: r.job().engine == "server", 15, "fallback to the server engine")
+            self.assertIn("server is taking the shots", r.job().message)
+            await r.wait(lambda: r.emu.settings["drivemode"][0] == "normal", 10, "single drive")
+            await r.wait(lambda: r.job().state == "done", 40, "done")
+            j = r.job()
+            self.assertEqual(j.shots, 3)
+            self.assertNotEqual(j.state, "failed")
+            self.assertEqual(r.emu.settings["drivemode"], ("stopmotion_interval", "interval"))
+            self.assertIsNone(r.sess.cam.interval_owner)
+            self.assertFalse(r.sess.cam.wedged)
+        self.run_(go(), 90)
+
+
+class ServerEngineDriveTest(EmuTestCase):
+    cfg = emu_cfg()
+
+    def test_server_engine_uses_single_drive_and_restores_time_lapse(self):
+        r = self.rig
+
+        async def go():
+            await r.call("POST", "/api/setting", {"type": "drivemode", "value": "stopmotion_interval",
+                                                  "value2": "interval"})
+            st, d = await r.call("POST", "/api/timelapse/start", {"interval": 2, "count": 2, "name": "sd"})
+            self.assertEqual(st, 201, d)
+            await r.wait(lambda: r.job().shots >= 1, 15, "first shot")
+            self.assertEqual(r.emu.settings["drivemode"][0], "normal")
+            self.assertEqual(r.emu.interval["state"], "enable")      # no in-camera run started
+            await r.wait(lambda: r.job().state == "done", 30, "done")
+            self.assertEqual(r.emu.settings["drivemode"], ("stopmotion_interval", "interval"))
+        self.run_(go(), 60)
+
+
+class ServerEngineLockedDriveTest(EmuTestCase):
+    cfg = emu_cfg(drive_locked=True, interval_scale=0.05)
+
+    def test_locked_time_lapse_drive_shoots_one_shot_runs(self):
+        """Real S5 2026-10-12: drivemode=normal answered ok but stayed Time Lapse;
+        one-shot runs gave 3 photos for 3 slots (server log 11:44, fixture)."""
+        r = self.rig
+
+        async def go():
+            await r.call("POST", "/api/setting", {"type": "drivemode", "value": "stopmotion_interval",
+                                                  "value2": "interval"})
+            await r.call("POST", "/api/setting", {"type": "interval_shoot_num", "value": "1080"})
+            before = r.emu.card.counts()[0]
+            st, d = await r.call("POST", "/api/timelapse/start", {"interval": 3, "count": 3, "name": "lk"})
+            self.assertEqual(st, 201, d)
+            await r.wait(lambda: r.job().native.get("oneshot"), 15, "one-shot mode")
+            self.assertEqual(r.emu.curmenu_value("menu_item_id_interval_shoot_num"), "1")
+            await r.wait(lambda: r.job().state == "done", 40, "done")
+            self.assertEqual(r.job().shots, 3)
+            self.assertEqual(r.emu.card.counts()[0] - before, 3)          # one photo per shot
+            await r.wait(lambda: r.emu.curmenu_value("menu_item_id_interval_shoot_num") == "1080",
+                         10, "image count restored")
+            self.assertEqual(r.emu.settings["drivemode"], ("stopmotion_interval", "interval"))
+        self.run_(go(), 60)
 
 
 class QuiesceTest(EmuTestCase):

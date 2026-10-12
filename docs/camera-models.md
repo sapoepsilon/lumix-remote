@@ -36,7 +36,7 @@ preset, BLE, onboarding UI) reads the profile instead of hard-coding the S5.
 | `connect.wedge_busy_streak`, `recmode_refused_from_play_is_wedge`, `busy_budget_exhausted_is_wedge` | wedge detection | 10 / yes / yes |
 | `connect.wedge_triggers` | docs, `GET /api/models/{id}` | the list of things never to send |
 | `capabilities` | UI hints | touch AF (type 5), dual SD, no power zoom, writable rec mode, no Kelvin WB, BLE wake but no BLE power-off |
-| `capabilities.interval_native` (+ `interval_max_count`, `interval_min_s`) | timelapse `native` engine (`camctrl interval`), UI "In-camera" switch | yes, 9999, 1 s (command flow from LUMIX Sync + emulator; not yet run on the body). Generic: no |
+| `capabilities.interval_native` (+ `interval_max_count`, `interval_min_s`) | timelapse `native` engine (`camctrl interval`), UI "In-camera" switch | yes, 9999, 1 s (verified on the body 2026-10-12: Time Lapse drive + counts, then the shutter starts the run; `camctrl interval set` is rejected once armed and not needed). Generic: no |
 | `liveview` | `lumix.liveview.extract_jpeg` | JPEG at `be16(data[30:32]) + 32`, SOI search fallback |
 | `menu_assist` | UI "Tap in MF" default, "Close MF Assist inset" | MF tap opens the PIP inset, not switchable remotely, closed by flipping focus to AF-S and back |
 | `auto_preset`, `auto_saved_types` | `lumix.presets.AutoPreset` | iA (fallback Program AE / Creative Video P), AF-S/AF-C, auto-detect AF, ISO auto, AWB, EV 0, multi metering, single drive |

@@ -126,6 +126,7 @@ Result-code buckets used by the live-view model: `err_critical`/`err_param`/`err
 ## 10. Interval / stop motion / other remote modes
 
 - Interval: drivemode set via the allmenu command, then `camctrl&type=interval&value=set` (repeats every 1 s while reply is `ok_under_research`), then shutter. Control: `camctrl&type=interval&value=pause|restart|continue|cancel|stop`. State in getstate: `<interval_status>`, `<interval_remain_num>`, `<interval_end_time>`, warn_disp `interval_canceled|interval_fail|interval_finish|interval_ng_mode|interval_pause`.
+- Real DC-S5 fw 2.03 (2026-10-12): with drive mode `stopmotion_interval`/`interval` getstate already says `interval_status=enable`, and `camctrl interval set` then answers `err_reject`. The shutter alone (`camcmd capture`) starts the run. Running = `interval_status=rec` (not `run`), `pause` (+ warn `interval_pause`), `restart` resumes with a shot right away, `stop` -> `enable`; a finished run shows `off` + `interval_finish` for ~5 s, then `enable`.
 - Stop motion: `camctrl&type=stop_motion&value=<op>`; the app sends `value=pause` when opening a menu while getstate `<stop_motion>` is `auto`.
 - Live composite `camctrl&type=livecomp&value=<op>`, high-res `camctrl&type=hrs&value=<op>`, program shift `camctrl&type=program_shift&value=<dir>`, shutter sync `camctrl&type=shtrspeed_syncro&value=..&value2=..`, `camctrl&type=frame_ctrl&value=..`, 4K photo marking `camcmd&value=4kphoto_marking`.
 

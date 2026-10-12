@@ -184,6 +184,25 @@ async def set_raw(request: web.Request) -> web.Response:
     return _json(await camera(request).set_raw(t, str(body["value"]), str(v2) if v2 is not None else None))
 
 
+CAMCTRL_DENY = ("fw_update_mode", "lens_fw_update_mode")
+
+
+@_guard
+async def camctrl(request: web.Request) -> web.Response:
+    """camctrl passthrough ({type, value, value2?}), e.g. interval set|cancel.
+    Firmware-update types are refused."""
+    body = await _body(request)
+    t, v = str(body["type"]), str(body["value"])
+    if t in CAMCTRL_DENY:
+        raise ValueError("camctrl %s is not allowed" % t)
+    v2 = body.get("value2")
+    cam = camera(request)
+    async with cam.exclusive("camctrl") as tr:
+        r = await tr.cgi("camctrl", t, v, str(v2) if v2 is not None else None)
+    cam.log_event("cmd", "camctrl %s=%s%s -> %s" % (t, v, "/%s" % v2 if v2 is not None else "", r.result))
+    return _json({"result": r.result, "type": t, "value": v})
+
+
 async def get_setting_one(request: web.Request) -> web.Response:
     cam = camera(request)
     sid = request.match_info["id"]
@@ -427,6 +446,7 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
         ("POST", "/api/settings/{id}", set_setting),
         ("GET", "/api/getsetting/{type}", getsetting),
         ("POST", "/api/camcmd", camcmd),
+        ("POST", "/api/camctrl", camctrl),
         ("GET", "/api/state", state_raw),
         ("GET", "/api/info", info),
         ("POST", "/api/setting", set_raw),

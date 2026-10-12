@@ -6,6 +6,7 @@ so it keeps working while the client is refactored.
 """
 
 import asyncio
+import os
 import re
 import struct
 import time
@@ -289,6 +290,8 @@ class WedgeTest(EmuTestBase):
 
     async def test_capture_busy_window(self):
         await self.ready_in_rec()
+        # the recorded body boots in Time Lapse drive, where the shutter starts an interval run
+        self.assertEqual(await self.result(mode="setsetting", type="drivemode", value="normal"), "ok")
         before = (await self.control("state"))["card"]["total"]
         self.assertEqual(await self.result(mode="camcmd", value="capture"), "ok")
         self.assertIn("<sd_access>on</sd_access>", await self.cgi(mode="getstate"))
@@ -506,29 +509,81 @@ class IntervalTest(EmuTestBase):
     cfg_kw = {"interval_scale": 0.002}
 
     async def test_interval_run(self):
+        """Real DC-S5 fw 2.03 (2026-10-12, tests/fixtures/real-s5-interval-2026-10-12.log
+        11:31:56-11:32:54): Time Lapse drive arms the run
+        (interval_status enable), ``camctrl interval set`` answers err_reject, the
+        shutter starts the run (status rec), pause/restart/stop work."""
         await self.ready_in_rec()
-        # the recorded body boots in Time Lapse drive (curmenu); start from Single
-        self.assertEqual(await self.result(mode="setsetting", type="drivemode", value="normal"), "ok")
-        self.assertEqual(await self.result(mode="camctrl", type="interval", value="set"),
-                         "err_reject")                  # drive mode is not interval yet
         self.assertEqual(await self.result(mode="setsetting", type="drivemode",
-                                           value="stopmotion_interval"), "ok")
+                                           value="stopmotion_interval", value2="interval"), "ok")
+        self.assertIn("<settingvalue drivemode=\"stopmotion_interval\">interval</settingvalue>",
+                      await self.cgi(mode="getsetting", type="drivemode"))
         self.assertIn("<burst_interval_status>on</burst_interval_status>",
                       await self.cgi(mode="getstate"))
+        self.assertIn("<interval_status>enable</interval_status>", await self.cgi(mode="getstate"))
         self.assertEqual(await self.result(mode="camctrl", type="interval", value="set"),
-                         "ok_under_research")
-        self.assertEqual(await self.result(mode="camctrl", type="interval", value="set"), "ok")
+                         "err_reject")
         before = (await self.control("state"))["card"]
         self.assertEqual(await self.result(mode="camcmd", value="capture"), "ok")
         await asyncio.sleep(0.3)
         st = await self.cgi(mode="getstate")
-        self.assertIn("<interval_status>run</interval_status>", st)
+        self.assertIn("<interval_status>rec</interval_status>", st)
         self.assertEqual(await self.result(mode="camcmd", value="recmode"), "err_busy")
-        self.assertEqual(await self.result(mode="camctrl", type="interval", value="cancel"), "ok")
+        self.assertEqual(await self.result(mode="camctrl", type="interval", value="pause"), "ok")
+        st = await self.cgi(mode="getstate")
+        self.assertIn("<interval_status>pause</interval_status>", st)
+        self.assertIn("<warn_disp>interval_pause</warn_disp>", st)
+        self.assertEqual(await self.result(mode="camctrl", type="interval", value="restart"), "ok")
+        self.assertIn("<interval_status>rec</interval_status>", await self.cgi(mode="getstate"))
+        self.assertEqual(await self.result(mode="camctrl", type="interval", value="stop"), "ok")
+        self.assertIn("<interval_status>enable</interval_status>", await self.cgi(mode="getstate"))
         after = (await self.control("state"))["card"]
         self.assertGreater(after["total"], before["total"])
         self.assertEqual(after["top_level"], before["top_level"] + 1)   # one new Interval group
-        self.assertIn("<warn_disp>interval_canceled</warn_disp>", await self.cgi(mode="getstate"))
+
+    def test_real_s5_trace_backs_the_model(self):
+        """The emulator's interval model is the recorded real-camera sequence."""
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "real-s5-interval-2026-10-12.log")
+        with open(path) as f:
+            log = f.read()
+        i = log.index("[11:31:56.129] GET /cam.cgi?mode=camctrl&type=interval&value=set")
+        self.assertIn("err_reject", log[i:i + 200])
+        j = log.index("[11:32:07.032] GET /cam.cgi?mode=camcmd&value=capture", i)
+        self.assertIn("<result>ok</result>", log[j:j + 200])
+        self.assertIn("'interval_status': 'rec'", log[j:j + 400])
+        for line in ("'interval_status': 'pause', 'warn_disp': 'interval_pause'",
+                     "'warn_disp': 'interval_finish'", "'interval_status': 'enable', 'warn_disp': 'no_disp'"):
+            self.assertIn(line, log)
+
+    async def test_shutter_during_run_starts_over(self):
+        """Real S5 11:38:17: capture during a 2-shot run -> ok, remain back to 2."""
+        await self.ready_in_rec()
+        self.assertEqual(await self.result(mode="setsetting", type="interval_shoot_num", value="2"), "ok")
+        self.assertEqual(await self.result(mode="setsetting", type="interval_shoot_interval",
+                                           value="600"), "ok")           # 1.2 s at this scale
+        self.assertEqual(await self.result(mode="setsetting", type="drivemode",
+                                           value="stopmotion_interval", value2="interval"), "ok")
+        self.assertEqual(await self.result(mode="camcmd", value="capture"), "ok")
+        await asyncio.sleep(0.8)            # past the card write, run still going
+        self.assertEqual(await self.result(mode="camcmd", value="capture"), "ok")
+        self.assertIn("<interval_status>rec</interval_status>", await self.cgi(mode="getstate"))
+        self.assertEqual(await self.result(mode="camctrl", type="interval", value="stop"), "ok")
+
+    async def test_interval_run_finishes(self):
+        await self.ready_in_rec()
+        for typ, v in (("interval_shoot_num", "2"), ("interval_shoot_interval", "1")):
+            self.assertEqual(await self.result(mode="setsetting", type=typ, value=v), "ok")
+        self.assertEqual(await self.result(mode="setsetting", type="drivemode",
+                                           value="stopmotion_interval", value2="interval"), "ok")
+        self.assertEqual(await self.result(mode="camcmd", value="capture"), "ok")
+        for _ in range(50):
+            st = await self.cgi(mode="getstate")
+            if "<interval_status>off</interval_status>" in st:
+                break
+            await asyncio.sleep(0.01)
+        self.assertIn("<warn_disp>interval_finish</warn_disp>", st)
+        await asyncio.sleep(0.4)
+        self.assertIn("<interval_status>enable</interval_status>", await self.cgi(mode="getstate"))
 
 
 class MultiCameraTest(unittest.IsolatedAsyncioTestCase):

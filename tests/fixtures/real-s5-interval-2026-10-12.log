@@ -1,0 +1,150 @@
+# Real DC-S5 fw 2.03, 2026-10-12, camera command trace (lumix-remote server log, scrubbed).
+# getstate polls are not logged (only state changes); focal/shtrspeed/touch_type polls removed.
+[11:11:02.475] GET /cam.cgi?mode=camctrl&type=touch&value=533/698&value2=on -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:03.182] GET /cam.cgi?mode=camctrl&type=touch&value=0/0&value2=off -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:04.717] GET /cam.cgi?mode=camctrl&type=touch&value=457/626&value2=on -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_reject</result></camrply>
+[11:11:05.843] GET /cam.cgi?mode=camctrl&type=touch&value=0/0&value2=off -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:44.049] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:11:45.536] GET /cam.cgi?mode=setsetting&type=drivemode&value=stopmotion_interval&value2=interval -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:46.357] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=30 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:46.817] state change {'interval_end_time': '2020/2/27/0/28'}
+[11:11:47.789] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=961 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:48.568] GET /cam.cgi?mode=setsetting&type=interval_start_time&value=-1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:11:49.625] state change {'interval_remain_num': '961', 'interval_end_time': '2020/2/26/23/29'}
+[11:11:50.444] GET /cam.cgi?mode=camctrl&type=interval&value=set -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_reject</result></camrply>
+[11:11:53.085] GET /cam.cgi?mode=camctrl&type=touch&value=504/687&value2=on -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_reject</result></camrply>
+[11:11:54.861] GET /cam.cgi?mode=camctrl&type=touch&value=0/0&value2=off -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:12:00.283] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:12:05.266] GET /cam.cgi?mode=setsetting&type=drivemode&value=stopmotion_interval&value2=interval -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:12:05.871] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=30 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:12:07.444] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=961 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:12:07.969] GET /cam.cgi?mode=setsetting&type=interval_start_time&value=-1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:12:09.126] GET /cam.cgi?mode=camctrl&type=interval&value=set -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_reject</result></camrply>
+[11:30:35.401] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[11:31:04.361] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1915', 'burst_interval_status': 'on', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'enable', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '961', 'interval_end_time': '2020/2/26/23/29', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+[11:31:42.046] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:31:47.527] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=3 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:31:48.274] state change {'interval_remain_num': '3', 'interval_end_time': '2020/2/26/15/50'}
+[11:31:50.347] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=2 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:31:51.391] state change {'interval_end_time': '2020/2/26/15/49'}
+[11:31:56.129] GET /cam.cgi?mode=camctrl&type=interval&value=set -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_reject</result></camrply>
+[11:32:07.032] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:07.448] state change {'interval_status': 'rec', 'interval_remain_num': '2'}
+[11:32:10.140] state change {'remaincapacity': '1914', 'interval_remain_num': '1'}
+[11:32:12.362] state change {'remaincapacity': '1912', 'burst_interval_status': 'off', 'interval_status': 'off', 'sd2_access': 'on', 'warn_disp': 'interval_finish', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:32:13.646] state change {'sd2_access': 'off'}
+[11:32:16.738] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '3', 'interval_end_time': '2020/2/26/15/49'}
+[11:32:26.283] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=6 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:27.435] state change {'interval_remain_num': '6', 'interval_end_time': '2020/2/26/15/50'}
+[11:32:28.857] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=5 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:36.169] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:36.502] state change {'interval_status': 'rec', 'interval_remain_num': '5'}
+[11:32:37.772] state change {'remaincapacity': '1911', 'sd2_access': 'on'}
+[11:32:38.851] state change {'sd2_access': 'off'}
+[11:32:39.727] GET /cam.cgi?mode=camctrl&type=interval&value=pause -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:39.931] state change {'interval_status': 'pause', 'warn_disp': 'interval_pause'}
+[11:32:45.177] state change {'warn_disp': 'no_disp'}
+[11:32:46.348] GET /cam.cgi?mode=camctrl&type=interval&value=restart -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:46.695] state change {'interval_status': 'rec', 'interval_remain_num': '4'}
+[11:32:47.903] state change {'remaincapacity': '1910', 'sd2_access': 'on'}
+[11:32:49.094] state change {'sd2_access': 'off'}
+[11:32:51.592] state change {'interval_remain_num': '3'}
+[11:32:52.683] state change {'remaincapacity': '1909', 'sd2_access': 'on'}
+[11:32:54.694] GET /cam.cgi?mode=camctrl&type=interval&value=stop -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:32:54.866] state change {'interval_status': 'enable', 'sd2_access': 'off', 'interval_remain_num': '6', 'interval_end_time': '2020/2/26/15/51'}
+[11:35:23.455] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:35:23.536] GET /cam.cgi?mode=setsetting&type=drivemode&value=stopmotion_interval&value2=interval -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:35:23.815] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=30 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:35:24.149] state change {'interval_end_time': '2020/2/26/15/55'}
+[11:35:24.349] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=961 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:35:24.580] GET /cam.cgi?mode=setsetting&type=interval_start_time&value=-1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:35:24.767] GET /cam.cgi?mode=camctrl&type=interval&value=set -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_reject</result></camrply>
+[11:35:27.167] state change {'interval_remain_num': '961', 'interval_end_time': '2020/2/26/23/53'}
+[11:36:47.702] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[11:37:16.634] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1909', 'burst_interval_status': 'on', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'enable', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '961', 'interval_end_time': '2020/2/26/23/53', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+[11:37:35.940] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:37:36.909] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=2 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:37:37.515] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=3 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:37:38.198] state change {'interval_remain_num': '3', 'interval_end_time': '2020/2/26/15/55'}
+[11:37:39.125] GET /cam.cgi?mode=setsetting&type=interval_start_time&value=-1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:37:40.133] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:37:41.571] state change {'remaincapacity': '1908', 'interval_status': 'rec', 'sd2_access': 'on', 'interval_remain_num': '2'}
+[11:37:43.111] state change {'interval_remain_num': '1'}
+[11:37:44.365] state change {'interval_status': 'off', 'sd2_access': 'off', 'warn_disp': 'interval_finish', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:37:45.724] state change {'remaincapacity': '1907', 'burst_interval_status': 'off', 'sd2_access': 'on'}
+[11:37:47.360] state change {'sd2_access': 'off'}
+[11:37:50.651] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '3', 'interval_end_time': '2020/2/26/15/55'}
+[11:38:13.051] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:38:13.164] GET /cam.cgi?mode=setsetting&type=drivemode&value=normal -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:38:13.260] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:38:13.750] state change {'interval_status': 'rec', 'interval_remain_num': '2'}
+[11:38:16.963] state change {'remaincapacity': '1905', 'sd2_access': 'on', 'interval_remain_num': '1'}
+[11:38:17.580] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:38:18.272] state change {'remaincapacity': '1903', 'interval_remain_num': '2', 'interval_end_time': '2020/2/26/15/56'}
+[11:38:18.548] GET /cam.cgi?mode=setsetting&type=drivemode&value=stopmotion_interval&value2=interval -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:38:20.082] state change {'remaincapacity': '1902', 'interval_remain_num': '1'}
+[11:38:21.460] state change {'sd2_access': 'off'}
+[11:38:23.504] state change {'remaincapacity': '1901', 'interval_status': 'off', 'sd2_access': 'on', 'warn_disp': 'interval_finish', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:38:25.222] state change {'sd2_access': 'off'}
+[11:38:29.416] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '3', 'interval_end_time': '2020/2/26/15/56'}
+[11:38:43.626] GET /cam.cgi?mode=setsetting&type=drivemode&value=normal -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:38:47.389] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:39:53.206] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:39:55.204] state change {'interval_remain_num': '1', 'interval_end_time': '2020/2/26/15/57'}
+[11:39:57.633] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:39:58.081] state change {'interval_status': 'off', 'warn_disp': 'interval_finish', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:39:59.774] state change {'remaincapacity': '1900'}
+[11:40:03.300] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '1', 'interval_end_time': '2020/2/26/15/57'}
+[11:42:10.142] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[11:42:40.550] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1900', 'burst_interval_status': 'on', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'enable', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '1', 'interval_end_time': '2020/2/26/15/57', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+[11:42:51.647] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=1080 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:42:52.816] state change {'interval_remain_num': '1080', 'interval_end_time': '2020/2/26/16/36'}
+[11:42:59.240] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:43:02.968] GET /cam.cgi?mode=setsetting&type=drivemode&value=normal -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:04.670] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:43:04.998] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:05.323] GET /cam.cgi?mode=setsetting&type=interval_start_time&value=-1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:05.736] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:06.339] state change {'interval_status': 'off', 'warn_disp': 'interval_finish', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:43:06.941] state change {'remaincapacity': '1899', 'sd2_access': 'on'}
+[11:43:07.619] state change {'sd2_access': 'off'}
+[11:43:10.961] state change {'burst_interval_status': 'off'}
+[11:43:12.337] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '1', 'interval_end_time': '2020/2/26/16/00'}
+[11:43:13.911] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:14.008] state change {'interval_status': 'off', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:43:14.795] state change {'remaincapacity': '1898', 'sd2_access': 'on', 'warn_disp': 'interval_finish'}
+[11:43:17.252] state change {'sd2_access': 'off'}
+[11:43:20.112] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '1', 'interval_end_time': '2020/2/26/16/00'}
+[11:43:21.801] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:22.058] state change {'interval_status': 'off', 'warn_disp': 'interval_finish', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00'}
+[11:43:22.938] state change {'remaincapacity': '1897', 'sd2_access': 'on'}
+[11:43:24.682] state change {'sd2_access': 'off'}
+[11:43:27.940] state change {'interval_status': 'enable', 'warn_disp': 'no_disp', 'interval_remain_num': '1', 'interval_end_time': '2020/2/26/16/01'}
+[11:43:28.591] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=1080 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:29.400] state change {'interval_remain_num': '1080', 'interval_end_time': '2020/2/26/16/37'}
+[11:43:48.377] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=30 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:43:49.873] state change {'interval_end_time': '2020/2/27/1/00'}
+[11:43:51.331] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:46:12.699] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:46:13.218] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=30 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:46:13.442] GET /cam.cgi?mode=setsetting&type=interval_shoot_num&value=961 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:46:13.631] GET /cam.cgi?mode=setsetting&type=interval_start_time&value=-1 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:46:14.553] state change {'interval_remain_num': '961', 'interval_end_time': '2020/2/27/0/03'}
+[11:46:14.985] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:46:15.840] state change {'interval_status': 'rec', 'interval_remain_num': '960'}
+[11:46:15.906] state change {'remaincapacity': '1896', 'sd2_access': 'on'}
+[11:46:17.739] state change {'sd2_access': 'off'}
+[11:46:47.119] state change {'remaincapacity': '1895', 'interval_remain_num': '959'}
+[11:47:15.881] state change {'remaincapacity': '1894', 'sd2_access': 'on', 'interval_remain_num': '958'}
+[11:47:17.628] state change {'sd2_access': 'off'}
+[11:47:46.216] state change {'remaincapacity': '1893', 'sd2_access': 'on', 'interval_remain_num': '957'}
+[11:47:47.788] state change {'sd2_access': 'off'}
+[11:48:15.294] state change {'interval_remain_num': '956'}
+[11:48:16.718] state change {'remaincapacity': '1892', 'sd2_access': 'on'}
+[11:48:18.064] state change {'sd2_access': 'off'}
+[11:48:46.718] state change {'remaincapacity': '1891', 'sd2_access': 'on', 'interval_remain_num': '955'}
+[11:48:49.457] state change {'sd2_access': 'off'}
+[11:49:15.394] state change {'interval_remain_num': '954'}
+[11:49:17.134] state change {'remaincapacity': '1890'}
+[11:49:46.617] state change {'remaincapacity': '1889', 'sd2_access': 'on', 'interval_remain_num': '953'}
+[11:49:48.424] state change {'sd2_access': 'off'}
