@@ -557,6 +557,12 @@ class EmuCamera:
             return self._xml("err_param")
         if (typ, value) in self.menu_map:
             for item in self.menu_map[(typ, value)]:
+                cur = self.curmenu_value(item)
+                if cur and (typ, cur) not in self.menu_map:
+                    # a sub-choice item whose value is an option token, not a
+                    # cmd_value (Time Lapse Shot "interval" vs "stop_motion", both
+                    # cmd_value stopmotion_interval): the body keeps it
+                    continue
                 self._curmenu_set(item, value)
         elif typ in self.value_items:
             # free-value item (interval_shoot_num, interval_shoot_interval, ...): the

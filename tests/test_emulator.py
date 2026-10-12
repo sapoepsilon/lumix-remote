@@ -553,3 +553,30 @@ class MultiCameraTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CurmenuStateTest(unittest.TestCase):
+    """setsetting <-> curmenu <-> getsetting stay one state (QA 2026-10-12)."""
+
+    def make(self):
+        from emulator.camera import EmuCamera, EmuConfig
+        return EmuCamera(Identity(), EmuConfig(), "127.0.0.1", 1, 2, 3)
+
+    def test_getsetting_follows_recorded_curmenu_at_boot(self):
+        cam = self.make()
+        self.assertEqual(cam.settings["exposure"][0], cam.curmenu_value("menu_item_id_exposure3"))
+        self.assertEqual(cam.settings["drivemode"][0], cam.curmenu_value("menu_item_id_drivemode"))
+
+    def test_setsetting_reaches_items_with_extra_attributes(self):
+        cam = self.make()          # <item id="menu_item_id_sensitivity" enable active value>
+        self.assertEqual(cam._setsetting("iso", "400", None)[2], "ok")
+        self.assertEqual(cam.curmenu_value("menu_item_id_sensitivity"), "400")
+
+    def test_sub_choice_item_keeps_its_token(self):
+        cam = self.make()
+        sub = "menu_item_id_stopmotion_interval_shoot_type"
+        before = cam.curmenu_value(sub)
+        cam._setsetting("drivemode", "normal", None)
+        cam._setsetting("drivemode", "stopmotion_interval", None)
+        self.assertEqual(cam.curmenu_value(sub), before)
+        self.assertEqual(cam.curmenu_value("menu_item_id_drivemode"), "stopmotion_interval")
