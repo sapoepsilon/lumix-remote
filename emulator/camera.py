@@ -217,11 +217,13 @@ class EmuCamera:
         self.touch_on = False
         self.interval = {"armed": False, "research": False, "state": "enable", "remain": 0,
                          "group": None, "task": None}
-        self.settings: Dict[str, Tuple[str, str]] = dict(GETSETTING_DEFAULTS)
-        self.curmenu = self.data["curmenu"]
-        self._sync_settings_from_curmenu()
-        self.card = Card(photos=self._card_args[0], group_size=self._card_args[1],
-                         base_date="2020-02-10T13:15:54")
+        if not hasattr(self, "card"):
+            # non-volatile: menu settings and the card survive a power cycle
+            self.settings: Dict[str, Tuple[str, str]] = dict(GETSETTING_DEFAULTS)
+            self.curmenu = self.data["curmenu"]
+            self._sync_settings_from_curmenu()
+            self.card = Card(photos=self._card_args[0], group_size=self._card_args[1],
+                             base_date="2020-02-10T13:15:54")
         self.counters: Dict[str, int] = {}
         self.event_log: Deque[Dict[str, Any]] = deque(maxlen=500)
 

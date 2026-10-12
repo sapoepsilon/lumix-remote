@@ -580,3 +580,12 @@ class CurmenuStateTest(unittest.TestCase):
         cam._setsetting("drivemode", "stopmotion_interval", None)
         self.assertEqual(cam.curmenu_value(sub), before)
         self.assertEqual(cam.curmenu_value("menu_item_id_drivemode"), "stopmotion_interval")
+
+    def test_card_and_settings_survive_a_power_cycle(self):
+        cam = self.make()
+        cam._setsetting("iso", "400", None)
+        cam.card_marker = cam.card
+        cam.boot()
+        self.assertIs(cam.card, cam.card_marker)
+        self.assertEqual(cam.settings["iso"][0], "400")
+        self.assertEqual(cam.curmenu_value("menu_item_id_sensitivity"), "400")
