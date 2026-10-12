@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Lumix Remote</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="conn"><span id="dot" class="dot"></span><span id="camname">Lumix Remote</span></div>
+  <div class="meta" id="meta"></div>
+</header>
+
+<main class="layout">
+  <section class="viewer">
+    <div class="lv" id="lv">
+      <img id="lvimg" alt="Live view" src="/api/liveview.mjpg">
+      <div class="lv-empty" id="lvempty">Waiting for live view…</div>
+      <div class="touchmark" id="touchmark"></div>
+      <div class="rec-badge" id="recbadge" hidden><span class="rec-dot"></span><span id="rectime">00:00</span></div>
+      <div class="lv-stats" id="lvstats"></div>
+    </div>
+    <div class="actions">
+      <button class="btn-af" id="btnaf" title="One-shot AF">AF</button>
+      <button class="shutter" id="btnshutter" title="Take photo (Space)" aria-label="Take photo"></button>
+      <button class="btn-rec" id="btnrec" title="Start/stop video (R)" aria-label="Record video"><span></span></button>
+    </div>
+    <p class="hint">Tap the live view to focus there. Space = photo, R = video.</p>
+  </section>
+
+  <aside class="panel">
+    <section class="card">
+      <h2>Exposure</h2>
+      <div class="quick" id="quick"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>All settings</h2>
+        <input type="search" id="filter" placeholder="Filter…" aria-label="Filter settings">
+      </div>
+      <div id="allsettings" class="allsettings"><p class="muted">Loading…</p></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>Events</h2><button class="small" id="clearlog">Clear</button></div>
+      <ol class="log" id="log"></ol>
+    </section>
+
+    <section class="card danger-zone">
+      <h2>Power</h2>
+      <p class="muted">The camera can't be switched back on over Wi-Fi.</p>
+      <button class="danger" id="btnpower">Power off camera…</button>
+    </section>
+  </aside>
+</main>
+
+<dialog id="powerdlg">
+  <form method="dialog">
+    <h3>Power off the camera?</h3>
+    <p>You'll need to switch it on by hand afterwards. Wi-Fi can't wake it.</p>
+    <menu>
+      <button value="cancel" autofocus>Cancel</button>
+      <button value="ok" class="danger">Power off</button>
+    </menu>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
