@@ -45,6 +45,7 @@ function friendlyHttp(code, msg) {
     return msg.charAt(0).toUpperCase() + msg.slice(1) + (/[.!?]$/.test(msg) ? "" : ".");
   }
   if (code === 502) return "Couldn't reach the camera" + (msg ? ` (${msg.split(":")[0]})` : ".");
+  if (code === 404 && msg && /^no camera (set up|')/.test(msg)) return msg.startsWith("no camera set up") ? "No camera set up yet. Add one first." : "That camera isn't registered any more.";
   return msg || "Request failed (" + code + ")";
 }
 
@@ -55,8 +56,10 @@ const RESULT_TEXT = {
   err_critical: "The camera couldn't do that right now.",
   err_nonsupport: "This camera doesn't support that remotely.",
 };
+const WEDGED_TEXT = "The camera is stuck (it answers \"busy\" to every command). Switch it off and on again.";
 function explain(result) {
   if (!result || result === "ok") return null;
+  if (result === "err_busy" && state.status && state.status.wedged) return WEDGED_TEXT;
   if (result === "err_busy") state.lastBusyAt = Date.now();
   return RESULT_TEXT[result] || "Camera answered " + result;
 }
@@ -419,8 +422,16 @@ function renderStatus(s) {
   // banner: dropped connection after first connect, or camera busy
   const busy = ready && !live && Date.now() - state.lastBusyAt < 30000;
   const banner = $("banner");
+  $("bannerbtn").hidden = false;
   if (!ready && (state.everReady || state.skipConnect)) {
     banner.hidden = false; $("bannerdot").className = "dot " + info.dot; $("bannertext").textContent = info.title;
+  } else if (ready && s.wedged) {
+    // only a power cycle clears it; reconnecting would not help
+    banner.hidden = false; $("bannerdot").className = "dot bad"; $("bannerbtn").hidden = true;
+    $("bannertext").textContent = "Camera stuck: switch it off and on again";
+  } else if (ready && s.body_busy) {
+    banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannerbtn").hidden = true;
+    $("bannertext").textContent = "Someone is using the camera";
   } else if (busy) {
     banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannertext").textContent = "Camera busy: check its screen";
   } else banner.hidden = true;
@@ -475,6 +486,11 @@ function renderConnect(s) {
     remBox.hidden = false;
     remBox.textContent = `Last camera: ${rem.model || ""} ${rem.name}${rem.ip ? " · " + rem.ip : ""}`;
   } else remBox.hidden = true;
+  const none = s.status === "no_camera";
+  $("btnreconnect").hidden = none;
+  $("btnwizard").textContent = none ? "Add a camera" : "Set up step by step";
+  $("btnwizard").classList.toggle("primary", none);
+  for (const d of c.querySelectorAll(".cs-more")) d.hidden = none;
   if (ready) {
     if (!c.hidden && !connectHideTimer) {
       connectHideTimer = setTimeout(() => {
@@ -663,7 +679,11 @@ function keepLiveView() {
   // Start the never-ending MJPEG response after page load so "load" fires.
   const start = () => { img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now(); };
   if (document.readyState === "complete") start(); else window.addEventListener("load", start);
-  img.addEventListener("error", () => setTimeout(() => { img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now(); }, 2000));
+  const noSource = () => !state.status || ["no_camera", "offline"].includes(state.status.status);
+  img.addEventListener("error", () => setTimeout(function retry() {
+    if (noSource()) { setTimeout(retry, 3000); return; }   // nothing to stream: don't hammer the server
+    img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now();
+  }, 2000));
   setInterval(() => {
     const lv = state.status && state.status.liveview;
     if (lv && lv.viewers === 0 && lv.age !== null && lv.age < 2) img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now();
@@ -808,7 +828,9 @@ async function loadFiles(offset) {
     files.items = offset ? files.items.concat(r.items || []) : (r.items || []);
   } catch (e) {
     files.items = [];
-    if (e.status === 404 || e.status === 405) {
+    if (e.status === 404 && /^No camera|isn't registered/.test(e.message)) {
+      showFilesEmpty("No camera yet", "Add a camera to browse its card.");
+    } else if (e.status === 404 || e.status === 405) {
       files.available = false;
       showFilesEmpty("Files not available yet", "This server doesn't have the files feature yet. Update it and try again.");
     } else showFilesEmpty("Couldn't load files", e.message);
