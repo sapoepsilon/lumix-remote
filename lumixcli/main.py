@@ -283,12 +283,48 @@ def cmd_raw(c: Client, a: argparse.Namespace) -> int:
     return 0
 
 
+def fmt_power_plan(plan: Optional[Dict[str, Any]]) -> str:
+    items = (plan or {}).get("items") or []
+    if not items:
+        return "Nothing running: nothing to pause."
+    verbs = {"pause": "pause", "stop": "stop", "unsubscribe": "cancel"}
+    rows = ["Before powering off, the server will:"]
+    for it in items:
+        rows.append("  %-6s %s%s" % (verbs.get(it.get("action"), it.get("action")), it.get("label"),
+                                     " (resumable)" if it.get("resumable") and it.get("action") == "pause" else ""))
+    if (plan or {}).get("resume_on_reconnect"):
+        rows.append("Paused work resumes when the camera is back on (resume_on_reconnect).")
+    return "\n".join(rows)
+
+
+def fmt_quiesce(rep: Dict[str, Any]) -> str:
+    rows = []
+    for k, title in (("paused", "paused"), ("stopped", "stopped")):
+        for it in rep.get(k) or []:
+            rows.append("  %-7s %s" % (title, it.get("label")))
+    for e in rep.get("errors") or []:
+        rows.append("  error   %s" % e)
+    return "\n".join(rows)
+
+
 def cmd_poweroff(c: Client, a: argparse.Namespace) -> int:
+    try:
+        plan = c.get("/api/power/plan")
+    except CliError:
+        plan = None          # older server
     if not a.yes:
+        if plan is not None and not a.json:
+            sys.stderr.write(fmt_power_plan(plan) + "\n")
         sys.stderr.write("lumix: poweroff needs --yes (the camera cannot be switched back on over Wi-Fi)\n")
         return EXIT_USAGE
-    r = c.post("/api/power/off", {"confirm": True})
-    out(a, r, lambda r: "poweroff: %s (switch the camera on by hand)" % r["result"])
+    if plan is not None and not a.json:
+        print(fmt_power_plan(plan))
+    r = c.post("/api/power/off", {"confirm": True}, timeout=max(c.timeout, 60))
+
+    def human(r: Dict[str, Any]) -> str:
+        q = fmt_quiesce(r.get("quiesce") or {})
+        return (q + "\n" if q else "") + "poweroff: %s (switch the camera on by hand)" % r["result"]
+    out(a, r, human)
     return 0
 
 
@@ -579,6 +615,111 @@ def cmd_cameras(c: Client, a: argparse.Namespace) -> int:
     return 0
 
 
+def parse_duration(text: str) -> float:
+    """'90', '90s', '30m', '1h', '1h30m', '2:30' (m:s) or '1:00:00' -> seconds."""
+    t = str(text).strip().lower()
+    if not t:
+        raise ResolveError("empty duration")
+    if ":" in t:
+        parts = t.split(":")
+        try:
+            nums = [float(x) for x in parts]
+        except ValueError:
+            raise ResolveError("bad duration %r" % text)
+        secs = 0.0
+        for n in nums:
+            secs = secs * 60 + n
+        return secs
+    import re
+    m = re.fullmatch(r"(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s?)?", t)
+    if not m or not any(m.groups()):
+        raise ResolveError("bad duration %r (use 90, 90s, 30m, 1h30m or 1:30:00)" % text)
+    h, mi, se = (float(g) if g else 0.0 for g in m.groups())
+    return h * 3600 + mi * 60 + se
+
+
+def fmt_timelapse(d: Dict[str, Any]) -> str:
+    j = d.get("job")
+    caps = d.get("capabilities") or {}
+    if not j:
+        return "no timelapse yet (in-camera interval: %s, ffmpeg: %s)" % (
+            _yn(caps.get("native")), _yn(caps.get("ffmpeg")))
+    tgt = j.get("target")
+    rows = ["timelapse %s (%s engine): %s%s" % (j["name"], j["engine"], j["state"],
+                                                " (%s)" % j["paused_by"] if j.get("paused_by") else "")]
+    rows.append("  shots      %d%s, every %gs" % (j["shots"], " of %d" % tgt if tgt else "", j["interval_s"]))
+    if j.get("skipped") or j.get("missed") or j.get("failed"):
+        rows.append("  skipped    %d busy, %d missed (camera away), %d failed"
+                    % (j["skipped"], j["missed"], j["failed"]))
+    if j.get("waiting"):
+        rows.append("  waiting    %s" % j["waiting"])
+    if j.get("eta_s") is not None and j["state"] in ("scheduled", "running"):
+        rows.append("  remaining  %s" % _fmt_secs(round(j["eta_s"])))
+    if j.get("next_shot_at") and j["state"] in ("scheduled", "running"):
+        rows.append("  next shot  in %.0fs" % max(0, j["next_shot_at"] - (j.get("now") or time.time())))
+    if j.get("auto_import"):
+        rows.append("  import     %s (%s), %d frame(s) -> %s" % (
+            "after every shot" if j.get("import_mode") == "each" else "at the end",
+            "on" if j.get("auto_import") else "off", j.get("frames_total") or 0, j.get("folder")))
+    if j.get("video"):
+        rows.append("  video      %s" % (j.get("video_path") or j.get("video_error") or "after the run"))
+    if j.get("ae_lock"):
+        rows.append("  AE lock    on %s" % (j.get("fixed") or ""))
+    for sk in (j.get("skips") or [])[-3:]:
+        rows.append("  skip       slot %s: %s" % (sk.get("slot", 0) + 1, sk.get("reason")))
+    for e in (j.get("errors") or [])[-3:]:
+        rows.append("  error      %s" % e)
+    if j.get("message"):
+        rows.append("  note       %s" % j["message"])
+    return "\n".join(rows)
+
+
+def cmd_timelapse(c: Client, a: argparse.Namespace) -> int:
+    act = a.tl_cmd
+    if act == "status":
+        if a.watch:
+            try:
+                while True:
+                    d = c.get("/api/timelapse")
+                    if a.json:
+                        print(json.dumps(d, default=str), flush=True)
+                    else:
+                        sys.stdout.write("\x1b[H\x1b[2J" if sys.stdout.isatty() else "")
+                        print(fmt_timelapse(d), flush=True)
+                    j = d.get("job") or {}
+                    if j.get("state") not in ("scheduled", "running", "paused", "stopping",
+                                              "importing", "assembling"):
+                        return 0
+                    time.sleep(a.every)
+            except KeyboardInterrupt:
+                return 0
+        out(a, c.get("/api/timelapse"), fmt_timelapse)
+        return 0
+    if act == "start":
+        if not a.count and not a.duration:
+            raise ResolveError("give --count N and/or --duration (e.g. 1h)")
+        body: Dict[str, Any] = {"interval": parse_duration(a.interval), "native": a.native,
+                                "import": a.import_, "video": a.video, "ae_lock": a.ae_lock}
+        if a.count:
+            body["count"] = a.count
+        if a.duration:
+            body["duration"] = parse_duration(a.duration)
+        if a.start_at:
+            from lumix.timelapse import TimelapseError, parse_start_at
+            try:
+                body["start_at"] = parse_start_at(a.start_at)
+            except TimelapseError as e:
+                raise ResolveError(str(e))
+        for k in ("name", "dest", "fps", "import_mode"):
+            v = getattr(a, k, None)
+            if v:
+                body[k] = v
+        out(a, c.post("/api/timelapse/start", body), fmt_timelapse)
+        return 0
+    out(a, c.post("/api/timelapse/" + act), fmt_timelapse)
+    return 0
+
+
 def cmd_coming_soon(c: Client, a: argparse.Namespace) -> int:
     sys.stderr.write("lumix %s: coming soon (the server exposes no %s API yet)\n" % (a.feature, a.feature))
     return 1
@@ -603,6 +744,8 @@ _lumix() {
               elif [ "$prev" = options ]; then COMPREPLY=($(compgen -W "$(lumix settings list --names 2>/dev/null)" -- "$cur")); fi;;
     video) COMPREPLY=($(compgen -W "start stop toggle" -- "$cur"));;
     zoom) COMPREPLY=($(compgen -W "tele wide stop --fast" -- "$cur"));;
+    timelapse) if [ $n -eq 1 ]; then COMPREPLY=($(compgen -W "start status pause resume stop" -- "$cur"));
+               else COMPREPLY=($(compgen -W "--interval --count --duration --start-at --native --import --video --ae-lock --name --fps --watch" -- "$cur")); fi;;
     server) COMPREPLY=($(compgen -W "start stop status" -- "$cur"));;
     cameras) if [ $n -eq 1 ]; then COMPREPLY=($(compgen -W "list add remove use rename" -- "$cur"));
              else COMPREPLY=($(compgen -W "$(lumix cameras list --json 2>/dev/null | python3 -c 'import json,sys; print(" ".join(c["id"] for c in json.load(sys.stdin)["cameras"]))' 2>/dev/null)" -- "$cur")); fi;;
@@ -726,7 +869,36 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("extra", nargs=argparse.REMAINDER,
                     help="for start: extra run.sh args after --, e.g. -- --camera-ip 192.168.1.50")
 
-    for feat, help in (("timelapse", "interval shooting (coming soon)"), ("files", "browse/download card files (coming soon)")):
+    sp = add("timelapse", None, "interval shooting: server-driven or in-camera (--native)")
+    ts = sp.add_subparsers(dest="tl_cmd", metavar="start|status|pause|resume|stop")
+    ts.required = True
+    tp = ts.add_parser("start", parents=[common], help="start a timelapse",
+                       description="lumix timelapse start --interval 10 --count 360 [--native] [--import] [--video]")
+    tp.add_argument("--interval", "-i", required=True, help="seconds between shots (10, 10s, 1m)")
+    tp.add_argument("--count", "-n", type=int, help="number of photos")
+    tp.add_argument("--duration", "-d", help="run time instead of / as well as a count (30m, 1h30m, 2:00:00)")
+    tp.add_argument("--start-at", help="start later: HH:MM, ISO time or +SECONDS")
+    tp.add_argument("--native", action="store_true", help="use the camera's own interval shooting")
+    tp.add_argument("--import", dest="import_", action="store_true",
+                    help="import frames to ~/Pictures/Lumix/<date>/timelapse-<name>/")
+    tp.add_argument("--import-mode", choices=["auto", "each", "end"], help="import after every shot or at the end")
+    tp.add_argument("--video", action="store_true", help="assemble an MP4 with ffmpeg (implies --import)")
+    tp.add_argument("--fps", type=int, help="video frame rate (default 24)")
+    tp.add_argument("--ae-lock", action="store_true", help="AE/AF lock + fixed exposure for the run")
+    tp.add_argument("--name", help="name (folder timelapse-<name>)")
+    tp.add_argument("--dest", help="import root (default ~/Pictures/Lumix)")
+    tp.set_defaults(fn=cmd_timelapse)
+    tp = ts.add_parser("status", parents=[common], help="progress of the current/last timelapse")
+    tp.add_argument("--watch", "-w", action="store_true", help="refresh until it finishes")
+    tp.add_argument("--every", type=float, default=2.0, help="with --watch: seconds between refreshes")
+    tp.set_defaults(fn=cmd_timelapse)
+    for act, h in (("pause", "pause (resume continues on the same interval grid)"),
+                   ("resume", "resume a paused timelapse"),
+                   ("stop", "stop early (frames so far are still imported / assembled)")):
+        tp = ts.add_parser(act, parents=[common], help=h)
+        tp.set_defaults(fn=cmd_timelapse)
+
+    for feat, help in (("files", "browse/download card files (coming soon)"),):
         sp = add(feat, cmd_coming_soon, help)
         sp.add_argument("rest", nargs=argparse.REMAINDER)
         sp.set_defaults(feature=feat)

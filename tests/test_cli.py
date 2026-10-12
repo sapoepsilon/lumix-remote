@@ -328,10 +328,61 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(out.splitlines()[0])["type"], "status")
 
     def test_coming_soon(self):
-        code, _, err = self.cli("timelapse", "start")
+        code, _, err = self.cli("files")
         self.assertEqual(code, 1)
         self.assertIn("coming soon", err)
-        self.assertEqual(self.cli("files")[0], 1)
+
+    def test_timelapse_commands(self):
+        job = {"id": "j1", "name": "sunset", "engine": "server", "state": "running", "paused_by": None,
+               "interval_s": 10.0, "shots": 12, "target": 360, "skipped": 1, "missed": 0, "failed": 0,
+               "waiting": None, "eta_s": 3480, "next_shot_at": None, "auto_import": True,
+               "import_mode": "end", "frames_total": 0, "folder": "/x/timelapse-sunset", "video": True,
+               "video_path": None, "video_error": None, "ae_lock": False, "skips": [{"slot": 4, "reason": "camera busy"}],
+               "errors": [], "message": None}
+        st = {"job": job, "capabilities": {"native": True, "ffmpeg": True}}
+        for path in ("/api/timelapse", "/api/timelapse/start", "/api/timelapse/pause",
+                     "/api/timelapse/resume", "/api/timelapse/stop"):
+            self.srv.overrides[("GET " if path == "/api/timelapse" else "POST ") + path] = (200, st)
+        code, out, err = self.cli("timelapse", "start", "--interval", "10", "--count", "360",
+                                  "--native", "--import", "--video", "--duration", "1h", "--start-at", "+60")
+        self.assertEqual(code, 0, err)
+        body = self.posts()[-1][1]
+        self.assertEqual((body["interval"], body["count"], body["duration"], body["native"],
+                          body["import"], body["video"]), (10.0, 360, 3600.0, True, True, True))
+        self.assertAlmostEqual(body["start_at"], time.time() + 60, delta=5)
+        self.assertIn("shots      12 of 360", out)
+        self.assertIn("camera busy", out)
+        code, out, _ = self.cli("timelapse", "status")
+        self.assertIn("timelapse sunset (server engine): running", out)
+        code, out, _ = self.cli("timelapse", "status", "--json")
+        self.assertEqual(json.loads(out)["job"]["shots"], 12)
+        for act in ("pause", "resume", "stop"):
+            self.assertEqual(self.cli("timelapse", act)[0], 0)
+        self.assertEqual([p for p, _ in self.posts()][-3:],
+                         ["/api/timelapse/pause", "/api/timelapse/resume", "/api/timelapse/stop"])
+        code, _, err = self.cli("timelapse", "start", "--interval", "10")
+        self.assertEqual(code, 2)
+        self.assertIn("--count", err)
+        code, _, err = self.cli("timelapse", "start", "--interval", "ten", "--count", "3")
+        self.assertEqual(code, 2)
+
+    def test_poweroff_shows_plan(self):
+        plan = {"reason": "poweroff", "resume_on_reconnect": True, "items": [
+            {"kind": "import", "action": "pause", "resumable": True, "label": "Import: 2 of 5 files"},
+            {"kind": "recording", "action": "stop", "resumable": False, "label": "Video recording"}]}
+        self.srv.overrides["GET /api/power/plan"] = (200, plan)
+        code, _, err = self.cli("poweroff")
+        self.assertEqual(code, 2)
+        self.assertIn("pause  Import: 2 of 5 files (resumable)", err)
+        self.assertIn("stop   Video recording", err)
+        self.srv.overrides["POST /api/power/off"] = (200, {"result": "ok", "quiesce": {
+            "paused": [{"kind": "import", "label": "Import: 2 of 5 files"}],
+            "stopped": [{"kind": "recording", "label": "Video recording"}], "errors": []}})
+        code, out, _ = self.cli("poweroff", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("paused  Import: 2 of 5 files", out)
+        self.assertIn("stopped Video recording", out)
+        self.assertIn("poweroff: ok", out)
 
 
 class CamerasCliTest(unittest.TestCase):
