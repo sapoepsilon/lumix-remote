@@ -1536,10 +1536,20 @@ function renderTlLast() {
   box.className = "tl-last" + (bad ? " bad" : "");
   const what = j.video_path ? j.video_path.split("/").slice(-1)[0] : j.frames_total ? `${j.frames_total} frames in ${j.folder.replace(/^.*\/Pictures\//, "~/Pictures/")}` : "frames on the camera's card";
   const extra = j.video_error || j.import_error || (j.state === "failed" && (j.errors || []).slice(-1)[0]) || "";
+  if (!j.shots) {
+    box.className = "tl-last";
+    box.replaceChildren(el("b", {}, `Last run ${j.state}`), j.state === "failed" && extra ? `: ${extra}` : " before the first shot.");
+    box.hidden = false;
+    return;
+  }
   box.replaceChildren(el("b", {}, `Last run ${j.state}: `), `${j.shots} shots${(j.skipped || 0) + (j.missed || 0) ? ` (${(j.skipped || 0) + (j.missed || 0)} skipped)` : ""} → ${what}`, extra ? ` · ${extra}` : "");
   box.hidden = false;
 }
 function renderTimelapse(d) {
+  const cur = tl.status && tl.status.job;
+  if (d && d.job && cur && d.job.id === cur.id && d.job.now && cur.now && d.job.now < cur.now) {
+    d = null;   // an HTTP answer older than a WebSocket push already shown (stop -> stopped race)
+  }
   if (d) { tl.status = d; const j = d.job; if (j && j.now) tl.skew = j.now - Date.now() / 1000; }
   const j = tlJob();
   const active = tlActive();
