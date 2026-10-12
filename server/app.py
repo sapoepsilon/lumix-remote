@@ -136,7 +136,16 @@ NO_CAMERA_STATUS: Dict[str, Any] = {
 async def status(request: web.Request) -> web.Response:
     if "cam" not in request.match_info and request.app[SESSIONS].active() is None:
         return _json(NO_CAMERA_STATUS)
-    return _json(camera(request).status_dict())
+    s = session(request)
+    st = s.cam.status_dict()
+    if not s.running:
+        # not "idle" forever: say why nothing happens
+        mgr = request.app[SESSIONS]
+        why = ("this server was started for another camera (--camera-ip)"
+               if mgr.opts.camera_ip and not mgr.opts.all_cameras
+               else "Connect automatically is off for this camera")
+        st.update(status="paused", message="not connecting: %s" % why)
+    return _json(st)
 
 
 async def settings(request: web.Request) -> web.Response:
