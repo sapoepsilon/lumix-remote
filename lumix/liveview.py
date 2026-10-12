@@ -17,16 +17,23 @@ import logging
 import struct
 import time
 from collections import deque
-from typing import Deque, Optional, Tuple
+from typing import Any, Deque, Optional, Tuple
 
 log = logging.getLogger("lumix.liveview")
 
 
-def extract_jpeg(d: bytes) -> Optional[bytes]:
-    if len(d) < 64:
+def extract_jpeg(d: bytes, rules: Any = None) -> Optional[bytes]:
+    """JPEG inside one live view datagram; ``rules`` is a
+    lumix.models.LiveViewRules (None = the S5/GMaster layout)."""
+    off = getattr(rules, "header_len_offset", 30)
+    add = getattr(rules, "header_len_add", 32)
+    fallback = getattr(rules, "soi_search_fallback", True)
+    if len(d) < max(getattr(rules, "min_datagram", 64), off + 2):
         return None
-    start = struct.unpack(">H", d[30:32])[0] + 32
+    start = struct.unpack(">H", d[off:off + 2])[0] + add
     if not (start < len(d) - 2 and d[start:start + 2] == b"\xff\xd8"):
+        if not fallback:
+            return None
         start = d.find(b"\xff\xd8\xff")
         if start < 0:
             return None
@@ -95,9 +102,10 @@ class _Proto(asyncio.DatagramProtocol):
 class LiveViewReceiver(FrameSource):
     name = "wifi"
 
-    def __init__(self, port: int = 49199) -> None:
+    def __init__(self, port: int = 49199, rules: Any = None) -> None:
         super().__init__()
         self.port = port
+        self.rules = rules          # lumix.models.LiveViewRules; set from the model profile
         self.camera_ip: Optional[str] = None
         self._transport: Optional[asyncio.DatagramTransport] = None
         self.datagrams = 0
@@ -127,7 +135,7 @@ class LiveViewReceiver(FrameSource):
         if self.camera_ip and addr[0] != self.camera_ip:
             return
         self.datagrams += 1
-        jpeg = extract_jpeg(data)
+        jpeg = extract_jpeg(data, self.rules)
         if jpeg is None:
             self.bad += 1
             return

@@ -96,8 +96,9 @@ class CamTransport:
     """Serialised HTTP access to one camera."""
 
     def __init__(self, ip: str, user_agent: str = "LumixRemote/0.1",
-                 trace: Optional[Callable[[str, Reply], None]] = None):
+                 trace: Optional[Callable[[str, Reply], None]] = None, port: int = 80):
         self.ip = ip
+        self.port = port            # cam.cgi port (80 on real bodies; emulators may differ)
         self.user_agent = user_agent
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
@@ -137,7 +138,8 @@ class CamTransport:
         async with self._lock:
             t0 = time.monotonic()
             sess = await self._sess()
-            url = URL("http://%s/cam.cgi?%s" % (self.ip, q), encoded=True)
+            host = self.ip if self.port == 80 else "%s:%d" % (self.ip, self.port)
+            url = URL("http://%s/cam.cgi?%s" % (host, q), encoded=True)
             try:
                 async with sess.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                     body = await r.read()
@@ -178,6 +180,33 @@ def parse_ddd(raw: bytes) -> Dict[str, str]:
     for el in root.iter():
         tag = el.tag.split("}", 1)[-1]
         if tag in ("friendlyName", "manufacturer", "modelName", "modelNumber", "serialNumber",
-                   "UDN", "X_FirmVersion", "X_CamCategory", "X_AdditionalFunction"):
+                   "UDN", "X_FirmVersion", "X_CamCategory", "X_AdditionalFunction",
+                   "X_CamCapability"):
             out[tag] = (el.text or "").strip()
     return out
+
+
+ENC_ZERO_NONCE = -1875740628 & 0xFFFFFFFF   # LUMIX Sync's stand-in for a zero nonce
+
+
+def parse_nonce(rep_text: str) -> int:
+    """req_acc_g reply ``ok,<8 hex>`` -> 32-bit nonce (ValueError otherwise)."""
+    parts = rep_text.strip().split(",")
+    if len(parts) < 2 or parts[0] != "ok":
+        raise ValueError("no nonce in %r" % rep_text[:40])
+    return int(parts[1], 16) & 0xFFFFFFFF
+
+
+def encrypt_acc(text: str, nonce: int) -> str:
+    """LUMIX Sync's req_acc_e field transform (docs/lumix-sync-wifi-flow.md section 3):
+    pad with 0xFF to a multiple of 4, each 4-byte block as big-endian uint32
+    XOR nonce, byte-swapped, printed as %08x. Untested on a real encrypted body."""
+    n = (nonce & 0xFFFFFFFF) or ENC_ZERO_NONCE
+    raw = bytearray(text.encode("utf-8"))
+    while len(raw) % 4:
+        raw.append(0xFF)
+    out = []
+    for i in range(0, len(raw), 4):
+        v = int.from_bytes(bytes(raw[i:i + 4]), "big") ^ n
+        out.append("%08x" % int.from_bytes(v.to_bytes(4, "big"), "little"))
+    return "".join(out)
