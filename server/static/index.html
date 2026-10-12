@@ -29,6 +29,11 @@
   <symbol id="i-mac" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 20h6M12 16v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
   <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5z" fill="currentColor"/></symbol>
   <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z" fill="currentColor"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 11v6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.6" r="1.3" fill="currentColor"/></symbol>
+  <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.4a9.5 9.5 0 0 1 13 0M8.6 15.7a5 5 0 0 1 6.8 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="19" r="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-bt" viewBox="0 0 24 24"><path d="M7 7.5l10 9-5 4.5V3l5 4.5-10 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-down-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
 </svg>
 
 <div class="app" id="app" data-mode="photo">
@@ -53,7 +58,7 @@
   <!-- ======================================================== top bar -->
   <header class="top">
     <button class="pill glass conn" id="btnconn" title="Connection">
-      <span class="dot" id="dot"></span><span id="camname">Lumix</span>
+      <span class="dot" id="dot"></span><span id="camname">Lumix</span><svg class="conn-chev" id="connchev" hidden><use href="#i-down-chev"/></svg>
     </button>
     <div class="rec-badge" id="recbadge" hidden><span class="rec-dot"></span><span id="rectime">00:00</span></div>
     <div class="top-right">
@@ -117,6 +122,7 @@
       </div>
       <h3 class="group-title">More</h3>
       <div class="group">
+        <button class="cell nav-cell" data-push="cams"><div class="cell-text"><b>Cameras</b><small id="camssub">Switch or add a camera</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
         <button class="cell nav-cell" data-push="all"><div class="cell-text"><b>All settings</b><small id="allcount">Every setting the camera allows remotely</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
         <button class="cell nav-cell" data-push="conn"><div class="cell-text"><b>Connection</b><small id="connsub">-</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
         <button class="cell nav-cell" data-push="log"><div class="cell-text"><b>Event log</b><small>Commands and camera events</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
@@ -160,6 +166,49 @@
       </div>
     </section>
 
+    <section class="page" data-page="cams" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg>Controls</button>
+        <h2>Cameras</h2>
+        <button class="link" id="btnaddcam">Add</button>
+      </header>
+      <div class="group" id="camlist"></div>
+      <div class="group">
+        <button class="cell nav-cell add-cell" id="btnaddcam2"><span class="add-ico"><svg><use href="#i-plus"/></svg></span><div class="cell-text"><b>Add camera…</b><small>Step by step: Wi-Fi, approval, Bluetooth, name</small></div></button>
+      </div>
+      <p class="page-sub">Every camera here stays connected at the same time. The one with a check is the camera these controls, the CLI and new browser tabs use.</p>
+    </section>
+
+    <section class="page" data-page="cam" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg>Cameras</button>
+        <h2 id="camtitle">Camera</h2>
+        <span></span>
+      </header>
+      <div class="group">
+        <label class="cell"><div class="cell-text"><b>Name</b></div><input class="cell-input" id="camnick" maxlength="64" aria-label="Camera name" enterkeyhint="done"></label>
+        <label class="cell"><div class="cell-text"><b>Model</b></div><select class="cell-select" id="cammodel" aria-label="Camera model"></select></label>
+      </div>
+      <div class="group" id="caminfo"></div>
+      <div class="group">
+        <div class="cell switch-cell">
+          <div class="cell-text"><b>Connect automatically</b><small>Look for this camera whenever the server runs.</small></div>
+          <label class="switch"><input type="checkbox" id="camauto"><span></span></label>
+        </div>
+        <div class="cell switch-cell">
+          <div class="cell-text"><b>Bluetooth watchdog</b><small>Power-cycle over Bluetooth when the camera gets stuck answering "busy". Needs Bluetooth pairing.</small></div>
+          <label class="switch"><input type="checkbox" id="camwd"><span></span></label>
+        </div>
+      </div>
+      <div class="group">
+        <button class="cell nav-cell" id="camuse"><div class="cell-text"><b>Use this camera</b></div></button>
+        <button class="cell nav-cell" id="camsetup"><div class="cell-text"><b>Run setup again…</b><small>Wi-Fi steps, Bluetooth pairing, name</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
+      </div>
+      <div class="group">
+        <button class="cell danger-cell" id="camremove">Remove camera…</button>
+      </div>
+    </section>
+
     <section class="page" data-page="log" hidden>
       <header class="sheet-head">
         <button class="back" data-pop><svg><use href="#i-back"/></svg>Controls</button>
@@ -199,7 +248,8 @@
     <div class="cs-remember" id="csremember" hidden></div>
     <div class="cs-actions">
       <button class="btn primary" id="btnreconnect">Reconnect</button>
-      <button class="btn" id="btnskip">Continue without camera</button>
+      <button class="btn" id="btnwizard">Set up step by step</button>
+      <button class="link" id="btnskip">Continue without camera</button>
     </div>
     <h3 class="group-title">On the camera</h3>
     <ol class="checklist" id="checklist"></ol>
@@ -211,6 +261,84 @@
       </form>
       <button class="link" id="btnforget">Forget remembered camera</button>
     </details>
+  </div>
+</section>
+
+<!-- ======================================================== add-camera wizard -->
+<section class="wizard" id="wizard" hidden aria-label="Add a camera">
+  <header class="wz-head">
+    <button class="link" id="wzback" hidden><svg><use href="#i-back"/></svg>Back</button>
+    <div class="wz-dots" id="wzdots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+    <button class="link" id="wzcancel">Cancel</button>
+  </header>
+  <div class="wz-body">
+    <section class="wz-step" data-step="model">
+      <div class="wz-hero"><svg><use href="#i-camera"/></svg></div>
+      <h1>Add a camera</h1>
+      <p class="wz-sub">Pick your model, or let this app recognise the camera when it connects.</p>
+      <div class="group wz-choices" id="wzmodels" role="radiogroup" aria-label="Camera model"></div>
+      <div class="wz-actions"><button class="btn primary" id="wzmodelnext">Continue</button></div>
+    </section>
+
+    <section class="wz-step" data-step="wifi" hidden>
+      <div class="wz-hero"><svg><use href="#i-wifi"/></svg></div>
+      <h1>Connect over Wi-Fi</h1>
+      <p class="wz-sub" id="wzwifisub">On the camera, put it on your home Wi-Fi in remote-shooting mode:</p>
+      <ol class="checklist wz-steps" id="wzwifisteps"></ol>
+      <h3 class="group-title">This computer</h3>
+      <div class="group wz-status" id="wzstatus">
+        <div class="wz-stage" data-stage="discover"><span class="stage-mark"><i>1</i><svg><use href="#i-check"/></svg><span class="spinner"></span></span><div class="cell-text"><b>Looking on your network</b><small></small></div></div>
+        <div class="wz-stage" data-stage="approve"><span class="stage-mark"><i>2</i><svg><use href="#i-check"/></svg><span class="spinner"></span></span><div class="cell-text"><b>Waiting for the camera to approve</b><small></small></div></div>
+        <div class="wz-stage" data-stage="ready"><span class="stage-mark"><i>3</i><svg><use href="#i-check"/></svg><span class="spinner"></span></span><div class="cell-text"><b>Connected</b><small></small></div></div>
+      </div>
+      <details class="cs-more">
+        <summary>Connect to a specific address</summary>
+        <form id="wzipform" class="ipform">
+          <input id="wzip" inputmode="decimal" placeholder="192.168.1.50" aria-label="Camera IP address">
+          <button class="btn">Connect</button>
+        </form>
+      </details>
+      <div class="wz-actions">
+        <button class="btn primary" id="wzwifinext" disabled>Continue</button>
+        <button class="link" id="wzwifiskip">Skip for now</button>
+      </div>
+    </section>
+
+    <section class="wz-step" data-step="ble" hidden>
+      <div class="wz-hero"><svg><use href="#i-bt"/></svg></div>
+      <h1>Bluetooth <span class="wz-opt">optional</span></h1>
+      <p class="wz-sub" id="wzblesub">Pairing lets this computer switch the camera's Wi-Fi on and set its clock. You can skip it and pair later.</p>
+      <ol class="checklist wz-steps" id="wzblesteps"></ol>
+      <div class="callout warn" id="wzblewarn">
+        <b>This Mac leaves your home Wi-Fi for a moment</b>
+        <span>To finish pairing it joins the camera's own Wi-Fi for about 30–60 seconds, then rejoins your network. Downloads and calls on this Mac pause meanwhile, and this page may lose the server briefly.</span>
+      </div>
+      <div class="wz-blestate" id="wzblestate" hidden></div>
+      <div class="wz-actions">
+        <button class="btn primary" id="wzblepair">Pair over Bluetooth</button>
+        <button class="link" id="wzbleskip">Skip</button>
+      </div>
+    </section>
+
+    <section class="wz-step" data-step="name" hidden>
+      <div class="wz-hero"><svg><use href="#i-camera"/></svg></div>
+      <h1>Name your camera</h1>
+      <p class="wz-sub">Shown in the camera switcher. Handy when you run more than one body.</p>
+      <input class="wz-input" id="wzname" maxlength="64" aria-label="Camera name" enterkeyhint="done">
+      <p class="wz-hint" id="wznamehint"></p>
+      <div class="wz-actions"><button class="btn primary" id="wznamenext">Save</button></div>
+    </section>
+
+    <section class="wz-step" data-step="done" hidden>
+      <div class="radar ok idle wz-done"><span></span><span></span><span></span><svg><use href="#i-check"/></svg></div>
+      <h1 id="wzdonetitle">All set</h1>
+      <p class="wz-sub" id="wzdonesub"></p>
+      <div class="group" id="wzsummary"></div>
+      <div class="wz-actions">
+        <button class="btn primary" id="wzfinish">Start shooting</button>
+        <button class="link" id="wzanother">Add another camera</button>
+      </div>
+    </section>
   </div>
 </section>
 
@@ -258,6 +386,17 @@
     <menu>
       <button value="cancel" autofocus>Cancel</button>
       <button value="ok" class="destructive">Power Off</button>
+    </menu>
+  </form>
+</dialog>
+
+<dialog id="removedlg" class="alert">
+  <form method="dialog">
+    <h3 id="removetitle">Remove camera?</h3>
+    <p>This forgets its settings and Bluetooth pairing on this computer. The camera itself is not changed.</p>
+    <menu>
+      <button value="cancel" autofocus>Cancel</button>
+      <button value="ok" class="destructive">Remove</button>
     </menu>
   </form>
 </dialog>

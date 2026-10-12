@@ -10,17 +10,27 @@ const state = {
   status: null, exposure: null, settings: [], filter: "", mode: LS.get("mode", "photo"),
   auto: { on: false }, autoBusy: false, picker: null, skipConnect: false, everReady: false,
   lastBusyAt: 0, conn: null, mftap: LS.get("mftap", "off"),
+  camId: LS.get("camId", null), cameras: [], models: [],
 };
 const MODES = ["photo", "video", "timelapse"];
 
 // ---------------------------------------------------------------- helpers
 class HttpError extends Error { constructor(msg, status) { super(msg); this.status = status; } }
 
-async function api(path, body) {
-  const opt = body === undefined ? {} : {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+// Camera routes go to /api/cameras/<id>/... for the camera this tab shows;
+// /api/cameras and /api/models are global.
+const GLOBAL_API = /^\/api\/(cameras|models)(\/|\?|$)/;
+function cp(path) {
+  if (!state.camId || !path || !path.startsWith("/api/") || GLOBAL_API.test(path)) return path;
+  return "/api/cameras/" + encodeURIComponent(state.camId) + "/" + path.slice(5);
+}
+
+async function api(path, body, method) {
+  const opt = body === undefined && !method ? {} : {
+    method: method || "POST", headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
   };
-  const r = await fetch(path, opt);
+  const r = await fetch(cp(path), opt);
   let data = null;
   try { data = await r.json(); } catch (_) { /* non-JSON */ }
   if (!r.ok) throw new HttpError(friendlyHttp(r.status, data && data.error), r.status);
@@ -348,6 +358,8 @@ function statusInfo(s) {
     case "reconnecting": return { title: "Reconnecting…", msg: msg.includes("powered off") ? "The camera is off. Switch it on and it will reconnect." : "The camera dropped off (asleep or out of range). Retrying automatically.", cls: "warn", dot: "wait" };
     case "error": return { title: "Something's wrong", msg, cls: "warn", dot: "bad" };
     case "offline": return { title: "Server not reachable", msg: "Start it with ./run.sh on your Mac.", cls: "warn", dot: "bad" };
+    case "no_camera": return { title: "No camera yet", msg: "Add a camera to get started.", cls: "", dot: "" };
+    case "paused": return { title: "Not connecting", msg: "This camera is switched off in Cameras (Connect automatically).", cls: "", dot: "" };
     default: return { title: "Starting…", msg, cls: "", dot: "wait" };
   }
 }
@@ -359,7 +371,11 @@ function renderStatus(s) {
   const ready = s.status === "ready";
   $("dot").className = "dot " + info.dot;
   const cam = s.camera || {};
-  $("camname").textContent = ready && cam.friendlyName ? (cam.modelNumber || cam.friendlyName) : (ready ? "Camera" : info.title.replace("…", ""));
+  const me = currentCamera();
+  const nick = me && me.nickname && !me.provisional ? me.nickname : null;
+  $("camname").textContent = ready ? (nick || cam.modelNumber || cam.friendlyName || "Camera")
+    : (state.cameras.length > 1 && nick ? `${nick} · ${info.title.replace("…", "")}` : info.title.replace("…", ""));
+  if (s.status === "no_camera" && !wz.open && !state.skipConnect) openWizard({});
   if (ready && cam.friendlyName) {
     LS.set("camera", { name: cam.friendlyName, model: cam.modelNumber, ip: s.ip, ts: Date.now() });
     state.everReady = true;
@@ -404,6 +420,7 @@ function renderStatus(s) {
   $("connsub").textContent = ready ? `${cam.friendlyName || ""} · ${s.ip || ""}` : info.title;
   renderConnect(s);
   if (!$("prosheet").hidden && currentPage() === "conn") renderConnInfo();
+  if (me && me.status !== s.status && s.status !== "offline") { me.status = s.status; if (currentPage() === "cams") renderCameras(); }
   if (ready && (!prev || prev.status !== "ready")) loadSettings();
 }
 function batteryPct(b) {
@@ -475,6 +492,9 @@ async function reconnect(ip, forget) {
 async function loadConnection() {
   try {
     state.conn = await api("/api/connection");
+    if (state.conn.model && state.conn.model.menu_assist && LS.get("mftap", null) === null) {
+      state.mftap = state.conn.model.menu_assist.ui_default_mf_tap || "off";
+    }
     renderChecklist(state.conn.steps && state.conn.steps.length ? state.conn.steps : DEFAULT_STEPS);
   } catch (_) { renderChecklist(DEFAULT_STEPS); }
 }
@@ -482,8 +502,10 @@ async function loadConnection() {
 function renderConnInfo() {
   const s = state.status || {};
   const cam = s.camera || {};
+  const me = currentCamera();
   const rows = [
     ["Status", statusInfo(s).title], ["Camera", [cam.modelNumber, cam.friendlyName].filter(Boolean).join(" ") || "–"],
+    ["Profile", s.model_name || "–"], ["Name", me ? me.nickname : "–"],
     ["Address", s.ip || "–"], ["Firmware", cam.X_FirmVersion || "–"], ["Lens", s.lens || "–"],
     ["Battery", s.battery ? batteryPct(s.battery) : "–"],
     ["Live view", s.liveview && s.liveview.fps ? s.liveview.fps + " fps" : "no frames"],
@@ -631,12 +653,12 @@ async function exitMfAssist() {
 function keepLiveView() {
   const img = $("lvimg");
   // Start the never-ending MJPEG response after page load so "load" fires.
-  const start = () => { img.src = "/api/liveview.mjpg?t=" + Date.now(); };
+  const start = () => { img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now(); };
   if (document.readyState === "complete") start(); else window.addEventListener("load", start);
-  img.addEventListener("error", () => setTimeout(() => { img.src = "/api/liveview.mjpg?t=" + Date.now(); }, 2000));
+  img.addEventListener("error", () => setTimeout(() => { img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now(); }, 2000));
   setInterval(() => {
     const lv = state.status && state.status.liveview;
-    if (lv && lv.viewers === 0 && lv.age !== null && lv.age < 2) img.src = "/api/liveview.mjpg?t=" + Date.now();
+    if (lv && lv.viewers === 0 && lv.age !== null && lv.age < 2) img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now();
   }, 4000);
 }
 
@@ -788,7 +810,7 @@ function renderFiles() {
   const grid = $("grid");
   grid.replaceChildren();
   for (const it of files.items) {
-    const img = el("img", { alt: it.name, loading: "lazy", decoding: "async", src: it.thumb_url || "" });
+    const img = el("img", { alt: it.name, loading: "lazy", decoding: "async", src: it.thumb_url ? cp(it.thumb_url) : "" });
     img.addEventListener("load", () => img.classList.add("loaded"));
     const tile = el("button", { class: "tilef" + (files.sel.has(it.id) ? " sel" : ""), "data-id": it.id, title: it.name },
       img,
@@ -832,11 +854,11 @@ function openViewer(it) {
   const meta = [it.date ? new Date(it.date).toLocaleString() : null, fmtSize(it.size), it.has_raw ? "+ RAW" : null].filter(Boolean);
   $("vmeta").textContent = meta.join(" · ");
   const dl = $("vdownload");
-  dl.href = it.download_url || "#";
+  dl.href = it.download_url ? cp(it.download_url) : "#";
   dl.setAttribute("download", it.name || "");
   const body = $("vbody");
   body.replaceChildren(el("div", { class: "spinner" }));
-  const img = el("img", { alt: it.name, src: it.preview_url || it.thumb_url });
+  const img = el("img", { alt: it.name, src: cp(it.preview_url || it.thumb_url) });
   img.addEventListener("load", () => body.replaceChildren(img, it.kind === "video" ? el("div", { class: "viewer-note glass" }, "Video preview frame. Download or import to play it.") : ""));
   img.addEventListener("error", () => body.replaceChildren(el("p", { class: "page-sub" }, "Preview not available.")));
   $("viewer").hidden = false;
@@ -846,7 +868,7 @@ function closeViewer() { $("viewer").hidden = true; $("vbody").replaceChildren()
 function downloadSelected() {
   const items = files.items.filter((x) => files.sel.has(x.id) && x.download_url);
   items.forEach((it, i) => setTimeout(() => {
-    const a = el("a", { href: it.download_url, download: it.name || "" });
+    const a = el("a", { href: cp(it.download_url), download: it.name || "" });
     document.body.append(a); a.click(); a.remove();
   }, i * 400));
   toast(`Downloading ${items.length} file${items.length === 1 ? "" : "s"}`);
@@ -938,12 +960,460 @@ function wireFiles() {
   });
 }
 
+
+// ---------------------------------------------------------------- cameras
+const enc = encodeURIComponent;
+function currentCamera() { return state.cameras.find((c) => c.id === state.camId) || null; }
+
+async function loadCameras() {
+  try {
+    const r = await api("/api/cameras");
+    state.models = r.models || [];
+    setCameras(r);
+  } catch (_) { /* older server without /api/cameras: stay on the alias routes */ }
+}
+
+function setCameras(d) {
+  state.cameras = d.cameras || [];
+  const ids = state.cameras.map((c) => c.id);
+  if (!state.camId || !ids.includes(state.camId)) {
+    const next = d.active && ids.includes(d.active) ? d.active : ids[0] || null;
+    if (next !== state.camId) {
+      const had = state.camId !== null;
+      state.camId = next; LS.set("camId", next);
+      if (had) resetForCamera();
+    }
+  }
+  renderCameras();
+}
+
+function dotFor(st) {
+  if (st === "ready") return "ready";
+  if (st === "error") return "bad";
+  if (st === "paused" || st === "no_camera") return "";
+  return "wait";
+}
+
+function camModelText(c) {
+  const cam = c.camera || {};
+  return cam.modelNumber ? (c.profile && c.profile.id !== "generic" ? c.profile.name : cam.modelNumber)
+    : c.model && c.model !== "auto" ? (c.profile ? c.profile.name : c.model) : "Model detected on connect";
+}
+
+function renderCameras() {
+  const cams = state.cameras;
+  const me = currentCamera();
+  $("connchev").toggleAttribute("hidden", cams.length < 2);   // SVG: no .hidden property
+  $("camssub").textContent = !cams.length ? "Add a camera" : cams.length === 1 ? `${me ? me.nickname : ""} · add another camera`
+    : `${me ? me.nickname : "–"} · ${cams.length} cameras`;
+  const box = $("camlist");
+  box.replaceChildren();
+  for (const c of cams) {
+    const info = statusInfo({ status: c.status, message: c.message });
+    const row = el("div", { class: "cell nav-cell cam-row", role: "button", tabindex: "0",
+      onclick: (e) => { if (!e.target.closest(".info")) switchCamera(c.id, true); },
+      onkeydown: (e) => { if (e.key === "Enter") switchCamera(c.id, true); } },
+    el("span", { class: "dot " + dotFor(c.status) }),
+    el("div", { class: "cell-text" }, el("b", {}, c.nickname || c.id),
+      el("small", {}, [camModelText(c), c.status === "ready" ? c.ip : info.title.replace("…", "")].filter(Boolean).join(" · "))),
+    c.id === state.camId ? icon("check", "tick") : null,
+    el("button", { class: "info", "aria-label": `${c.nickname} details`, onclick: () => openCamDetail(c.id) }, icon("info")));
+    box.append(row);
+  }
+  if (!cams.length) box.append(el("div", { class: "cell" }, el("div", { class: "cell-text" }, el("b", {}, "No cameras yet"), el("small", {}, "Add one to get started."))));
+  if (camDetailId && currentPage() === "cam") renderCamDetail();
+}
+
+function resetForCamera() {
+  state.settings = []; state.exposure = null; state.auto = { on: false }; state.status = null;
+  state.everReady = false; state.picker = null; state.conn = null;
+  $("log").replaceChildren();
+  renderQC(); renderAll(); renderAuto();
+  const img = $("lvimg");
+  img.removeAttribute("src");
+  img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now();
+  connectWs();
+  loadSettings(); loadConnection(); loadPresets();
+}
+
+async function switchCamera(id, fromList) {
+  if (!id) return;
+  haptic();
+  const changed = id !== state.camId;
+  state.camId = id; LS.set("camId", id);
+  try { await api(`/api/cameras/${enc(id)}/activate`, {}); } catch (_) { /* still show it */ }
+  if (changed) {
+    resetForCamera();
+    const c = currentCamera();
+    toast(`Now using ${c ? c.nickname : id}`);
+  }
+  renderCameras();
+  if (fromList && changed) setTimeout(closeSheet, 250);
+}
+
+let camDetailId = null;
+async function openCamDetail(id) {
+  camDetailId = id;
+  push("cam");
+  renderCamDetail();
+  try {
+    const d = await api(`/api/cameras/${enc(id)}`);
+    camDetail = d;
+    renderCamDetail();
+  } catch (e) { toast(e.message, true); }
+}
+let camDetail = null;
+function renderCamDetail() {
+  const c = state.cameras.find((x) => x.id === camDetailId);
+  if (!c) return;
+  const d = camDetail && camDetail.id === c.id ? camDetail : null;
+  $("camtitle").textContent = c.nickname || c.id;
+  if (document.activeElement !== $("camnick")) $("camnick").value = c.nickname || "";
+  const sel = $("cammodel");
+  sel.replaceChildren(el("option", { value: "auto" }, "Detect automatically"),
+    ...state.models.map((m) => el("option", { value: m.id }, m.name + (m.verified ? "" : " (untested)"))));
+  sel.value = c.model || "auto";
+  const cam = c.camera || {};
+  const ports = c.ports || {};
+  const rows = [
+    ["Status", statusInfo({ status: c.status }).title], ["Detected", [cam.modelNumber, cam.X_FirmVersion ? "fw " + cam.X_FirmVersion : null].filter(Boolean).join(" · ") || "not yet"],
+    ["Profile", c.profile ? c.profile.name + (c.profile.verified ? "" : " (untested)") : "–"],
+    ["Address", c.ip || "found automatically"], ["Bluetooth", c.ble && c.ble.registered ? "paired" + (c.ble.name ? " · " + c.ble.name : "") : "not paired"],
+    ["Live view port", ports.liveview || "–"], ["ID (CLI)", c.id],
+  ];
+  if (d && d.entry && (ports.http !== 80 || ports.upnp !== 60606)) rows.push(["Camera ports", `${ports.http} / ${ports.upnp} / ${ports.files}`]);
+  $("caminfo").replaceChildren(...rows.map(([k, v]) => el("div", { class: "cell" }, el("div", { class: "cell-text" }, el("b", {}, k)), el("span", { class: "val" }, String(v)))));
+  $("camauto").checked = !(c.settings && c.settings.autoconnect === false);
+  $("camwd").checked = !!(c.settings && c.settings.watchdog);
+  $("camuse").hidden = c.id === state.camId;
+}
+
+async function patchCamera(id, body, okMsg) {
+  try {
+    const r = await api(`/api/cameras/${enc(id)}`, body, "PATCH");
+    await loadCameras();
+    if (okMsg) toast(okMsg);
+    return r;
+  } catch (e) { toast(e.message, true); await loadCameras(); return null; }
+}
+
+function wireCameras() {
+  const add = () => { closeSheet(); openWizard({}); };
+  $("btnaddcam").addEventListener("click", add);
+  $("btnaddcam2").addEventListener("click", add);
+  const saveNick = () => {
+    const v = $("camnick").value.trim();
+    const c = state.cameras.find((x) => x.id === camDetailId);
+    if (c && v && v !== c.nickname) patchCamera(c.id, { nickname: v }, "Renamed");
+  };
+  $("camnick").addEventListener("change", saveNick);
+  $("camnick").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("camnick").blur(); } });
+  $("cammodel").addEventListener("change", (e) => patchCamera(camDetailId, { model: e.target.value }, "Model saved; reconnecting"));
+  $("camauto").addEventListener("change", (e) => patchCamera(camDetailId, { settings: { autoconnect: e.target.checked } }));
+  $("camwd").addEventListener("change", (e) => patchCamera(camDetailId, { settings: { watchdog: e.target.checked } }));
+  $("camuse").addEventListener("click", () => switchCamera(camDetailId, true));
+  $("camsetup").addEventListener("click", () => { const id = camDetailId; closeSheet(); openWizard({ camId: id, reuse: true, step: "wifi" }); });
+  $("camremove").addEventListener("click", () => {
+    const c = state.cameras.find((x) => x.id === camDetailId);
+    $("removetitle").textContent = `Remove ${c ? c.nickname : "camera"}?`;
+    $("removedlg").showModal();
+  });
+  $("removedlg").addEventListener("close", async () => {
+    if ($("removedlg").returnValue !== "ok") return;
+    const id = camDetailId;
+    try {
+      await api(`/api/cameras/${enc(id)}`, undefined, "DELETE");
+      toast("Camera removed");
+      pop();
+      if (id === state.camId) state.camId = null;
+      await loadCameras();
+      if (!state.camId) resetForCamera();
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
+// ---------------------------------------------------------------- add-camera wizard
+const WZ = ["model", "wifi", "ble", "name", "done"];
+const wz = { open: false, step: "model", camId: null, model: "auto", created: false, poll: null, profiles: {}, ble: "idle", bleMsg: "", status: null, reuse: false };
+
+async function profileFor(id) {
+  if (!wz.profiles[id]) {
+    try { wz.profiles[id] = await api(`/api/models/${enc(id)}`); } catch (_) { return null; }
+  }
+  return wz.profiles[id];
+}
+// Steps to show: the chosen model's, or the detected one's, or the S5's (verified) for auto.
+async function wzProfile() {
+  const c = state.cameras.find((x) => x.id === wz.camId);
+  const detected = c && c.camera && c.camera.modelNumber && c.profile ? c.profile.id : null;
+  const pick = wz.model !== "auto" ? wz.model : detected && detected !== "generic" ? detected : "dc_s5";
+  return profileFor(pick);
+}
+
+async function openWizard(opts) {
+  if (wz.open && !opts.step) return;
+  Object.assign(wz, { open: true, camId: opts.camId || null, model: "auto", created: false, ble: "idle", bleMsg: "", status: null, reuse: !!opts.reuse });
+  if (!state.models.length) await loadCameras();
+  const c = state.cameras.find((x) => x.id === wz.camId);
+  if (c) wz.model = c.model || "auto";
+  $("wizard").hidden = false;
+  $("wizard").classList.remove("leaving");
+  renderWzModels();
+  await wzGo(WZ.includes(opts.step) ? opts.step : "model");
+}
+
+async function closeWizard(cancelled) {
+  stopWzPoll();
+  const created = wz.created && wz.camId;
+  wz.open = false;
+  const w = $("wizard");
+  w.classList.add("leaving");
+  setTimeout(() => { w.hidden = true; w.classList.remove("leaving"); }, 380);
+  if (location.hash.startsWith("#wizard")) history.replaceState(null, "", location.pathname + location.search);
+  if (cancelled && created) {
+    // a camera added by this wizard that never connected: don't leave it behind
+    const c = state.cameras.find((x) => x.id === wz.camId);
+    if (c && c.status !== "ready" && !c.udn_bound) {
+      try { await api(`/api/cameras/${enc(wz.camId)}`, undefined, "DELETE"); } catch (_) { /* keep it */ }
+      await loadCameras();
+    }
+  }
+}
+
+async function wzGo(step, back) {
+  const prev = wz.step;
+  wz.step = step;
+  for (const sec of document.querySelectorAll(".wz-step")) {
+    const on = sec.dataset.step === step;
+    sec.hidden = !on;
+    sec.classList.toggle("back", !!back);
+    if (on) { sec.style.animation = "none"; void sec.offsetWidth; sec.style.animation = ""; }
+  }
+  const i = WZ.indexOf(step);
+  [...$("wzdots").children].forEach((d, k) => { d.className = k === i ? "on" : k < i ? "done" : ""; });
+  $("wzback").hidden = i === 0 || step === "done";
+  $("wzcancel").textContent = step === "done" ? "Close" : "Cancel";
+  $("wizard").scrollTop = 0;
+  if (step === "wifi") { await renderWzWifi(); startWzPoll(); } else stopWzPoll();
+  if (step === "ble") await renderWzBle();
+  if (step === "name") renderWzName();
+  if (step === "done") renderWzDone();
+  if (prev !== step) haptic();
+}
+
+function renderWzModels() {
+  const box = $("wzmodels");
+  const opts = [{ id: "auto", name: "Detect automatically", sub: "Recommended. Recognised from the camera when it connects." },
+    ...state.models.map((m) => ({ id: m.id, name: m.name, sub: m.model_numbers && m.model_numbers.length ? m.model_numbers.join(", ") : "Safe defaults for any LUMIX Sync body", verified: m.verified }))];
+  box.replaceChildren(...opts.map((o) => el("button", {
+    class: "cell nav-cell", role: "radio", "aria-checked": wz.model === o.id ? "true" : "false",
+    onclick: () => { wz.model = o.id; haptic(); renderWzModels(); },
+  }, el("div", { class: "cell-text" }, el("b", {}, o.name, o.verified ? el("span", { class: "badge" }, "tested") : null), el("small", {}, o.sub)), icon("check", "tick"))));
+}
+
+async function wzEnsureCamera() {
+  // Zero-friction path: the camera the server made on first run (provisional, never
+  // connected) is the one we set up, instead of adding a second entry.
+  if (!wz.camId && !wz.reuse) {
+    const prov = state.cameras.find((c) => c.provisional && !c.udn_bound && c.status !== "ready");
+    if (prov) wz.camId = prov.id;
+  }
+  if (wz.camId) {
+    const c = state.cameras.find((x) => x.id === wz.camId);
+    if (c && (c.model || "auto") !== wz.model) await patchCamera(wz.camId, { model: wz.model });
+    return true;
+  }
+  try {
+    const n = state.cameras.length + 1;
+    const r = await api("/api/cameras", { nickname: `Camera ${n}`, model: wz.model });
+    wz.camId = r.id; wz.created = true;
+    await loadCameras();
+    return true;
+  } catch (e) { toast(e.message, true); return false; }
+}
+
+function stepItem(i, s) {
+  return el("li", {}, el("button", {
+    onclick: (e) => { haptic(); e.currentTarget.parentElement.classList.toggle("done"); },
+  }, el("span", { class: "box" }, el("i", {}, String(i + 1)), icon("check")),
+  el("span", { class: "t" }, el("b", {}, s.title), s.detail ? el("small", {}, s.detail) : null)));
+}
+
+async function renderWzWifi() {
+  const p = await wzProfile();
+  const steps = (p && p.setup_wifi) || [];
+  $("wzwifisub").textContent = p && p.id !== "generic"
+    ? `On your ${p.name}, put it on your home Wi-Fi in remote-shooting mode:`
+    : "On the camera, put it on your home Wi-Fi in remote-shooting mode:";
+  $("wzwifisteps").replaceChildren(...steps.map((s, i) => stepItem(i, s)));
+  renderWzStatus();
+}
+
+function startWzPoll() {
+  stopWzPoll();
+  const tick = async () => {
+    if (!wz.open || wz.step !== "wifi" || !wz.camId) return;
+    try {
+      const d = await api(`/api/cameras/${enc(wz.camId)}`);
+      wz.status = d.status_detail || { status: d.status, message: d.message };
+      wz.detail = d;
+    } catch (_) { wz.status = { status: "offline" }; }
+    renderWzStatus();
+  };
+  tick();
+  wz.poll = setInterval(tick, 1000);
+}
+function stopWzPoll() { if (wz.poll) { clearInterval(wz.poll); wz.poll = null; } }
+
+function renderWzStatus() {
+  const s = wz.status || { status: "starting" };
+  const st = s.status;
+  const order = { discover: 0, approve: 1, ready: 2 };
+  const at = st === "ready" ? 3 : ["connecting", "waiting_approval"].includes(st) ? 1 : 0;
+  for (const row of document.querySelectorAll(".wz-stage")) {
+    const k = order[row.dataset.stage];
+    row.classList.toggle("done", k < at);
+    row.classList.toggle("active", k === at);
+    row.classList.toggle("warn", k === at && ["waiting_approval", "error", "reconnecting"].includes(st));
+    const small = row.querySelector("small");
+    small.textContent = "";
+    if (k === at) {
+      if (row.dataset.stage === "discover") small.textContent = st === "paused" ? "This camera is set not to connect automatically." : s.message || "Scanning for a Lumix in remote-shooting mode…";
+      else if (row.dataset.stage === "approve") small.textContent = st === "waiting_approval" ? "If the camera shows a prompt, press OK on it." : s.message || "Registering this computer on the camera…";
+    }
+    if (row.dataset.stage === "discover" && k < at && s.ip) small.textContent = `Found at ${s.ip}`;
+    if (row.dataset.stage === "ready" && st === "ready") {
+      const cam = s.camera || {};
+      small.textContent = [cam.modelNumber, s.model_name && s.model !== "generic" ? s.model_name + " profile" : "generic profile", s.ip].filter(Boolean).join(" · ");
+    }
+  }
+  $("wzwifinext").disabled = st !== "ready";
+  $("wzwifinext").textContent = st === "ready" ? "Continue" : "Waiting for the camera…";
+}
+
+async function renderWzBle() {
+  const p = await wzProfile();
+  const c = state.cameras.find((x) => x.id === wz.camId);
+  const can = !!(p && p.ble);
+  $("wzblesteps").replaceChildren(...((p && p.setup_ble) || []).map((s, i) => stepItem(i, s)));
+  $("wzblesteps").hidden = !can;
+  $("wzblewarn").hidden = !can || wz.ble === "ok";
+  $("wzblesub").textContent = can
+    ? "Pairing lets this computer switch the camera's Wi-Fi on and set its clock. You can skip it and pair later."
+    : "Bluetooth control isn't known for this model yet, so there is nothing to pair. You can still use it over Wi-Fi.";
+  const box = $("wzblestate");
+  const pair = $("wzblepair");
+  pair.hidden = !can || wz.ble === "ok";
+  pair.disabled = wz.ble === "running";
+  pair.textContent = wz.ble === "failed" ? "Try again" : "Pair over Bluetooth";
+  $("wzbleskip").textContent = wz.ble === "ok" || !can ? "Continue" : "Skip";
+  box.hidden = wz.ble === "idle" && !(c && c.ble && c.ble.registered);
+  box.className = "wz-blestate callout " + (wz.ble === "running" ? "" : wz.ble === "failed" ? "bad" : "ok");
+  if (wz.ble === "running") box.replaceChildren(el("span", { class: "spinner" }), el("div", {}, el("b", {}, "Pairing…"), el("span", {}, " Keep the camera on the Pairing screen. This takes up to a few minutes.")));
+  else if (wz.ble === "failed") box.replaceChildren(el("div", {}, el("b", {}, "Pairing didn't finish"), el("span", {}, " " + (wz.bleMsg || "Check that the camera shows Pairing, then try again."))));
+  else if (wz.ble === "ok" || (c && c.ble && c.ble.registered)) box.replaceChildren(el("div", {}, el("b", {}, "Paired"), el("span", {}, " This computer can wake the camera's Wi-Fi over Bluetooth.")));
+}
+
+async function wzPair() {
+  wz.ble = "running"; wz.bleMsg = ""; await renderWzBle();
+  try {
+    const r = await fetch(`/api/cameras/${enc(wz.camId)}/ble/register`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    let d = null; try { d = await r.json(); } catch (_) { /* none */ }
+    if (r.ok && d && d.ok) { wz.ble = "ok"; haptic([8, 30, 8]); }
+    else { wz.ble = "failed"; wz.bleMsg = (d && d.error) || `server answered ${r.status}`; }
+  } catch (e) {
+    // the Mac's Wi-Fi hop can drop this request; the result is in the camera list
+    await sleep(3000); await loadCameras();
+    const c = state.cameras.find((x) => x.id === wz.camId);
+    wz.ble = c && c.ble && c.ble.registered ? "ok" : "failed";
+    wz.bleMsg = "Lost the server while this Mac was on the camera's Wi-Fi. " + (wz.ble === "ok" ? "" : "Try again.");
+  }
+  await loadCameras();
+  await renderWzBle();
+}
+
+function suggestName(c) {
+  if (c && c.nickname && !/^(camera|new camera)( \d+)?$/i.test(c.nickname)) return c.nickname;
+  const cam = (c && c.camera) || {};
+  const m = (cam.friendlyName || "").match(/^([A-Z0-9]{2,6})-[0-9A-F]{6}$/);
+  if (m) return m[1];
+  if (cam.modelNumber) return cam.modelNumber.replace(/^DC-/, "");
+  return c && c.nickname ? c.nickname : "My camera";
+}
+function renderWzName() {
+  const c = state.cameras.find((x) => x.id === wz.camId);
+  $("wzname").value = suggestName(c);
+  updateNameHint();
+  setTimeout(() => $("wzname").focus(), 350);
+}
+function updateNameHint() {
+  const v = $("wzname").value.trim() || "…";
+  const hint = $("wznamehint");
+  hint.replaceChildren("From a terminal: ", el("code", {}, `lumix --camera ${/\s/.test(v) ? JSON.stringify(v) : v} shoot`));
+}
+
+function renderWzDone() {
+  const c = state.cameras.find((x) => x.id === wz.camId) || {};
+  const cam = c.camera || {};
+  $("wzdonetitle").textContent = `${c.nickname || "Camera"} is ready`;
+  $("wzdonesub").textContent = c.status === "ready" ? "Connected and remembered. It reconnects by itself next time." : "Saved. It connects as soon as the camera is in remote-shooting mode on your Wi-Fi.";
+  const rows = [["Model", cam.modelNumber ? `${cam.modelNumber}${c.profile ? " · " + c.profile.name : ""}` : (c.profile ? c.profile.name : "detected on connect")],
+    ["Wi-Fi", c.status === "ready" ? `connected · ${c.ip}` : "not connected yet"],
+    ["Bluetooth", c.ble && c.ble.registered ? "paired" : "not paired"], ["ID", c.id || "–"]];
+  $("wzsummary").replaceChildren(...rows.map(([k, v]) => el("div", { class: "cell" }, el("div", { class: "cell-text" }, el("b", {}, k)), el("span", { class: "val" }, v))));
+  $("wzanother").hidden = false;
+}
+
+function wireWizard() {
+  $("wzcancel").addEventListener("click", () => closeWizard(wz.step !== "done"));
+  $("wzback").addEventListener("click", () => { const i = WZ.indexOf(wz.step); if (i > 0) wzGo(WZ[i - 1], true); });
+  $("wzmodelnext").addEventListener("click", async () => {
+    $("wzmodelnext").disabled = true;
+    const ok = await wzEnsureCamera();
+    $("wzmodelnext").disabled = false;
+    if (ok) wzGo("wifi");
+  });
+  $("wzwifinext").addEventListener("click", () => wzGo("ble"));
+  $("wzwifiskip").addEventListener("click", () => wzGo("ble"));
+  $("wzipform").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const ip = $("wzip").value.trim();
+    if (!ip || !wz.camId) return;
+    try { await api(`/api/cameras/${enc(wz.camId)}/connection/reconnect`, { ip }); toast(`Connecting to ${ip}…`); }
+    catch (err) { toast(err.message, true); }
+  });
+  $("wzblepair").addEventListener("click", wzPair);
+  $("wzbleskip").addEventListener("click", () => wzGo("name"));
+  $("wzname").addEventListener("input", updateNameHint);
+  $("wzname").addEventListener("keydown", (e) => { if (e.key === "Enter") $("wznamenext").click(); });
+  $("wznamenext").addEventListener("click", async () => {
+    const v = $("wzname").value.trim();
+    if (!v) { $("wzname").focus(); return; }
+    const r = await patchCamera(wz.camId, { nickname: v });
+    if (r) wzGo("done");
+  });
+  $("wzfinish").addEventListener("click", async () => {
+    const id = wz.camId;
+    await closeWizard(false);
+    state.skipConnect = false;
+    if (id) await switchCamera(id);
+  });
+  $("wzanother").addEventListener("click", async () => {
+    await closeWizard(false);
+    setTimeout(() => openWizard({}), 420);
+  });
+}
+
 // ---------------------------------------------------------------- websocket
+let wsCur = null;
 function connectWs() {
-  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/api/ws");
+  if (wsCur) { const old = wsCur; wsCur = null; old.onclose = null; try { old.close(); } catch (_) { /* gone */ } }
+  const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + cp("/api/ws"));
+  wsCur = ws;
   ws.onmessage = (m) => {
     const msg = JSON.parse(m.data);
     if (msg.type === "status") renderStatus(msg.data);
+    else if (msg.type === "cameras") setCameras(msg.data);
     else if (msg.type === "exposure") { state.exposure = msg.data; renderQC(); }
     else if (msg.type === "settings") loadSettings();
     else if (msg.type === "preset") { state.auto = msg.data; renderAuto(); }
@@ -951,8 +1421,9 @@ function connectWs() {
     else if (msg.type === "events") { $("log").replaceChildren(); for (const ev of msg.data) addLog(ev); }
   };
   ws.onclose = () => {
+    if (ws !== wsCur) return;
     renderStatus({ status: "offline", message: "server unreachable", liveview: {} });
-    setTimeout(connectWs, 2000);
+    setTimeout(() => { if (ws === wsCur) { loadCameras().finally(connectWs); } }, 2000);
   };
 }
 
@@ -961,7 +1432,12 @@ function init() {
   $("btnshutter").addEventListener("click", shutterPressed);
   $("btnaf").addEventListener("click", () => { haptic(); cameraCall("/api/af", {}); });
   $("btnauto").addEventListener("click", () => setAuto(!state.auto.on));
-  $("btnconn").addEventListener("click", () => (state.status && state.status.status === "ready" ? openSheet("conn") : ($("connect").hidden = false, state.skipConnect = false)));
+  $("btnconn").addEventListener("click", () => {
+    if (state.cameras.length > 1) openSheet("cams");
+    else if (state.status && state.status.status === "ready") openSheet("conn");
+    else { $("connect").hidden = false; state.skipConnect = false; }
+  });
+  $("btnwizard").addEventListener("click", () => openWizard({ camId: state.camId, reuse: true }));
   $("bannerbtn").addEventListener("click", () => reconnect());
   $("btnreconnect").addEventListener("click", () => reconnect());
   $("btnskip").addEventListener("click", () => { state.skipConnect = true; $("connect").hidden = true; if (state.status) renderStatus(state.status); });
@@ -976,12 +1452,13 @@ function init() {
     if (document.querySelector("dialog[open]")) return;
     const k = e.key;
     if (k === "Escape") {
-      if (!$("viewer").hidden) closeViewer();
+      if (wz.open) closeWizard(true);
+      else if (!$("viewer").hidden) closeViewer();
       else if (!$("files").hidden) { if (files.selecting) setSelecting(false); else closeFiles(); }
       else if (sheetOpen()) { if (navStack.length > 1) pop(); else closeSheet(); }
       return;
     }
-    if (!$("files").hidden || !$("viewer").hidden) return;
+    if (!$("files").hidden || !$("viewer").hidden || wz.open) return;
     if (e.code === "Space") { e.preventDefault(); shoot(); }
     else if (k === "r" || k === "R") toggleRec();
     else if (k === "p" || k === "P") (sheetOpen() ? closeSheet() : openSheet());
@@ -992,14 +1469,35 @@ function init() {
     else if (k === "ArrowLeft") stepMode(-1);
     else if (k === "ArrowRight") stepMode(1);
   });
+  wireCameras();
+  wireWizard();
   setMode(state.mode, true);
   renderChecklist(DEFAULT_STEPS);
   renderConnect({ status: "starting" });
-  keepLiveView();
-  connectWs();
-  loadSettings();
-  loadConnection();
-  api("/api/presets").then((r) => { state.auto = r.auto || { on: false }; renderAuto(); }).catch(() => {});
+  loadCameras().finally(() => {
+    keepLiveView();
+    connectWs();
+    loadSettings();
+    loadConnection();
+    loadPresets();
+    hashRoute();
+  });
+  window.addEventListener("hashchange", hashRoute);
   if (document.fonts && document.fonts.ready) document.fonts.ready.then(positionModes);
+}
+// Statuses of the other cameras: refresh the list (fast while the switcher is open).
+let camPollAt = 0;
+setInterval(() => {
+  const open = sheetOpen() && ["cams", "cam"].includes(currentPage());
+  if (Date.now() - camPollAt > (open ? 1500 : 6000) && state.cameras.length) { camPollAt = Date.now(); loadCameras(); }
+}, 500);
+function loadPresets() {
+  api("/api/presets").then((r) => { state.auto = r.auto || { on: false }; renderAuto(); }).catch(() => {});
+}
+// Deep links: #wizard[=model|wifi|ble|name|done], #cameras
+function hashRoute() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (h.startsWith("wizard")) openWizard({ camId: state.camId, reuse: true, step: h.split("=")[1] || "model" });
+  else if (h === "cameras") openSheet("cams");
 }
 init();
