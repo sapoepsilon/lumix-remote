@@ -1067,10 +1067,11 @@ def _friendly_error(e: BaseException, ip: Optional[str]) -> str:
     """A connection error as a sentence (the raw text stays in the server log)."""
     log.info("connection error: %r", e)
     text = str(e)
-    if isinstance(e, asyncio.TimeoutError) or "timeout" in type(e).__name__.lower():
+    if (isinstance(e, asyncio.TimeoutError) or "timeout" in type(e).__name__.lower()
+            or text.startswith(("TimeoutError", "ServerTimeoutError"))):
         return "camera at %s does not answer (asleep, off or out of range)" % (ip or "?")
-    if isinstance(e, OSError) and ("Connect call failed" in text or "Cannot connect" in text
-                                   or "refused" in text.lower() or "unreachable" in text.lower()):
+    if ("Connect call failed" in text or "Cannot connect" in text
+            or "refused" in text.lower() or "unreachable" in text.lower()):
         return "camera at %s is not reachable (off, asleep or on another network)" % (ip or "?")
     return text or type(e).__name__
 

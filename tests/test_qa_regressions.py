@@ -140,3 +140,16 @@ class ShootingLeavesFilesTest(EmuTestCase):
             r.emu.cfg.dl_rate = 0
             await r.call("POST", "/api/jobs/%s/cancel" % j["id"])
         self.run_(go(), 40)
+
+
+class FriendlyErrorTest(unittest.TestCase):
+    def test_connection_errors_read_as_sentences(self):
+        from lumix.camera import _friendly_error
+        from lumix.protocol import CamError
+        e = CamError("ClientConnectorError: Cannot connect to host 1.2.3.4:60606 ssl:default "
+                     "[Connect call failed ('1.2.3.4', 60606)]")
+        self.assertEqual(_friendly_error(e, "1.2.3.4"),
+                         "camera at 1.2.3.4 is not reachable (off, asleep or on another network)")
+        self.assertIn("does not answer", _friendly_error(CamError("TimeoutError: "), "1.2.3.4"))
+        self.assertIn("does not answer", _friendly_error(asyncio.TimeoutError(), "1.2.3.4"))
+        self.assertEqual(_friendly_error(CamError("HTTP 500 for /x"), "1.2.3.4"), "HTTP 500 for /x")
