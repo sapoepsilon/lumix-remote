@@ -48,8 +48,8 @@ class BleHelpers(unittest.TestCase):
         self.assertEqual(p.hex(), "ea070a0b15050700" + struct.pack("<h", -360).hex())
 
     def test_is_lumix(self):
-        self.assertTrue(ble._is_lumix("S5-XXXXXX", {0x3A: b"\x00"}, [ble.SVC_MAIN]))
-        self.assertTrue(ble._is_lumix("S5-XXXXXX", {0x3A: b"\x00"}, []))
+        self.assertTrue(ble._is_lumix("S5-A1B2C3", {0x3A: b"\x00"}, [ble.SVC_MAIN]))
+        self.assertTrue(ble._is_lumix("S5-A1B2C3", {0x3A: b"\x00"}, []))
         self.assertFalse(ble._is_lumix("S1899af2988802f71C", {0x3A: b"\x00"}, []))
 
 

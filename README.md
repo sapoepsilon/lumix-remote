@@ -1,23 +1,172 @@
-# Lumix Remote
+# LUMIX Remote: open-source Panasonic LUMIX camera remote for Mac (web app + CLI)
 
-Control a Panasonic Lumix camera over Wi-Fi from a browser: live view, shutter,
-video, touch focus, exposure controls and every setting the camera exposes
-remotely. Built and tested against a **DC-S5 (firmware 2.03)**; other Lumix
-bodies that speak the same `cam.cgi` protocol (LUMIX Sync / Image App) may work.
+**Control a Panasonic LUMIX camera from your Mac, phone or terminal over Wi-Fi
+and Bluetooth LE: live view, shutter, video, touch focus, every remote setting,
+timelapse, and file transfer/import.** An open-source LUMIX Sync alternative
+for desktop, built and verified on the **LUMIX S5 (DC-S5)**.
 
-The protocol is reverse-engineered (see `docs/protocol-research.md`). Panasonic
-publishes no spec, so this is unofficial and may break with firmware updates.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
+![Camera: LUMIX S5](https://img.shields.io/badge/camera-LUMIX%20S5-yellow.svg)
+
+![LUMIX Remote web app: live view from a LUMIX S5 with exposure readout and shutter](docs/images/web-app-live-view.png)
+
+LUMIX Remote is a small Python server that speaks the camera's Wi-Fi protocol
+(the same `cam.cgi` / UPnP protocol LUMIX Sync and the old Image App use) and
+serves a browser UI styled after the iPhone Camera app, plus a `lumix` command
+line client and a JSON/WebSocket API. Use it for Lumix S5 Wi-Fi tethering on a
+Mac, long timelapses with automatic import, pulling photos and videos off the
+card without a cable, or scripting the camera from a terminal.
+
+The protocol is reverse-engineered (see [docs/protocol-research.md](docs/protocol-research.md)).
+Panasonic publishes no spec, so this is unofficial and may break with firmware updates.
+
+## Features
+
+- **Live view** in the browser (MJPEG + WebSocket), tap to focus, one-shot AF, power zoom.
+- **Remote shutter and video** recording, with remaining shots, battery and card status.
+- **Exposure controls**: aperture, shutter, ISO, EV, white balance, mode, focus, AF area, drive, quality.
+- **Every remote setting** the body exposes, generated from the camera's own menu and searchable.
+- **One-tap Auto preset** that saves your manual settings and restores them on the second tap.
+- **Timelapse / intervalometer**: server-driven or the camera's own interval mode, with AE lock,
+  pause/resume, survive-a-restart, automatic import and MP4 assembly (ffmpeg).
+- **File transfer and import**: browse the card in an iOS-Photos-style grid, preview, download,
+  and import to `~/Pictures/Lumix/<date>/` with RAW+JPEG pairs, resumable transfers and skip-duplicates.
+- **Multi-camera**: several bodies at once, each with its own session, live view port and settings.
+- **Guided onboarding** with the exact camera menu paths and a live connection tracker.
+- **Bluetooth LE (experimental)**: register the Mac, sync the clock, ask the camera to join your Wi-Fi.
+- **`lumix` CLI** for scripts and shell completion; **HTTP + WebSocket API** for everything the UI does.
+- **Phone friendly**: add it to the iPhone home screen and it runs full screen (PWA).
+- **Camera emulator** so contributors can develop and test without a camera.
+- Graceful power-off/server-stop handling: imports are checkpointed, recordings stopped, timelapses paused and resumed.
+
+| Timelapse running | On a phone |
+|---|---|
+| ![Timelapse panel with progress ring, next-shot countdown and last frame](docs/images/timelapse.png) | ![LUMIX Remote on a phone-width screen](docs/images/phone.png) |
+
+(Screenshots are from the bundled camera emulator, whose live view is a synthetic test pattern.)
+
+## Supported cameras
+
+| Camera | Status |
+|---|---|
+| Panasonic LUMIX **DC-S5** (firmware 2.03) | Verified on a real body: Wi-Fi control, live view, files, timelapse, BLE registration |
+| Other LUMIX bodies that support LUMIX Sync / Image App remote shooting (S5II, S1, GH5, GH6, G9, G9II, ...) | Untested; they run on the `generic` profile and may work. Reports and profiles welcome |
+
+Everything model-specific lives in a profile under `lumix/models/`. See
+[docs/adding-a-camera.md](docs/adding-a-camera.md) to add yours.
 
 ## Quick start
 
 ```sh
-./run.sh                       # http://127.0.0.1:8770, camera auto-discovered
-./run.sh --camera-ip 192.168.1.50
-./run.sh --lan                 # also reachable from your phone on the LAN (no auth!)
+git clone https://github.com/sapoepsilon/lumix-remote.git
+cd lumix-remote
+./run.sh                 # open http://127.0.0.1:8770
 ```
 
-`run.sh` creates `.venv` and installs `requirements.txt` (only `aiohttp`) on first
-run. Python 3.9+.
+`run.sh` creates `.venv`, installs `requirements.txt` (only `aiohttp`) on first run and
+auto-discovers the camera. Python 3.9+. Pass `--camera-ip 192.168.1.50` to skip discovery,
+or `--lan` to reach it from your phone (no authentication, trusted LANs only).
+
+## Onboarding: connect the camera
+
+1. On the camera: MENU > Setup > Wi-Fi > Wi-Fi Function > New Connection >
+   Remote Shooting & View, press DISP, choose **Via Network** and your home Wi-Fi
+   (the same network as the computer). Or join the camera's own access point
+   (the camera is then at 192.168.54.1).
+2. Start `./run.sh`; the server finds the camera and registers this computer.
+   Approve it on the camera if asked. The camera shows "Under remote control".
+3. For a guided setup (exact menu paths, live status, optional Bluetooth pairing,
+   a name) use **Set up step by step** on the connect screen, or Controls > Cameras > Add camera.
+
+## CLI examples
+
+```sh
+lumix status                          # battery, cards, mode, remaining shots, live view
+lumix set iso 400; lumix set aperture 5.6; lumix set shutter 250
+lumix shoot                           # take a photo
+lumix video start|stop
+lumix snapshot -o frame.jpg           # latest live view frame
+lumix timelapse start -i 5 --duration 1h30m --start-at 18:45 --ae-lock --import --video --name sunset
+lumix files import --latest 10        # copy the newest 10 files to ~/Pictures/Lumix/<date>/
+```
+
+The CLI talks to the running server (the camera allows one controller). Full list: [CLI](#cli).
+
+## API overview
+
+Everything the UI does is a JSON call, so you can script the camera from any language:
+
+```sh
+curl -s localhost:8770/api/status
+curl -s -X POST localhost:8770/api/capture
+curl -s -X POST localhost:8770/api/timelapse -H 'content-type: application/json' -d '{"interval": 10, "count": 360}'
+curl -s localhost:8770/api/liveview.mjpg > stream.mjpg
+```
+
+Groups: cameras (`/api/cameras`), status and settings (`/api/status`, `/api/settings`),
+shooting (`/api/capture`, `/api/video/*`, `/api/touch`), live view (`/api/liveview.jpg|.mjpg`),
+files and imports (`/api/files`, `/api/jobs`), timelapse (`/api/timelapse`), power
+(`/api/power/off`), and a WebSocket push feed (`/api/ws`). Full table: [HTTP API](#http-api).
+
+## How it works
+
+The camera runs an HTTP server (`cam.cgi`) for commands, a UPnP server on :60606
+for the device description, events (GENA) and the card listing (ContentDirectory),
+a file server on :50001, and streams live view as JPEG frames over UDP. LUMIX Remote
+mirrors the connection sequence of LUMIX Sync 2.0.17, keeps exactly one request in
+flight, and avoids the command patterns that wedge the S5. Notes:
+
+- [docs/protocol-research.md](docs/protocol-research.md): Wi-Fi protocol, `cam.cgi` commands, live view
+- [docs/lumix-sync-wifi-flow.md](docs/lumix-sync-wifi-flow.md): the LUMIX Sync connection flow, step by step
+- [docs/bluetooth-research.md](docs/bluetooth-research.md) and [docs/ble-prior-art.md](docs/ble-prior-art.md): Bluetooth LE GATT map and pairing
+- [docs/camera-models.md](docs/camera-models.md): model profiles
+- [Connection sequence](#connection-sequence-what-the-server-does) and [Known issues](#known-issues) below
+
+## Emulator for contributors
+
+No camera? `emulator/` is a fake DC-S5 that speaks the same protocol (cam.cgi,
+UPnP, GENA events, files, UDP live view) and reproduces the real body's failure
+modes, so the server and UI can be developed and tested without hardware:
+
+```sh
+.venv/bin/python -m emulator          # cam.cgi :8080, upnp :60606, files :50001
+LUMIX_REMOTE_HOME=/tmp/lumix-emu ./run.sh --camera emu --camera-ip 127.0.0.1 \
+  --camera-http-port 8080 --camera-upnp-port 60606 --camera-files-port 50001
+.venv/bin/python -m unittest discover -s tests   # 161 tests, no camera needed
+```
+
+Details: [docs/emulator.md](docs/emulator.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## FAQ
+
+**Can it turn the camera on over Wi-Fi?** No. Once the camera is off its Wi-Fi
+is off too. It can power the camera *off* (`lumix poweroff --yes`). Bluetooth LE
+wake is experimental: the S5 accepts the wake commands but has not come back on
+Wi-Fi in testing yet (see [Bluetooth](#bluetooth-wake--wi-fi-on--power-cycle--experimental)).
+
+**Does it use HDMI?** No, everything goes over Wi-Fi; no capture card needed.
+The live view has a frame-source hook where an HDMI capture source could be
+added (see [Extension points](#extension-points-timelapse-file-browser-hdmi-capture)).
+
+**Do I need to pair the camera in macOS Bluetooth settings?** No. The camera
+trusts a registered client id, not an OS bond, so `bin/lumix-ble register` (or the
+wizard's Bluetooth step) works without System Settings > Bluetooth, where the
+camera never shows up anyway. Bluetooth is optional; Wi-Fi control works without it.
+
+**Is it a LUMIX Sync replacement?** For remote shooting, live view, settings,
+timelapse and importing to a Mac, yes. It does not do geotagging or firmware updates.
+
+**Windows / Linux?** The Wi-Fi server is plain Python + aiohttp and should run
+anywhere; it is developed and tested on macOS. The BLE tools use `bleak`.
+
+**Is it safe to expose on my network?** There is no authentication. Keep the
+default 127.0.0.1 binding unless you trust the LAN.
+
+---
+
+## Server options and configuration
 
 On the camera: connect it to the same Wi-Fi network as your computer
 (Wi-Fi > "Remote Shooting & View", via network) or join its own access point
@@ -163,8 +312,7 @@ In-camera), interval and shots-or-time pickers, AE lock / Import / MP4 / Later
 toggles and a summary (shots, run time, clip length). While running: a progress
 ring with shots taken, time left and finish time, next shot countdown, skipped
 slots with the reason, the last frame, Pause/Resume and Stop. The shutter (or
-Space) starts/stops it. Screenshots: `evidence/timelapse-*.png`,
-`evidence/poweroff-*.png`.
+Space) starts/stops it. Screenshot: [docs/images/timelapse.png](docs/images/timelapse.png).
 
 ## Web UI
 
@@ -200,7 +348,7 @@ home screen (Share > Add to Home Screen; needs `--lan`) and it opens full screen
   live tracker (looking on the network > waiting for approval > connected) >
   optional Bluetooth pairing (S5: MENU > Setup > Bluetooth > ON > SET > Pairing,
   Remote Wakeup ON; warns that the Mac leaves home Wi-Fi for ~30-60 s) > name >
-  done. Deep link: `/#wizard`, `/#cameras`. Screenshots: `evidence/onboarding-*.png`.
+  done. Deep link: `/#wizard`, `/#cameras`.
 
 Keyboard: Space photo, R video, 1/2/3 or arrows mode, P controls, A Auto,
 F one-shot AF, G files, Esc closes.
@@ -609,8 +757,16 @@ back-off (10 s .. 120 s), never while the camera is busy or wedged.
 - Kelvin white balance and photo-style fine adjustments (`__value__` parameters)
   are not editable yet.
 - No authentication: keep the default 127.0.0.1 binding unless you trust the LAN.
+## Disclaimer
+
+LUMIX Remote is an independent open-source project. It is not affiliated with,
+endorsed by or supported by Panasonic Holdings Corporation. LUMIX and LUMIX Sync
+are trademarks of Panasonic. The protocol was reverse-engineered for
+interoperability; use it at your own risk, and note that some commands (for
+example rapid mode switching) can leave a camera unresponsive until it is
+power-cycled.
 
 ## License
 
-MIT, see `LICENSE`. Protocol knowledge comes from public reverse-engineering
+MIT, see [LICENSE](LICENSE). Protocol knowledge comes from public reverse-engineering
 notes; no third-party code is included.
