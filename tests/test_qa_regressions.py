@@ -109,3 +109,34 @@ class BackgroundTaskTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShootingLeavesFilesTest(EmuTestCase):
+    def test_capture_while_browsing_switches_back(self):
+        r = self.rig
+
+        async def go():
+            st, d = await r.call("GET", "/api/files?limit=1")
+            self.assertEqual(st, 200)
+            self.assertEqual(r.emu.cammode, "play")
+            st, d = await r.call("POST", "/api/capture")
+            self.assertEqual((st, d["result"]), (200, "ok"))
+            self.assertFalse(r.sess.files.active)
+            self.assertEqual(r.sess.cam.state.get("cammode"), "rec")
+        self.run_(go(), 40)
+
+    def test_capture_during_import_is_refused_with_reason(self):
+        r = self.rig
+
+        async def go():
+            st, d = await r.call("GET", "/api/files?limit=2")
+            r.emu.cfg.dl_rate = 50000           # slow card reads: the import keeps running
+            st, j = await r.call("POST", "/api/files/import", {"ids": [d["items"][0]["id"]], "dest": self.dest})
+            self.assertEqual(st, 202)
+            await r.wait(lambda: r.sess.files.running_jobs(), 5, "import running")
+            st, d = await r.call("POST", "/api/capture")
+            self.assertEqual(st, 409)
+            self.assertIn("import", d["error"])
+            r.emu.cfg.dl_rate = 0
+            await r.call("POST", "/api/jobs/%s/cancel" % j["id"])
+        self.run_(go(), 40)

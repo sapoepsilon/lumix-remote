@@ -189,14 +189,30 @@ async def info(request: web.Request) -> web.Response:
                   "touch_type": cam.touch_type, "exposure": cam.exposure_dict()})
 
 
+async def _shooting(request: web.Request) -> Camera:
+    """Shooting commands while file browsing is on (play mode, where the camera
+    answers err_reject): leave browsing first, unless an import is copying from
+    the card (then 409; `lumix files done` / closing Files pauses it)."""
+    s = session(request)
+    fb = s.files
+    if fb.active:
+        if fb.running_jobs() or fb.pins:
+            raise Busy("the camera is in playback for an import from the card; wait for it, "
+                       "or leave Files (`lumix files done`) to pause it")
+        r = await fb.leave()
+        if not r.get("left") or s.cam.state.get("cammode") != "rec":
+            raise Busy("the camera did not switch back from playback (%s)" % r.get("recmode", r.get("reason")))
+    return s.cam
+
+
 @_guard
 async def capture(request: web.Request) -> web.Response:
-    return _json(await camera(request).capture())
+    return _json(await (await _shooting(request)).capture())
 
 
 @_guard
 async def video_start(request: web.Request) -> web.Response:
-    return _json(await camera(request).video(True))
+    return _json(await (await _shooting(request)).video(True))
 
 
 @_guard
@@ -207,12 +223,13 @@ async def video_stop(request: web.Request) -> web.Response:
 @_guard
 async def touch(request: web.Request) -> web.Response:
     b = await _body(request)
-    return _json(await camera(request).touch_af(int(b["x"]), int(b["y"])))
+    x, y = int(b["x"]), int(b["y"])
+    return _json(await (await _shooting(request)).touch_af(x, y))
 
 
 @_guard
 async def af(request: web.Request) -> web.Response:
-    return _json(await camera(request).oneshot_af())
+    return _json(await (await _shooting(request)).oneshot_af())
 
 
 @_guard
