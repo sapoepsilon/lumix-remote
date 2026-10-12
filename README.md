@@ -23,15 +23,55 @@ On the camera: connect it to the same Wi-Fi network as your computer
 (Wi-Fi > "Remote Shooting & View", via network) or join its own access point
 (camera at 192.168.54.1). The first connection registers this computer on the
 camera; if it asks, approve it there. The camera then shows "Under remote control".
+With one camera there is nothing else to set up: the first run creates a camera
+entry that takes whatever Lumix it finds. For a guided setup (exact menu paths,
+live status, optional Bluetooth pairing, a name) use **Set up step by step** on
+the connect screen, or Controls > Cameras > Add camera.
 
 Options: `--port`, `--host`, `--device-name` (name shown on the camera),
-`--lv-port` (UDP live view, default 49199), `--event-port` (HTTP callback for
-camera events, default 49153), `--scan-exclude ip1,ip2` (hosts the subnet scan
-must never contact; also `LUMIX_SCAN_EXCLUDE`), `--log-dir` (raw request log,
-default `logs/`), `-v`.
+`--lv-port` (UDP live view; each camera has its own, 49199, 49200, ...),
+`--event-port` (HTTP callback for camera events, default 49153, shared by all
+cameras), `--scan-exclude ip1,ip2` (hosts the subnet scan must never contact;
+also `LUMIX_SCAN_EXCLUDE`), `--no-scan` (never TCP-scan the LAN; also
+`LUMIX_NO_SCAN=1`), `--log-dir` (raw request log, default `logs/`), `-v`.
+Camera options (`--camera-ip`, `--camera-http-port`, `--camera-upnp-port`,
+`--camera-files-port`, `--model`, `--lv-port`) apply to `--camera ID` (created
+if new) or the active camera; with `--camera-ip` only that camera runs unless
+`--all-cameras` is given. The emulator (`docs/emulator.md`) needs the port options:
 
-Your firewall must allow inbound UDP on the live view port and TCP on the event
+```sh
+LUMIX_REMOTE_HOME=/tmp/lumix-emu ./run.sh --camera emu --camera-ip 127.0.0.1 \
+  --camera-http-port 8080 --camera-upnp-port 60606 --camera-files-port 50001
+```
+
+Your firewall must allow inbound UDP on the live view ports and TCP on the event
 port from the camera.
+
+### Cameras (multi-camera, per-camera config)
+
+Every camera is an entry in `~/.config/lumix-remote/cameras.json`
+(`LUMIX_REMOTE_HOME` moves the directory; never commit it): id, nickname, model
+profile (`auto` or a profile id, see `docs/camera-models.md`), last IP or a fixed
+IP, the camera's UDN (once seen, the entry only ever connects to that body),
+client UUID (LUMIX Sync-style MEI0 id), Bluetooth name/address/identity, home
+SSID for the BLE Wi-Fi join, camera-side ports (`http` 80, `upnp` 60606, `files`
+50001; emulators change them), its live-view port, and settings
+(`autoconnect`, `watchdog`). Auto preset state is per camera in
+`cameras/<id>/presets.json`. The server runs one session per camera at the same
+time (own live-view UDP port, own GENA callback path `/Camera/event/<id>` on the
+shared event port); discovery in one session never takes a camera another
+session owns.
+
+The **active** camera is the one behind the plain `/api/*` routes, the CLI
+without `--camera` and a fresh browser tab. Switch it in the UI (tap the camera
+name at the top left, or Controls > Cameras), with `lumix cameras use ID`, or
+`POST /api/cameras/{id}/activate`.
+
+Upgrading from the single-camera version: on first start `state.json`,
+`ble.json` and `presets.json` are folded into one camera entry and moved to
+`legacy/`. The server's pidfile is `~/.config/lumix-remote/server.pid` for both
+`./run.sh` and `lumix server`, so `lumix server stop` also stops a server started
+by hand; an old `logs/lumix-server.pid` is adopted once.
 
 ### Discovery
 
@@ -69,6 +109,17 @@ home screen (Share > Add to Home Screen; needs `--lan`) and it opens full screen
   Also connection details, event log, shortcuts, power off.
 - **Files** (photo button or `G`): iOS-Photos-style grid, filter, tap to preview,
   Select for multi-select, Download, Import to Mac with progress.
+- **Cameras** (Controls > Cameras, or the camera name when there are several):
+  every registered camera with its live status, tap to switch, (i) for details
+  (name, model profile, address, Bluetooth, connect automatically, BLE watchdog,
+  run setup again, remove).
+- **Add camera wizard**: pick a model (or auto-detect) > camera-side Wi-Fi steps
+  with the exact menu path (S5: MENU > Setup > Wi-Fi > Wi-Fi Function > New
+  Connection > Remote Shooting & View > DISP > Via Network > home Wi-Fi) and a
+  live tracker (looking on the network > waiting for approval > connected) >
+  optional Bluetooth pairing (S5: MENU > Setup > Bluetooth > ON > SET > Pairing,
+  Remote Wakeup ON; warns that the Mac leaves home Wi-Fi for ~30-60 s) > name >
+  done. Deep link: `/#wizard`, `/#cameras`. Screenshots: `evidence/onboarding-*.png`.
 
 Keyboard: Space photo, R video, 1/2/3 or arrows mode, P controls, A Auto,
 F one-shot AF, G files, Esc closes.
@@ -104,12 +155,21 @@ server holds that session), so the server must be running. It uses the repo's
 `ln -s "$PWD/bin/lumix" ~/.local/bin/lumix`.
 
 Server address: `--server URL` or `LUMIX_SERVER`, default `127.0.0.1:8770`.
+Camera: `--camera ID` / `-c ID` (id or nickname, env `LUMIX_CAMERA`), default the
+server's active camera.
 Every read command takes `--json`. Exit codes: 0 ok, 1 camera or server error
 (the camera's raw answer such as `err_busy` goes to stderr), 2 usage error or
 unknown setting/value, 3 server unreachable.
 
 ```sh
-lumix server start               # background ./run.sh, pid + log in logs/lumix-server.{pid,log}
+lumix cameras list               # '*' = active; works without the server (reads cameras.json)
+lumix cameras add "B-cam" --model dc_s5 [--ip IP] [--http-port 8080 ...] [--use]
+lumix cameras use b-cam          # make it the active camera
+lumix cameras rename b-cam "Studio"
+lumix cameras remove b-cam
+lumix --camera b-cam shoot       # one command against another camera
+
+lumix server start               # background ./run.sh; log logs/lumix-server.log, pid ~/.config/lumix-remote/server.pid
 lumix server start -- --camera-ip 192.168.1.50
 lumix server status              # also: lumix server stop (only stops a server it started)
 
@@ -170,8 +230,20 @@ POST bodies are JSON. Camera answers come back as `result` (`ok`, `err_busy`,
 `err_param`, `err_reject`, `err_critical`, ...). HTTP 409 = camera busy with
 another operation or not connected, 400 = bad request, 502 = transport error.
 
+Every camera route below also exists as `/api/cameras/{id}/...` (e.g.
+`/api/cameras/b-cam/capture`, `/api/cameras/b-cam/ws`); the plain form talks to
+the active camera. `{id}` may also be the nickname. `/api/status` answers
+`{"status": "no_camera"}` when no camera is set up; other camera routes 404.
+
 | Method & path | What |
 |---|---|
+| `GET /api/cameras` | `{active, cameras: [{id, nickname, active, model, profile, status, message, ip, camera, provisional, ble, ports, settings, ...}], models}` |
+| `POST /api/cameras` `{"nickname"?, "model"?, "ip"?, "ports"?, "settings"?, "activate"?}` | Register a camera (201); its session starts right away |
+| `GET /api/cameras/{id}` | Summary + `entry` (registry) + `profile` (full model profile) + `status_detail` |
+| `PATCH /api/cameras/{id}` `{"nickname"?, "model"?, "ip"?, "ports"?, "settings"?, "device_name"?, "ble"?}` | Change it (POST works too); model/IP/port changes reconnect |
+| `DELETE /api/cameras/{id}` | Forget the camera |
+| `POST /api/cameras/{id}/activate` | Make it the active camera |
+| `GET /api/models`, `GET /api/models/{id}` | Model profiles (short list / full: setup steps, quirks, capabilities) |
 | `GET /api/status` | Connection status, camera, battery, card, recording, live view stats |
 | `GET /api/state` | Raw `getstate` fields |
 | `GET /api/info` | Device description, capabilities, lens, touch type, aperture/shutter options |
@@ -191,10 +263,10 @@ another operation or not connected, 400 = bad request, 502 = transport error.
 | `POST /api/power/off` `{"confirm": true}` | Power the camera off |
 | `GET /api/liveview.jpg` | Latest live view frame |
 | `GET /api/liveview.mjpg` | MJPEG stream (`multipart/x-mixed-replace`) |
-| `GET /api/ws` | WebSocket push: `status`, `exposure`, `settings` (changed ids), `event`, `events`, `preset` |
+| `GET /api/ws` | WebSocket push: `status`, `exposure`, `settings` (changed ids), `event`, `events`, `preset`, `cameras` (list changed); the plain `/api/ws` closes with `active` when the active camera changes |
 | `GET /api/presets` | Preset state: `{"auto": {on, target, saved, applied, recmode_used, since}}` |
 | `POST /api/presets/auto` `{"on": true, "target": "photo"\|"video"}` | Auto on (saves manual values first) / off (`{"on": false}` restores them). Returns `steps` (each setsetting + result), `before`, `after` |
-| `GET /api/connection` | Status, IP, remembered IP, camera, live view, camera-side setup steps |
+| `GET /api/connection` | Status, IP, remembered IP, camera, live view, camera-side setup steps (`steps`, and `model` with the profile's Wi-Fi/BLE steps) |
 | `POST /api/connection/reconnect` `{"ip"?, "forget"?}` | Drop the session and reconnect now (optionally to `ip`; `forget` clears the remembered camera) |
 
 Live view endpoints take `?source=<name>` (default `wifi`) so other frame
@@ -279,7 +351,13 @@ should end on "Pairing completed". The home SSID is read from the camera
 `bin/lumix-ble` prints one JSON object per command. The server's `.venv` stays
 aiohttp-only; it runs `bin/lumix-ble` as a subprocess.
 
-API: `GET /api/ble/status` (`?probe=1` also connects), `POST /api/ble/wake`,
+Per camera: the BLE name, address, home SSID and registration time live in the
+camera's `ble` entry in `cameras.json` (the server passes `LUMIX_CAMERA_ID` to
+`bin/lumix-ble`; without it the helper uses the active camera). One radio: BLE
+actions of all cameras run one at a time. The watchdog switch is the camera's
+`settings.watchdog` (UI: camera details).
+
+API (also under `/api/cameras/{id}/ble/...`): `GET /api/ble/status` (`?probe=1` also connects), `POST /api/ble/wake`,
 `POST /api/ble/power-cycle` (rec mode, `camcmd poweroff`, wait for the camera
 to drop off, BLE wake, reconnect), `POST /api/ble/register`,
 `POST /api/ble/watchdog {"enabled": bool}`.
@@ -306,15 +384,20 @@ lumix/            camera client library (no web code)
   menu.py         allmenu + curmenu -> generic settings model
   exposure.py     aperture/shutter code tables, lens limits
   discovery.py    SSDP listener, ddd probe, subnet scan
-  presets.py      Auto preset: save manual values, apply, restore
+  presets.py      Auto preset: save manual values, apply, restore (plan from the model profile)
+  models/         model profiles (dc_s5.py, generic.py, base.py); docs/camera-models.md
+  registry.py     cameras.json: per-camera config, migration, pidfile path
   didl.py         ContentDirectory Browse SOAP + DIDL-Lite parser
   files.py        FileBrowser: play-mode session, listing cache, thumbs, downloads, import jobs
 server/           aiohttp app (API, MJPEG, WebSocket) + static UI
+  sessions.py     one camera session per registered camera, active camera
+  cameras_api.py  /api/cameras, /api/models routes
   ui_api.py       /api/presets, /api/connection routes
   static/         web UI (index.html, app.js, style.css, manifest, icons)
 lumixcli/         `lumix` command line client (HTTP API only)
 bin/lumix         CLI wrapper (uses .venv)
-tests/            unit tests: real S5 menu dumps, CLI against a fake server
+tests/            unit tests: real S5 menu dumps, CLI against a fake server, profiles,
+                  registry/migration, multi-camera routing
 docs/             protocol research notes
 tools/            stand-alone protocol probe
 ```
@@ -359,7 +442,10 @@ back-off (10 s .. 120 s), never while the camera is busy or wedged.
   `leave()`.
 - **Frame sources:** subclass `lumix.liveview.FrameSource`, call `publish(jpeg)`,
   register it in `app[SOURCES]["hdmi"]`; `/api/liveview.mjpg?source=hdmi` works.
-- **Features:** append a `setup(app)` to `server.app.FEATURES` to add routes.
+- **Features:** append a `setup(app)` to `server.app.FEATURES` to add routes;
+  register them with `server.app.camera_route(app, method, "/api/x", handler)` so
+  `/api/cameras/{id}/x` exists too, and get the camera with `session(request)`.
+- **Camera models:** `docs/camera-models.md`.
 - **Events:** `camera.bus.publish(kind, data)` reaches every WebSocket client;
   `camera.log_event(kind, text)` adds to the event log.
 
@@ -372,10 +458,13 @@ back-off (10 s .. 120 s), never while the camera is busy or wedged.
   `recmode` during the camera's own switch to play, and rapid `recmode`
   re-sends (our old watchdog and an event loop on `lens_Atta`). Nothing in-band
   clears it. The server avoids the triggers (see Connection sequence), flags
-  `"wedged": true` in `/api/status` after two commands exhausted their retries
-  (or one `recmode` refused for its whole retry budget while in play),
+  `"wedged": true` in `/api/status` as soon as one camcmd/startstream (or a
+  `recmode` from play) is refused for LUMIX Sync's whole retry budget (5 x 1 s)
+  while the body is not reported busy (profile flag `busy_budget_exhausted_is_wedge`),
   and calls `Camera.wedge_hooks` (the Bluetooth watchdog power-cycles from there).
-- No Bluetooth: power-on and auto-connect are not possible.
+- Bluetooth wake is experimental (see "Bluetooth"); only the S5 has a BLE map.
+- Only the DC-S5 profile is verified; `generic` and the encrypted `req_acc_g` /
+  `req_acc_e` handshake are untested on real bodies.
 - Kelvin white balance and photo-style fine adjustments (`__value__` parameters)
   are not editable yet.
 - No authentication: keep the default 127.0.0.1 binding unless you trust the LAN.
