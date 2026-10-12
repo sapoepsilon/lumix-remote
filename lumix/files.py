@@ -280,11 +280,21 @@ class FileBrowser:
         if self.active and self.cam.state.get("cammode") == "play":
             return
         cam = self.cam
-        if getattr(cam, "interval_active", False):
-            raise ModeError("an in-camera interval run is in progress; stop the timelapse first")
+        # playmode during an in-camera interval run wedged the S5 (2026-10-12 11:55,
+        # see Camera.mid_operation): refuse before anything is paused or stopped
+        blocked = getattr(cam, "interval_blocked", None)
+        why = await blocked() if blocked is not None else None
+        if why or getattr(cam, "interval_active", False):
+            raise ModeError("file browsing needs playback mode, and %s; the camera finishes it on "
+                            "its own. Browse the card after it ends (or stop the timelapse)"
+                            % (why or "an in-camera interval run is in progress"))
         if not self.active and not self._quiet and self.on_enter is not None:
             # files <- shooting: pause the timelapse, stop a recording (server.quiesce)
             await self.on_enter()
+        switch_blocked = getattr(cam, "mode_switch_blocked", None)
+        why = await switch_blocked() if switch_blocked is not None else None
+        if why and cam.state.get("cammode") != "play":
+            raise ModeError("not switching to playback: %s" % why)
         # camera reconnecting (e.g. a power cycle): wait a little, then fail fast
         for _ in range(40):
             if getattr(cam, "status", "ready") == "ready":

@@ -16,7 +16,7 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
 from yarl import URL
@@ -92,17 +92,27 @@ def build_query(mode: str, type: Optional[str] = None, value: Optional[str] = No
     return "&".join("%s=%s" % (k, urllib.parse.quote(str(v), safe=_SAFE)) for k, v in parts)
 
 
+# Result of a request the camera guard refused to send (never sent on the wire).
+GUARD_RESULT = "err_local_mid_operation"
+
+
 class CamTransport:
     """Serialised HTTP access to one camera."""
 
     def __init__(self, ip: str, user_agent: str = "LumixRemote/0.1",
-                 trace: Optional[Callable[[str, Reply], None]] = None, port: int = 80):
+                 trace: Optional[Callable[[str, Reply], None]] = None, port: int = 80,
+                 guard: Optional[Callable[[str, Optional[str], Optional[str]],
+                                          Awaitable[Optional[str]]]] = None):
         self.ip = ip
         self.port = port            # cam.cgi port (80 on real bodies; emulators may differ)
         self.user_agent = user_agent
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
         self.trace = trace
+        # Pre-send veto: guard(mode, type, value) -> None (send) or a reason
+        # (not sent; a local GUARD_RESULT reply comes back instead). The camera
+        # uses it to keep mode switches away from a body that is mid-operation.
+        self.guard = guard
         self.last_ok = 0.0
 
     async def _sess(self) -> aiohttp.ClientSession:
@@ -135,6 +145,12 @@ class CamTransport:
     async def cgi(self, mode: str, type: Optional[str] = None, value: Optional[str] = None,
                   value2: Optional[str] = None, timeout: float = 6.0) -> Reply:
         q = build_query(mode, type, value, value2)
+        if self.guard is not None:
+            why = await self.guard(mode, type, value)
+            if why:
+                log.warning("not sent (%s): %s", why, q)
+                return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>"
+                                   % GUARD_RESULT.encode(), 0.0)
         async with self._lock:
             t0 = time.monotonic()
             sess = await self._sess()

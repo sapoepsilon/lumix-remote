@@ -220,6 +220,12 @@ class EmuCamera:
         self.touch_on = False
         self.interval = {"armed": False, "research": False, "state": "enable", "remain": 0,
                          "group": None, "task": None}
+        # 2026-10-12 11:55 incident (tests/fixtures/real-s5-interval-restart-incident-2026-10-12.log): playmode into a paused
+        # interval run -> ok; the next recmode -> err_critical and camcmd err_busy for
+        # good; setsetting -> err_critical, then getsetting err_busy (curmenu still ok)
+        self.interval_mode_switched = False
+        self.settings_wedged = False        # setsetting answers err_critical
+        self.getsetting_wedged = False      # set by the first such setsetting
         if not hasattr(self, "card"):
             # non-volatile: menu settings and the card survive a power cycle
             self.settings: Dict[str, Tuple[str, str]] = dict(GETSETTING_DEFAULTS)
@@ -440,11 +446,16 @@ class EmuCamera:
         if mode == "getinfo":
             return self._getinfo(typ)
         if mode == "getsetting":
+            if self.cfg.wedge_realism and self.getsetting_wedged:
+                return self._xml("err_busy")                # 11:56:35 onward
             if typ in self.settings:
                 v, text = self.settings[typ]
                 return self._xml("ok", '<settingvalue %s="%s">%s</settingvalue>' % (typ, v, text))
             return self._xml("err_critical")
         if mode == "setsetting":
+            if self.cfg.wedge_realism and self.settings_wedged:
+                self.getsetting_wedged = True
+                return self._xml("err_critical")            # 11:56:33
             return self._setsetting(typ, value, value2)
         if mode == "camcmd":
             return self._camcmd(value or "")
@@ -620,6 +631,17 @@ class EmuCamera:
             # over with the full image count (tests/fixtures/real-s5-interval-2026-10-12.log)
             self._interval_stop("enable")
             self._interval_start()
+            return self._xml("ok")
+        if self.interval_mode_switched and value == "recmode" and realism:
+            # real S5 11:56:17: recmode after a playmode that landed in a paused interval
+            # run -> err_critical, then err_busy for every camcmd until a power cycle
+            self.wedge("recmode after playmode during an in-camera interval run")
+            self.settings_wedged = True
+            return self._xml("err_critical")
+        if iv["state"] == "pause" and value == "playmode":
+            # real S5 11:55:43: playmode while the run is paused -> ok, cammode play
+            self.interval_mode_switched = True
+            self.set_mode("play", self.cfg.rec_switch_s)
             return self._xml("ok")
         if iv["state"] in ("rec", "pause") and value in ("capture", "recmode", "playmode",
                                                          "video_recstart"):

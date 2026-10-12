@@ -30,8 +30,8 @@ from .events import EventListener
 from .liveview import LiveViewReceiver
 from .menu import MenuModel
 from .models import ModelProfile
-from .protocol import (CamError, CamTransport, Reply, encrypt_acc, parse_ddd, parse_nonce, parse_reply,
-                       parse_state)
+from .protocol import (GUARD_RESULT, CamError, CamTransport, Reply, encrypt_acc, parse_ddd, parse_nonce,
+                       parse_reply, parse_state)
 from .registry import JsonStore
 
 log = logging.getLogger("lumix.camera")
@@ -41,6 +41,15 @@ SUBSCRIBE_SETTLE_S = 30.0      # default max wait for the post-SUBSCRIBE mod_Pla
 LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
 SESSION_PROBE = "mode=getsetting&type=touch_type"   # needs an accepted session
 RECMODE_GUARD = "err_local_recmode_guard"            # recmode withheld by the churn guard
+MID_OPERATION = GUARD_RESULT                         # request withheld by the mid-operation guard
+# getstate interval_status while an in-camera interval run is going. Real DC-S5
+# fw 2.03: rec (running) and pause (tests/fixtures/real-s5-interval-2026-10-12.log);
+# "run" is LUMIX Sync's name for other bodies (docs/lumix-sync-wifi-flow.md s10).
+INTERVAL_RUNNING = ("run", "rec", "pause")
+MODE_SWITCHES = ("recmode", "playmode", "pictmode")
+# A read-only connect completes (SUBSCRIBE, live view) once the camera has been
+# idle this long (interval_status not rec/pause/off, not recording, not busy).
+READONLY_CLEAR_S = 10.0
 
 
 class Disconnected(Exception):
@@ -179,11 +188,97 @@ class Camera:
         self._probe_at = 0.0               # last periodic session probe (supervisor)
         self._recmode_sent: Deque[float] = deque(maxlen=8)
         self._reject_probe_at = float("-inf")  # last session probe after an err_reject (monotonic may start near 0)
+        self._state_at = float("-inf")     # monotonic time of the last good getstate
+        # Set (to the reason) when the connect found the camera mid-operation (an
+        # in-camera interval run, a video recording, the body in use) and stopped
+        # after the read-only part: no playmode/recmode, no SUBSCRIBE, no
+        # setsetting, no live view until the camera is idle again.
+        self.readonly: Optional[str] = None
+        self._readonly_idle_since: Optional[float] = None
 
     @property
     def interval_active(self) -> bool:
-        return (self.interval_owner is not None
-                or self.state.get("interval_status") in ("run", "rec", "pause"))  # S5 running = rec
+        return self.interval_owner is not None or self.interval_running
+
+    @property
+    def interval_running(self) -> bool:
+        """getstate says the body runs (or holds paused) its own interval run."""
+        return self.state.get("interval_status") in INTERVAL_RUNNING   # S5 running = rec
+
+    def interval_info(self) -> Dict[str, Any]:
+        st = self.state
+        try:
+            remain: Optional[int] = int(st.get("interval_remain_num") or "")
+        except ValueError:
+            remain = None
+        return {"status": st.get("interval_status"), "running": self.interval_running,
+                "remain": remain if self.interval_running else None,
+                "end_time": st.get("interval_end_time") if self.interval_running else None}
+
+    # ------------------------------------------------- mid-operation guard
+    # 2026-10-12 11:55 (real S5, tests/fixtures/real-s5-interval-restart-incident-2026-10-12.log): an in-camera interval
+    # run was paused by the old quiesce, the reconnect sent camcmd playmode (ok),
+    # recmode 34 s later -> err_critical, then err_busy for good; the job resume's
+    # setsetting interval_shoot_interval -> err_critical. Only a power cycle
+    # recovered it. Mode switches while the body is busy with its own operation
+    # are the known wedge trigger, so one guard sits in front of the transport.
+    def mid_operation(self) -> Optional[str]:
+        """Why the camera must not be switched between rec/play right now (None = idle)."""
+        st = self.state
+        iv = st.get("interval_status")
+        if iv in INTERVAL_RUNNING:
+            rem = st.get("interval_remain_num")
+            return "an in-camera interval run is %s%s" % (
+                "paused on the camera" if iv == "pause" else "in progress",
+                " (%s shots left)" % rem if rem else "")
+        if st.get("rec") == "on":
+            return "the camera is recording video"
+        if self.body_busy:
+            return "the camera is being operated on the body"
+        return None
+
+    async def fresh_state(self, max_age: float = 1.5) -> None:
+        """getstate unless the last good one is younger than ``max_age`` s."""
+        if self.transport is None or time.monotonic() - self._state_at < max_age:
+            return
+        with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+            await self._refresh_state()
+
+    async def mode_switch_blocked(self) -> Optional[str]:
+        """Fresh-state check before a rec/play switch: the reason it must not happen."""
+        await self.fresh_state(0.0)
+        return self.mid_operation()
+
+    async def interval_blocked(self) -> Optional[str]:
+        """Reason any write (setsetting, shutter, startstream) must wait: an
+        in-camera interval run is going (rec or pause). Re-reads a stale state,
+        and a cached 'running' once more before refusing (a run that just ended)."""
+        await self.fresh_state(0.0 if self.interval_running else 1.5)
+        return self.mid_operation() if self.interval_running else None
+
+    async def _pre_send(self, mode: str, typ: Optional[str], value: Optional[str]) -> Optional[str]:
+        """CamTransport guard: veto requests that could wedge a busy body.
+
+        * camcmd recmode/playmode/pictmode: never while mid_operation() (interval
+          run rec/pause, video recording, body busy). State is re-read first.
+        * any other camcmd (except poweroff), setsetting, startstream: never during
+          an in-camera interval run. The shutter during a run restarts it with the
+          full image count (real S5 11:38:17); setsetting during a paused run after
+          a mode switch answered err_critical (11:56:33). Not verified on the body:
+          whether setsetting/startstream alone (no mode switch) harm a running run;
+          they are withheld anyway.
+        getstate/getinfo/getsetting/accctrl/stopstream/camctrl (interval
+        pause|restart|stop, touch) always pass."""
+        if mode == "camcmd" and value in MODE_SWITCHES:
+            why = await self.mode_switch_blocked()
+        elif (mode == "camcmd" and value != "poweroff") or mode in ("setsetting", "startstream"):
+            why = await self.interval_blocked()
+        else:
+            return None
+        if why:
+            what = "%s %s" % (mode, value if mode == "camcmd" else typ or value or "")
+            self.log_event("warn", "%s not sent: %s" % (what.strip(), why), guard=True)
+        return why
 
     # ------------------------------------------------------------------ utils
     def _set_status(self, status: str, msg: str = "") -> None:
@@ -287,6 +382,8 @@ class Camera:
             "liveview": self.liveview.stats(), "events_sub": bool(self.listener.sid),
             "powered_off": self.powered_off,
             "wedged": self.wedged, "wedged_since": self.wedged_since, "body_busy": self.body_busy,
+            "mid_operation": self.mid_operation(), "readonly": self.readonly,
+            "interval": self.interval_info(),
         }
 
     # ------------------------------------------------------------- lifecycle
@@ -479,12 +576,13 @@ class Camera:
             if self.transport is not None:
                 await self.transport.close()
             self.transport = CamTransport(ip, user_agent=LUMIX_SYNC_UA, trace=self._trace,
-                                          port=self.cfg.http_port)
+                                          port=self.cfg.http_port, guard=self._pre_send)
         t = self.transport
         self.liveview.camera_ip = ip
         self.busy_streak = 0
         self.wedged, self.wedged_since, self.body_busy = False, None, False
         self._lv_running = False
+        self.readonly, self._readonly_idle_since = None, None
         # 1. device description (also proves the camera is there)
         raw = await t.get_raw(self.cfg.upnp_port, discovery.DDD_PATH, timeout=6)
         ddd = parse_ddd(raw)
@@ -522,9 +620,29 @@ class Camera:
                 raise CamError("access not granted: %s" % r.text)
             await asyncio.sleep(1.0)
         self.log_event("conn", "access granted: %s" % r.text)
+        # 2b. Read the camera's state before anything can change its mode. A body
+        # that is mid-operation (in-camera interval run, video recording) gets a
+        # read-only connect: no device_name/raw_img_send, no SUBSCRIBE (in rec it
+        # makes the S5 switch itself to play, FINDINGS 21:24), no playmode/recmode,
+        # no live view. 2026-10-12 11:55:43: the old connect sent playmode into a
+        # paused interval run and the recmode after it wedged the camera.
+        await self._refresh_state(strict=True)
+        busy = self.mid_operation()
+        if busy:
+            await self._readonly_setup(t, busy)
+            return
         if acc_type == "req_acc_e":
             # LUMIX Sync, encrypted bodies: device_name before the SUBSCRIBE
             await t.cgi("setsetting", "device_name", self.cfg.device_name)
+        await self._full_setup(ip)
+
+    async def _full_setup(self, ip: str, deferred: bool = False) -> None:
+        """Steps 3-6 of the connect (LUMIX Sync order): SUBSCRIBE, read-only
+        setup, settle, the one live-view start; then "ready". Also completes a
+        read-only connect once the camera is idle (``_complete_readonly``)."""
+        t = self.transport
+        assert t is not None
+        q = self.profile.connect
         # 3. event subscription, right after the accept (moves the S5 off "Connecting")
         self._mod_play.clear()
         sub_at = time.monotonic()
@@ -549,22 +667,78 @@ class Camera:
         # at connect, so it never hits this window. Wait for mod_Play.
         left = (q.settle_s if q.settle_event else q.settle_min_s) - (time.monotonic() - sub_at)
         if left > 0 and not self._mod_play.is_set():
-            self._set_status("connecting", "finishing the connection (the camera needs 5-30 s)")
+            if not deferred:
+                self._set_status("connecting", "finishing the connection (the camera needs 5-30 s)")
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._mod_play.wait(), left)
         self.log_event("conn", "camera settled after SUBSCRIBE in %.1fs (%s)" % (
             time.monotonic() - sub_at, (q.settle_event or "settle") if self._mod_play.is_set() else "timeout"))
         await self._refresh_state(strict=True)
+        self.readonly, self._readonly_idle_since = None, None
         # 6. live view start (the only recmode at connect)
         if self.liveview_wanted:
             await self.start_liveview("connect")
+        self._probe_at = time.monotonic()
+        if deferred:
+            # same session (connected_at and the ready hooks belong to the read-only connect)
+            self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
+            return
         self.connected_at = time.time()
         self.powered_off = False
-        self._probe_at = time.monotonic()
         self._save_state(connected_at=int(self.connected_at), provisional=False)
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
         for hook in list(self.ready_hooks):
             self._spawn(hook(self))
+
+    async def _readonly_setup(self, t: CamTransport, why: str) -> None:
+        """Connect without touching the camera's mode: only reads (capability,
+        allmenu, curmenu, lens, touch_type, getstate; the real S5 answered
+        curmenu/touch_type/focal/shtrspeed/getstate normally during a running
+        interval run, server camera log 11:46-11:55, before the restart). The supervisor
+        finishes the connect (``_complete_readonly``) when the camera is idle."""
+        self.readonly, self._readonly_idle_since = why, None
+        self.log_event("conn", "camera is mid-operation (%s): connected read-only; no mode switch, "
+                               "event subscription or live view until it is done" % why)
+        cap = await t.cgi("getinfo", "capability")
+        self.capability = _capability_dict(cap)
+        await self._load_menu()
+        await self.refresh_lens()
+        tt = await t.cgi("getsetting", "touch_type")
+        self.touch_type = tt.setting_value("touch_type")
+        await self._refresh_state(strict=True)
+        self._last_ok = time.monotonic()
+        self.connected_at = time.time()
+        self.powered_off = False
+        self._probe_at = time.monotonic()
+        self._save_state(connected_at=int(self.connected_at), provisional=False)
+        self._set_status("ready", "%s connected read-only: %s" % (self.ddd.get("friendlyName", t.ip), why))
+        for hook in list(self.ready_hooks):
+            self._spawn(hook(self))
+
+    async def _complete_readonly(self) -> None:
+        """Supervisor tick: finish a read-only connect once the camera has been
+        idle for READONLY_CLEAR_S (interval run over: not rec/pause and not the
+        ~5 s 'off' finish window). Not verified on the body yet: the SUBSCRIBE +
+        live view start right after an interval run ends
+        (scripts/real-verify-interval-restart.sh checks it)."""
+        why = self.mid_operation()
+        if why or self.state.get("interval_status") == "off":
+            if why and why != self.readonly:
+                self.readonly = why
+                self._set_status("ready", "%s connected read-only: %s"
+                                 % (self.ddd.get("friendlyName", self.ip), why))
+            self._readonly_idle_since = None
+            return
+        now = time.monotonic()
+        if self._readonly_idle_since is None:
+            self._readonly_idle_since = now
+            return
+        if now - self._readonly_idle_since < READONLY_CLEAR_S or self._op_lock.locked():
+            return
+        self.log_event("conn", "camera idle again: finishing the connection (events, live view)")
+        async with self.exclusive("connect"):
+            if await self.mode_switch_blocked() is None and self.transport is not None:
+                await self._full_setup(self.transport.ip, deferred=True)
 
     async def _cancel_access_request(self) -> None:
         """LUMIX Sync: giving up while the camera still researches our req_acc
@@ -737,6 +911,12 @@ class Camera:
             self.log_event("lv", "live view start (%s) skipped: camera %s"
                            % (reason, "in use" if self.body_busy else "wedged"))
             return False
+        # recmode/startstream into an in-camera interval run is the 11:55 wedge
+        # trigger; a read-only connect has no event subscription yet
+        why = await self.interval_blocked() or self.readonly
+        if why:
+            self.log_event("lv", "live view start (%s) skipped: %s" % (reason, why))
+            return False
         q = self.profile.connect
         if self._lv_running or not q.stopstream_only_if_running:
             # stopstream with no stream running answers err_critical on the S5
@@ -776,7 +956,7 @@ class Camera:
             raise Disconnected("getstate -> err_reject (camera dropped the session)")
         if not r.ok:
             return
-        self._last_ok = time.monotonic()
+        self._last_ok = self._state_at = time.monotonic()
         new = parse_state(r)
         if new != self.state:
             old = self.state
@@ -841,6 +1021,9 @@ class Camera:
                 await self._probe_session()
                 if self._reconnect_req.is_set():
                     raise Disconnected("camera dropped the session")
+            if self.readonly:
+                with contextlib.suppress(Busy):
+                    await self._complete_readonly()
             if (self._lv_pending and not self._op_lock.locked()
                     and time.monotonic() - self._lv_restart_at > 5):
                 reason, self._lv_pending = self._lv_pending, None
@@ -874,7 +1057,7 @@ class Camera:
         restart attempt, with growing back-off, only when the camera is in rec,
         not in use and not wedged; a camera-side switch to play is respected."""
         if (not self.liveview_wanted or self._op_lock.locked() or self.body_busy
-                or self.wedged or self.state.get("cammode") != "rec"):
+                or self.wedged or self.readonly or self.state.get("cammode") != "rec"):
             return
         if self.interval_active:
             # the body runs its own interval shooting: recmode/startstream answer
@@ -969,6 +1152,14 @@ class Camera:
             self._op_lock.release()
 
     # ------------------------------------------------------------- commands
+    async def refuse_mid_run(self, what: str) -> None:
+        """Busy when an in-camera interval run (rec or pause) is going: ``what``
+        (settings, shutter, Auto preset, ...) has to wait until it ends."""
+        why = await self.interval_blocked()
+        if why:
+            raise Busy("%s not possible: %s. The camera shoots on its own; stop the timelapse "
+                       "first (Pause keeps the run paused, still locked)" % (what, why))
+
     def _check_usable(self) -> None:
         if self.body_busy:
             raise Busy("camera is being operated on the body (waiting for it to finish)")
@@ -1028,6 +1219,7 @@ class Camera:
 
     async def set_raw(self, cmd_type: str, value: str, value2: Optional[str] = None,
                       mode: str = "setsetting") -> Dict[str, Any]:
+        await self.refuse_mid_run("Changing camera settings")
         async with self.exclusive("setting") as t:
             r = await t.cgi(mode, cmd_type, value, value2)
             self.log_event("cmd", "%s %s=%s%s -> %s" % (mode, cmd_type, value,
@@ -1061,6 +1253,12 @@ class Camera:
             # pointless and not harmless: recmode in rec with a stream answers err_busy and
             # counts towards the recmode churn that wedges the S5
             return {"result": "ok", "text": "already in %s mode (not sent)" % mode_now}
+        await self.refuse_mid_run("camcmd %s" % value)
+        if value in MODE_SWITCHES:
+            why = await self.mode_switch_blocked()
+            if why:
+                raise Busy("camcmd %s not sent: %s (switching modes now can wedge the camera)"
+                           % (value, why))
         async with self.exclusive("camcmd") as t:
             r = await self.cmd("camcmd", value=value, timeout=15)
             self.log_event("cmd", "camcmd %s -> %s" % (value, r.result))

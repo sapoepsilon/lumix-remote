@@ -10,7 +10,10 @@ Used by
 
 Order (each step bounded by a timeout, all of it by an overall deadline):
   1. import jobs: checkpointed (``.part`` files stay; resumed with Range later)
-  2. timelapse: paused after the shot in flight (in-camera runs: camctrl pause)
+  2. timelapse: paused after the shot in flight. An in-camera (native) run is
+     NOT paused on server stop / camera removal: the body shoots it alone, and
+     the next server start adopts it from getstate (2026-10-12 11:55: the
+     pause + reconnect mode switch wedged the S5). Power-off pauses it.
   3. video recording: ``video_recstop``, then wait until the card write is done
   4. live view: stopstream (only a stream we started)
   5. UNSUBSCRIBE the event subscription
@@ -45,6 +48,20 @@ def _import_label(j: Any) -> str:
     return "%s: %d item(s)" % (what, len(j.ids))
 
 
+# Reasons that leave an in-camera interval run alone (the camera needs no server).
+KEEP_NATIVE = ("server-stop", "remove")
+
+
+def keeps_native_run(sess: Any, reason: str) -> bool:
+    """True when ``reason`` must leave the camera's own interval run shooting."""
+    j = sess.timelapse.job
+    if reason not in KEEP_NATIVE:
+        return False
+    if sess.cam.state.get("interval_status") in ("run", "rec", "pause"):
+        return True
+    return bool(j is not None and j.engine == "native" and j.native.get("armed"))
+
+
 def plan(sess: Any, reason: str = "poweroff") -> Dict[str, Any]:
     """What a quiesce for ``reason`` would pause or stop right now."""
     if reason not in REASONS:
@@ -61,7 +78,11 @@ def plan(sess: Any, reason: str = "poweroff") -> Dict[str, Any]:
                       "label": "Video recording",
                       "detail": "Stopped; waits until the camera has finished writing the card."})
     j = tl.job
-    if j is not None and j.state in ("scheduled", "running") and reason != "shooting":
+    if keeps_native_run(sess, reason):
+        items.append({"kind": "timelapse", "action": "keep", "resumable": True,
+                      "label": "In-camera timelapse",
+                      "detail": "Keeps shooting on the camera; the server picks it up again when it starts."})
+    elif j is not None and j.state in ("scheduled", "running") and reason != "shooting":
         tgt = j.target
         items.append({"kind": "timelapse", "id": j.id, "action": "pause", "resumable": True,
                       "label": "Timelapse %s: %d%s shots" % (j.name, j.shots, " of %d" % tgt if tgt else ""),
@@ -107,7 +128,11 @@ async def quiesce(sess: Any, reason: str, timeout: float = 15.0) -> Dict[str, An
                 rep["paused"].append({"kind": "import", "id": j.id, "label": _import_label(j)})
     # 2. timelapse
     j = tl.job
-    if j is not None and j.state in ("scheduled", "running") and reason != "shooting":
+    if keeps_native_run(sess, reason):
+        # no camctrl pause, no mode switch: the camera finishes the run by itself
+        rep.setdefault("kept", []).append({"kind": "timelapse", "label": "In-camera timelapse",
+                                           "interval": cam.interval_info()})
+    elif j is not None and j.state in ("scheduled", "running") and reason != "shooting":
         await step("timelapse", tl.pause(reason, timeout=left(10)), 12)
         if tl.job is not None and tl.job.state == "paused":
             rep["paused"].append({"kind": "timelapse", "id": j.id,
@@ -134,10 +159,11 @@ async def quiesce(sess: Any, reason: str, timeout: float = 15.0) -> Dict[str, An
         if had:
             rep["stopped"].append({"kind": "events", "label": "Camera event subscription"})
     rep["elapsed_s"] = round(time.monotonic() - t0, 2)
-    if rep["paused"] or rep["stopped"]:
-        cam.log_event("quiesce", "%s: paused %s; stopped %s%s" % (
+    if rep["paused"] or rep["stopped"] or rep.get("kept"):
+        cam.log_event("quiesce", "%s: paused %s; stopped %s%s%s" % (
             LABELS[reason], ", ".join(x["label"] for x in rep["paused"]) or "nothing",
             ", ".join(x["label"] for x in rep["stopped"]) or "nothing",
+            "; left running: " + ", ".join(x["label"] for x in rep["kept"]) if rep.get("kept") else "",
             "; errors: " + "; ".join(rep["errors"]) if rep["errors"] else ""))
     cam.bus.publish("quiesce", rep)
     return rep
@@ -147,9 +173,13 @@ async def resume_after_reconnect(sess: Any, force: bool = False) -> Dict[str, An
     """Camera is ready again: resume what power-off / server stop paused.
     ``force`` (POST /api/resume) ignores the resume_on_reconnect setting."""
     out: Dict[str, Any] = {"timelapse": False, "imports": []}
+    tl, fb = sess.timelapse, sess.files
+    # an interval run going on the camera with no job (started on the body, or the
+    # job file is gone): show it and offer Pause/Stop; nothing is sent
+    with contextlib.suppress(Exception):
+        out["adopted"] = tl.adopt_camera_run()
     if not force and not sess.resume_on_reconnect():
         return out
-    tl, fb = sess.timelapse, sess.files
     if not force:
         await asyncio.sleep(0.5)    # let the connect's live-view start settle
     with contextlib.suppress(Exception):

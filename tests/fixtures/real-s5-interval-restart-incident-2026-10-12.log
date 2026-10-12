@@ -1,0 +1,31 @@
+# Real DC-S5 fw 2.03, 2026-10-12: native interval run across a server restart that wedged the camera
+# (lumix-remote server camera log, scrubbed: camera name, client id; getinfo bodies cut; focal/shtrspeed polls removed).
+# 11:46:14 run started (961 @ 30 s); 19 shots done when the server was restarted at 11:55:37.
+[11:55:15.557] state change {'interval_remain_num': '942'}
+[11:55:16.927] state change {'remaincapacity': '1878'}
+[11:55:37.371] GET /cam.cgi?mode=camctrl&type=interval&value=pause -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:55:38.286] GET /cam.cgi?mode=stopstream -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:55:38.420] state change {'interval_status': 'pause', 'warn_disp': 'interval_pause'}
+[11:55:41.041] GET /cam.cgi?mode=accctrl&type=req_acc&value=4D454930-0100-1000-8001-000000000000&value2=LumixRemote -> 200 ok_under_research_no_msg,S5-XXXXXX,remote,encrypted
+[11:55:42.361] GET /cam.cgi?mode=accctrl&type=req_acc&value=4D454930-0100-1000-8001-000000000000&value2=LumixRemote -> 200 ok,S5-XXXXXX,remote,encrypted
+[11:55:43.215] GET /cam.cgi?mode=camcmd&value=playmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:55:43.910] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[11:55:44.229] GET /cam.cgi?mode=setsetting&type=raw_img_send&value=enable -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:55:44.384] GET /cam.cgi?mode=getinfo&type=capability -> 200 <camrply><result>ok</result>...(cut)
+[11:55:45.149] GET /cam.cgi?mode=getinfo&type=allmenu -> 200 <camrply><result>ok</result>...(cut)
+[11:55:45.454] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <camrply><result>ok</result>...(cut)
+[11:55:45.484] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+[11:55:45.570] GET /cam.cgi?mode=getsetting&type=touch_type -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue touch_type="5"></settingvalue></camrply>
+[11:55:45.677] GET /cam.cgi?mode=setsetting&type=device_name&value=LumixRemote -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[11:56:17.818] GET /cam.cgi?mode=camcmd&value=recmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_critical</result></camrply>
+[11:56:23.268] GET /cam.cgi?mode=camcmd&value=recmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+[11:56:27.905] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result><settingvalue drivemode="stopmotion_interval">interval</settingvalue></camrply>
+[11:56:33.144] GET /cam.cgi?mode=setsetting&type=interval_shoot_interval&value=30 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_critical</result></camrply>
+[11:56:35.610] GET /cam.cgi?mode=getsetting&type=drivemode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+[11:56:38.256] GET /cam.cgi?mode=getsetting&type=touch_type -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+[11:56:54.285] GET /cam.cgi?mode=getsetting&type=touch_type -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+[11:57:10.171] GET /cam.cgi?mode=getsetting&type=touch_type -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+[11:57:22.632] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <camrply><result>ok</result>...(cut)
+[11:57:25.414] GET /cam.cgi?mode=getsetting&type=touch_type -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+[11:57:40.479] GET /cam.cgi?mode=getsetting&type=touch_type -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+# ... getsetting err_busy every ~15 s until the battery ran out; only a power cycle clears it.

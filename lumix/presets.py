@@ -150,6 +150,9 @@ class AutoPreset:
     async def set(self, on: bool, target: str = "photo") -> Dict[str, Any]:
         if target not in AUTO:
             raise ValueError("target must be photo or video")
+        refuse = getattr(self.cam, "refuse_mid_run", None)
+        if refuse is not None:
+            await refuse("The Auto preset")   # setsettings into an in-camera interval run
         async with self._lock:
             if on:
                 return await self._apply(target)

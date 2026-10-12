@@ -416,8 +416,15 @@ function renderStatus(s) {
   const lv = s.liveview || {};
   const live = lv.age !== null && lv.age !== undefined && lv.age < 3;
   $("lvempty").hidden = live;
+  // in-camera interval run (from getstate, so it shows after a server restart too)
+  const iv = ready && s.interval && s.interval.running ? s.interval : null;
+  const ivText = iv ? `In-camera timelapse ${iv.status === "pause" ? "paused" : "running"}`
+    + (iv.remain !== null && iv.remain !== undefined ? `: ${iv.remain} shots left` : "") : "";
   $("lvemptytext").textContent = !ready ? info.title : s.wedged ? "Live view stopped: the camera is stuck"
-    : s.body_busy ? "Live view paused while the camera is in use" : s.cammode === "play" ? "Camera is in playback" : "Waiting for live view…";
+    : s.body_busy ? "Live view paused while the camera is in use"
+    : iv ? ivText + " (live view off until it ends)"
+    : s.readonly ? "Connected read-only: " + s.readonly
+    : s.cammode === "play" ? "Camera is in playback" : "Waiting for live view…";
   // recording
   const rec = !!s.recording;
   $("app").classList.toggle("recording", rec);
@@ -442,6 +449,10 @@ function renderStatus(s) {
   } else if (ready && s.body_busy) {
     banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannerbtn").hidden = true;
     $("bannertext").textContent = "Someone is using the camera";
+  } else if (iv) {
+    // the camera shoots on its own; mode switches, settings and file browsing wait for it
+    banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannerbtn").hidden = true;
+    $("bannertext").textContent = ivText + " · the camera shoots on its own";
   } else if (busy) {
     banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannertext").textContent = "Camera busy: check its screen";
   } else banner.hidden = true;
@@ -1584,7 +1595,7 @@ function renderTimelapse(d) {
   const names = { scheduled: "Starts soon", running: j.engine === "native" ? "In-camera run" : "Shooting", paused: "Paused",
     stopping: "Stopping…", importing: "Importing frames…", assembling: "Making the video…" };
   let title = names[j.state] || j.state;
-  if (j.state === "paused" && j.paused_by && j.paused_by !== "user") title += ` (${{ poweroff: "camera off", "server-stop": "server stopped", files: "browsing files" }[j.paused_by] || j.paused_by})`;
+  if (j.state === "paused" && j.paused_by && j.paused_by !== "user") title += ` (${{ poweroff: "camera off", "server-stop": "server stopped", files: "browsing files", camera: "camera" }[j.paused_by] || j.paused_by})`;
   if (j.waiting) title = "Waiting: " + j.waiting.replace("camera ", "camera is ");
   $("tlstate").textContent = title;
   tlTick();
@@ -1592,6 +1603,10 @@ function renderTimelapse(d) {
   const last = (j.skips || []).slice(-1)[0];
   $("tlskip").textContent = sk ? `${sk} skipped${last ? " · " + last.reason : ""}` : (j.failed ? `${j.failed} failed` : `every ${fmtSecs(j.interval_s)}${j.ae_lock ? " · AE lock" : ""}${j.auto_import ? " · import" : ""}`);
   // in-camera start refused: the server took over (job.message says why)
+  // the camera's own count (getstate interval_remain_num), also for an adopted run
+  const civ = state.status && state.status.interval;
+  if (j.engine === "native" && civ && civ.running && civ.remain !== null && civ.remain !== undefined) $("tlskip").textContent = `camera: ${civ.remain} left · ` + $("tlskip").textContent;
+  if (j.message && j.native && (j.native.adopted || /kept shooting|no longer running/.test(j.message)) && tl.adoptShown !== j.id + j.message) { tl.adoptShown = j.id + j.message; toast(j.message); }
   const fb = j.native && j.native.fallback;
   if (fb) $("tlskip").textContent = "Camera wouldn't start its own interval; server-timed shots · " + $("tlskip").textContent;
   if (fb && tl.fallbackShown !== j.id) { tl.fallbackShown = j.id; toast(j.message || "In-camera interval unavailable; the server is taking the shots", true); }

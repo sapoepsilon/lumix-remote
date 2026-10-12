@@ -33,8 +33,18 @@
     engine instead of failing (``job.message`` says why). Only for profiles with
     ``capabilities["interval_native"]``. While it runs the body answers
     ``err_busy`` to capture/mode switches, so the UI's shutter and file browsing
-    are refused (``Camera.interval_active``). A run the camera lost (power
-    cycle) is re-armed with the remaining shot count.
+    are refused (``Camera.interval_active``).
+
+    The run does not need the server. A server stop / restart leaves it shooting
+    (no ``camctrl interval pause``), and the next start ADOPTS it: getstate
+    ``interval_status`` / ``interval_remain_num`` re-attach the persisted job
+    (or a new "camera run" job when there is none) without sending anything but
+    reads; a run paused on the body stays paused until the user resumes. Only
+    an explicit Pause pauses the camera. A run the camera no longer has (power
+    cycle, cancelled on the body) is never re-armed behind the user's back: the
+    job is marked done when its time is up, else paused with Resume re-arming
+    the remaining shots. (2026-10-12 11:55: pause on shutdown + playmode on
+    reconnect + re-arm setsetting wedged the real S5.)
 
 Job state (``cameras/<id>/timelapse.json``) is written on every change, so a
 server restart resumes a running job; a job paused by power-off / server stop
@@ -84,6 +94,10 @@ INTERVAL_SHOOTING = ("run", "rec")
 
 class TimelapseError(ValueError):
     pass
+
+
+class RunInProgress(TimelapseError):
+    """The camera is already running an interval run: adopt it, never arm into it."""
 
 
 def _drive_value(r: Any) -> Optional[List[Optional[str]]]:
@@ -477,6 +491,11 @@ class TimelapseEngine:
                 raise TimelapseError("could not leave file browsing (camera stays in play mode)")
         if self.cam.status != "ready":
             raise TimelapseError("camera not connected (%s)" % self.cam.status)
+        mid = getattr(self.cam, "mode_switch_blocked", None)
+        why = await mid() if mid is not None else None
+        if why:
+            raise TimelapseError("camera busy: %s; a new timelapse would have to change its "
+                                 "mode/settings now" % why)
         if self.job is not None:
             self.history.append(self.job.summary())
         self.job = job
@@ -513,6 +532,10 @@ class TimelapseEngine:
                 raise TimelapseError("no paused timelapse to resume")
             return self.status()
         was = j.paused_by
+        if j.engine == "native":
+            # an explicit resume (user, or the power-off resume): restart a run paused
+            # on the camera / re-arm a lost one; a server restart only adopts
+            j.native["resume_requested"] = True
         j.state = "running" if j.started_at else "scheduled"
         j.paused_by = j.paused_at = None
         j.anchor_t = None                   # re-anchored on the first slot after the pause
@@ -828,6 +851,12 @@ class TimelapseEngine:
         cam = self.cam
         try:
             async with cam.exclusive("timelapse", timeout=15) as t:
+                with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                    await cam._refresh_state()
+                if cam.state.get("interval_status") in INTERVAL_RUNNING:
+                    # never arm into a run: setsetting/recmode then wedge the S5 (11:55)
+                    raise RunInProgress("the camera is already running an interval run "
+                                        "(interval_status %s)" % cam.state.get("interval_status"))
                 cam.interval_owner = "timelapse"
                 if cam.state.get("cammode") != "rec":
                     await cam.ensure_rec()
@@ -962,21 +991,74 @@ class TimelapseEngine:
         self._changed()
         await self._run_server(j)
 
+    def _adopt(self, j: TimelapseJob, why: Optional[str]) -> None:
+        """Re-attach ``j`` to the run the camera is doing right now (reads only)."""
+        cam, nat = self.cam, j.native
+        st = cam.state.get("interval_status")
+        try:
+            remain = int(cam.state.get("interval_remain_num") or -1)
+        except ValueError:
+            remain = -1
+        if not nat.get("armed_count") or remain > nat["armed_count"]:
+            # no record of the armed count (job lost / run started on the body)
+            nat.update(armed_count=max(remain, 0) + j.shots, base=0)
+        nat.update(armed=True, seen_run=True, remain=remain)
+        nat.setdefault("armed_at", time.time())
+        if 0 <= remain <= nat["armed_count"]:
+            j.shots = nat["base"] + nat["armed_count"] - remain
+        cam.interval_owner = "timelapse"
+        j.waiting = "interval run paused on the camera" if st == "pause" else None
+        if why:
+            j.message = "%s: the camera kept shooting on its own (%s shots left)" % (
+                why, remain if remain >= 0 else "?")
+            cam.log_event("timelapse", "timelapse %s: adopted the camera's interval run (%s, %s left, "
+                                       "%d shot(s) so far); nothing sent" % (j.name, st, remain, j.shots))
+        self._changed()
+
+    async def _run_lost(self, j: TimelapseJob, why: str) -> bool:
+        """The camera has no interval run for an armed job. Never re-arm on our
+        own (setsetting + shutter into a camera we did not see finish). Returns
+        True when the job is over (marked done), False when it was paused."""
+        nat = j.native
+        nat["armed"] = False
+        warn = self.cam.state.get("warn_disp") or ""
+        expected_end = (nat.get("armed_at") or 0) + max(0, (nat.get("armed_count") or 0) - 1) * j.interval_s
+        if "interval_finish" in warn or nat.get("remain") == 0 or time.time() >= expected_end:
+            j.shots = max(j.shots, (nat.get("base") or 0) + (nat.get("armed_count") or 0))
+            j.message = "the camera finished the interval run (%s)" % why
+            return True
+        left = (j.count or 0) - j.shots
+        j.state, j.paused_by, j.paused_at, j.waiting = "paused", "camera", time.time(), None
+        j.next_shot_at = None
+        j.message = ("The camera is no longer running the interval run (%s; switched off or "
+                     "cancelled on the body?). Resume re-arms the remaining %d shot(s)." % (why, left))
+        self.cam.interval_owner = None
+        self.cam.log_event("warn", "timelapse %s: %s" % (j.name, j.message))
+        self._changed()
+        return False
+
     async def _run_native(self, j: TimelapseJob) -> None:
         cam = self.cam
         await self._wait_start(j)
         await self._wait_ready(j)
         nat = j.native
-        if nat.get("armed"):
-            # resume: a paused run continues; a run the camera lost is re-armed
-            with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
-                await cam._refresh_state()          # the 1 Hz poll may still say "run"
-            st = cam.state.get("interval_status")
-            if st == "pause":
-                cam.interval_owner = "timelapse"
+        resume = bool(nat.pop("resume_requested", False))
+        with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+            await cam._refresh_state()              # the 1 Hz poll may be stale
+        st = cam.state.get("interval_status")
+        if st in INTERVAL_RUNNING and (nat.get("armed") or not resume):
+            # the camera is shooting (or holds a paused run): adopt, send nothing;
+            # only an explicit resume restarts a run paused on the camera
+            self._adopt(j, None if resume else "server restarted")
+            if st == "pause" and resume:
                 await self._native_ctrl(j, "restart")
-            elif st not in INTERVAL_SHOOTING:
-                nat["armed"] = False
+                j.waiting = None
+        elif nat.get("armed"):
+            if not resume:
+                if await self._run_lost(j, "after a server restart"):
+                    await self._native_done(j)
+                return
+            nat["armed"] = False                    # explicit resume: re-arm below
         if not nat.get("armed"):
             left = (j.count or 0) - j.shots
             if left <= 0:
@@ -986,32 +1068,38 @@ class TimelapseEngine:
                 await self._native_arm(j, left)
             except asyncio.CancelledError:
                 raise
+            except RunInProgress:
+                self._adopt(j, "already running")
             except Exception as e:      # TimelapseError, CamError, OSError, timeouts
                 log.warning("native arm failed, falling back to the server engine: %s", e)
-                if cam.state.get("interval_status") in INTERVAL_SHOOTING:
-                    # never leave a half-started camera run behind the server's shots
-                    await self._native_ctrl(j, "stop")
-                await self._fallback_to_server(j, str(e) or type(e).__name__)
-                return
+                if cam.state.get("interval_status") in INTERVAL_RUNNING:
+                    # the camera started a run after all: never put server shots on top
+                    self._adopt(j, "arm reported %s" % e)
+                elif cam.wedged or "err_critical" in str(e) or "err_busy" in str(e):
+                    # a camera refusing settings is not one the server can shoot with
+                    cam.interval_owner = None
+                    j.errors.append("in-camera: %s" % e)
+                    j.state, j.paused_by, j.paused_at = "paused", "camera", time.time()
+                    j.message = "The camera refused the interval settings (%s); paused" % e
+                    cam.log_event("warn", "timelapse %s: %s" % (j.name, j.message))
+                    self._changed()
+                    return
+                else:
+                    await self._fallback_to_server(j, str(e) or type(e).__name__)
+                    return
         cam.interval_owner = "timelapse"
         last_remain = nat.get("remain")
         while True:
             await asyncio.sleep(1.0)
             if await self._wait_ready(j):
-                st = cam.state.get("interval_status")
-                if st not in INTERVAL_RUNNING:
-                    left = (j.count or 0) - j.shots
-                    cam.log_event("timelapse", "native: the camera lost the interval run "
-                                               "(power cycle?); re-arming %d shot(s)" % left)
-                    if left <= 0:
-                        break
-                    nat["armed"] = False
-                    try:
-                        await self._native_arm(j, left)
-                    except (CamError, OSError, asyncio.TimeoutError) as e:
-                        j.errors.append("re-arm: %s" % e)
-                        continue     # camera dropped again: try on the next connect
-                    last_remain = nat.get("remain")
+                with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                    await cam._refresh_state()
+                if cam.state.get("interval_status") not in INTERVAL_RUNNING:
+                    if not await self._run_lost(j, "after a reconnect"):
+                        return
+                    break
+                self._adopt(j, "camera back")
+                last_remain = nat.get("remain")
                 continue
             st = cam.state.get("interval_status")
             try:
@@ -1041,15 +1129,54 @@ class TimelapseEngine:
                 elif "interval_cancel" in warn:
                     j.message = "the interval run was cancelled on the camera"
                 break
+        await self._native_done(j)
+
+    async def _native_done(self, j: TimelapseJob) -> None:
         j.next_shot_at = None
-        nat["armed"] = False
+        j.native["armed"] = False
         await self._native_restore(j)
         j.state = "importing" if j.auto_import else "assembling" if j.video else j.state
         await self._finish(j, "done")
 
+    def adopt_camera_run(self) -> bool:
+        """Camera ready with an interval run going and no active job here (run
+        started on the body, or the job file is gone): create a native job that
+        follows it from getstate so the UI shows the progress and offers
+        Pause/Stop. Nothing is sent to the camera."""
+        cam = self.cam
+        if self.is_active() or cam.status != "ready" or not getattr(cam, "interval_running", False):
+            return False
+        interval = 1.0
+        s = cam.menu.by_cmd_type("interval_shoot_interval") if getattr(cam, "menu", None) else None
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            interval = max(MIN_INTERVAL_S, float(s.current))
+        try:
+            remain = int(cam.state.get("interval_remain_num") or 0)
+        except ValueError:
+            remain = 0
+        if self.job is not None:
+            self.history.append(self.job.summary())
+        name = "camera-run-%s" % time.strftime("%Y%m%d-%H%M")
+        self.job = TimelapseJob(name=name, engine="native", interval_s=interval, count=max(1, remain),
+                                state="running", started_at=time.time(),
+                                folder=os.path.join(os.path.abspath(os.path.expanduser(DEFAULT_DEST)),
+                                                    dt.date.today().isoformat(), "timelapse-%s" % name))
+        self.job.native.update(adopted=True, armed=True, armed_count=max(1, remain), base=0,
+                               armed_at=time.time(), remain=remain, seen_run=True)
+        self._adopt(self.job, "found running on the camera")
+        self._spawn()
+        return True
+
     # ------------------------------------------------------------- finishing
     async def _finish(self, j: TimelapseJob, final: str) -> None:
         cam = self.cam
+        if j.engine == "native" and final == "stopped" and not j.native.get("armed"):
+            # stopped while the arm was still confirming the start: the camera may
+            # already be shooting; an explicit Stop stops it
+            with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                await cam._refresh_state()
+            if getattr(cam, "interval_running", False):
+                j.native["armed"] = True
         if j.engine == "native" and j.native.get("armed"):
             await self._native_ctrl(j, "stop")
             j.native["armed"] = False

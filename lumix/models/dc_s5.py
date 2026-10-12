@@ -43,6 +43,8 @@ S5 = ModelProfile(
             "recmode churn (restarting live view on every lens_Atta echo)",
             "stopstream with no stream running (err_critical, seen right before a wedge)",
             "BLE remote-shutter characteristic 7be5fd56 (turns the camera's Wi-Fi off)",
+            "camcmd playmode/recmode while an in-camera interval run is going (paused: playmode ok, "
+            "then recmode err_critical, 2026-10-12 11:55); also setsetting into it",
         ],
     ),
     capabilities={
