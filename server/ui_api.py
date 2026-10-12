@@ -13,7 +13,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from lumix import models
-from server.app import _body, _guard, _json, camera, camera_route, session
+from server.app import _body, _guard, _json, camera_route, session
 
 # Kept for older clients; the steps now come from the camera's model profile.
 CAMERA_STEPS = [
@@ -63,7 +63,15 @@ async def reconnect(request: web.Request) -> web.Response:
     ip = b.get("ip")
     if ip is not None and not isinstance(ip, str):
         raise ValueError("ip must be a string")
-    camera(request).request_reconnect(ip=(ip or "").strip() or None, forget=bool(b.get("forget")))
+    sess = session(request)
+    forget = bool(b.get("forget"))
+    sess.cam.request_reconnect(ip=(ip or "").strip() or None, forget=forget)
+    if forget and sess.entry.get("fixed_ip") and not ip:
+        # "search from scratch" must not leave a fixed address behind in cameras.json
+        # (the session would ignore it, and setting the same address again later
+        # would not reconnect); this restarts the session without it
+        from server.app import SESSIONS
+        await request.app[SESSIONS].update(sess.id, fixed_ip=None)
     return _json({"ok": True})
 
 

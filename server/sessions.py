@@ -303,6 +303,8 @@ class SessionManager:
             e = self.registry.update(cam_id, **fields)
             s.entry = e
             restart = any(k in fields and fields[k] != old.get(k) for k in RESTART_FIELDS)
+            if fields.get("fixed_ip") and s.running and s.cam.ip != fields["fixed_ip"]:
+                restart = True     # same entry value, but the session talks to another address
             settings = fields.get("settings") or {}
             if "watchdog" in settings:
                 s.ble.watchdog_enabled = bool(settings["watchdog"])

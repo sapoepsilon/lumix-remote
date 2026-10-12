@@ -197,3 +197,28 @@ class IndexAssetVersionTest(unittest.TestCase):
         finally:
             loop.close()
             asyncio.set_event_loop(None)
+
+
+class ForgetAndAddressTest(EmuTestCase):
+    def test_forget_then_set_address_reconnects(self):
+        r = self.rig
+
+        async def go():
+            st, d = await r.call("POST", "/api/connection/reconnect", {"forget": True})
+            self.assertEqual(st, 200)
+            self.assertIsNone(r.mgr.registry.get("emu").get("fixed_ip"))
+            await r.wait(lambda: r.sess.cam.status in ("discovering", "reconnecting"), 10, "searching")
+            st, d = await r.call("PATCH", "/api/cameras/emu", {"ip": "127.0.0.1"})
+            self.assertEqual(st, 200)
+            await r.wait(lambda: r.sess.cam.status == "ready", 20, "ready again")
+        self.run_(go(), 60)
+
+    def test_same_fixed_ip_brings_a_wandering_session_back(self):
+        r = self.rig
+
+        async def go():
+            await r.call("POST", "/api/connection/reconnect", {"ip": "127.0.0.9"})
+            await r.wait(lambda: r.sess.cam.ip == "127.0.0.9", 10, "on the wrong address")
+            st, d = await r.call("PATCH", "/api/cameras/emu", {"ip": "127.0.0.1"})   # unchanged entry
+            await r.wait(lambda: r.sess.cam.status == "ready" and r.sess.cam.ip == "127.0.0.1", 30, "back")
+        self.run_(go(), 60)
