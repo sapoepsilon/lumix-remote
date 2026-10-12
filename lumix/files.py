@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import time
 import uuid
 from collections import OrderedDict
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import aiohttp
 from yarl import URL
@@ -103,13 +104,23 @@ class _Entry:
         return "photo"
 
 
+ACTIVE_JOB_STATES = ("queued", "running")
+
+
 class ImportJob:
-    def __init__(self, ids: List[str], dest: str, include_raw: bool):
+    def __init__(self, ids: List[str], dest: str, include_raw: bool, folder: Optional[str] = None,
+                 label: Optional[str] = None):
         self.id = uuid.uuid4().hex[:12]
         self.ids = ids
         self.dest = dest
         self.include_raw = include_raw
-        self.state = "queued"          # queued | running | done | done_with_errors | failed | cancelled
+        self.folder = folder           # save every file here (flat) instead of <dest>/<date>/
+        self.label = label             # e.g. "timelapse sunset" (UI / power-off sheet)
+        # queued | running | paused | done | done_with_errors | failed | cancelled
+        self.state = "queued"
+        self.paused_by: Optional[str] = None   # "user" | "shooting" | "poweroff" | "server-stop" ...
+        self.paused_at: Optional[float] = None
+        self._pause_req: Optional[str] = None
         self.created = time.time()
         self.started: Optional[float] = None
         self.finished: Optional[float] = None
@@ -127,6 +138,8 @@ class ImportJob:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": self.id, "type": "import", "state": self.state, "dest": self.dest,
+            "folder": self.folder, "label": self.label,
+            "paused_by": self.paused_by, "paused_at": self.paused_at,
             "include_raw": self.include_raw, "items": len(self.ids),
             "files_total": self.files_total, "files_done": self.files_done,
             "files_skipped": self.files_skipped, "files_failed": self.files_failed,
@@ -137,10 +150,35 @@ class ImportJob:
             "created": self.created, "started": self.started, "finished": self.finished,
         }
 
+    def checkpoint(self) -> Dict[str, Any]:
+        """Everything needed to resume the job after a server restart."""
+        d = self.to_dict()
+        d.update(ids=self.ids, saved=self.saved, errors=self.errors[-50:])
+        return d
+
+    @classmethod
+    def from_checkpoint(cls, d: Dict[str, Any]) -> "ImportJob":
+        j = cls([str(i) for i in d.get("ids") or []], d["dest"], bool(d.get("include_raw", True)),
+                d.get("folder"), d.get("label"))
+        j.id = d.get("id") or j.id
+        for k in ("state", "paused_by", "paused_at", "created", "started", "finished",
+                  "files_total", "files_done", "files_skipped", "files_failed"):
+            if k in d:
+                setattr(j, k, d[k])
+        j.saved = list(d.get("saved") or [])
+        j.errors = list(d.get("errors") or [])
+        if j.state in ACTIVE_JOB_STATES:
+            # the server stopped (or crashed) in the middle of it: resumable
+            j.state, j.paused_by = "paused", j.paused_by or "server-stop"
+            j.paused_at = j.paused_at or time.time()
+        return j
+
 
 class FileBrowser:
-    def __init__(self, camera: Any, idle_timeout_s: float = 120.0, page: int = PAGE):
+    def __init__(self, camera: Any, idle_timeout_s: float = 120.0, page: int = PAGE,
+                 jobs_path: Optional[str] = None):
         self.cam = camera
+        self.jobs_path = jobs_path     # paused/running import jobs survive a server restart
         self.idle_timeout_s = idle_timeout_s
         self.page = page
         self.active = False            # we put the camera in play mode
@@ -159,6 +197,12 @@ class FileBrowser:
         self.previews = _LRU(64 << 20)
         self.jobs: "OrderedDict[str, ImportJob]" = OrderedDict()
         self.last_error: Optional[str] = None
+        # Quiesce hooks (server.quiesce): entering play for the user pauses the
+        # timelapse and stops a recording; leaving it resumes the timelapse.
+        self.on_enter: Optional[Callable[[], Awaitable[Any]]] = None
+        self.on_leave: Optional[Callable[[], Awaitable[Any]]] = None
+        self._quiet = 0                # >0: internal play-mode use (timelapse import), no hooks
+        self._load_jobs()
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -170,6 +214,8 @@ class FileBrowser:
             self._idle_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._idle_task
+        # running imports are checkpointed (resumable), not lost
+        await self.pause_jobs("server-stop", timeout=3.0)
         for j in self.jobs.values():
             if j.task and not j.task.done():
                 j.task.cancel()
@@ -216,6 +262,15 @@ class FileBrowser:
                 headers={"User-Agent": "LUMIX Sync"})
         return self._session
 
+    @contextlib.asynccontextmanager
+    async def quiet(self) -> AsyncIterator[None]:
+        """Internal play-mode use (timelapse frame import): no quiesce hooks."""
+        self._quiet += 1
+        try:
+            yield
+        finally:
+            self._quiet -= 1
+
     # ---------------------------------------------------------------- mode
     async def ensure_play(self) -> None:
         """Camera in play mode with live view paused; raises ModeError."""
@@ -223,6 +278,11 @@ class FileBrowser:
         if self.active and self.cam.state.get("cammode") == "play":
             return
         cam = self.cam
+        if getattr(cam, "interval_active", False):
+            raise ModeError("an in-camera interval run is in progress; stop the timelapse first")
+        if not self.active and not self._quiet and self.on_enter is not None:
+            # files <- shooting: pause the timelapse, stop a recording (server.quiesce)
+            await self.on_enter()
         # camera reconnecting (e.g. a power cycle): wait a little, then fail fast
         for _ in range(40):
             if getattr(cam, "status", "ready") == "ready":
@@ -258,6 +318,10 @@ class FileBrowser:
             log.info("get_content_info -> %s %s", ci.result, ci.text[-160:].replace("\n", " "))
             await asyncio.sleep(0.5)  # CDS answers 701 for a moment after the switch
         self._publish()
+        if not self._quiet:
+            # imports checkpointed when the user went back to shooting continue now
+            for jid in self.resume_jobs("shooting"):
+                cam.log_event("files", "import %s resumed (file browsing again)" % jid)
 
     async def _switch(self, t: Any, cmd: str, want: str) -> Tuple[bool, str]:
         """camcmd playmode/recmode with LUMIX Sync's retry rule (5 x 1 s on
@@ -273,12 +337,17 @@ class FileBrowser:
                 return True, last
         return False, last
 
-    async def leave(self, force: bool = False) -> Dict[str, Any]:
-        """Back to rec mode and resume live view (unless a transfer is running)."""
+    async def leave(self, force: bool = False, pause_jobs: bool = False) -> Dict[str, Any]:
+        """Back to rec mode and resume live view (unless a transfer is running).
+        ``pause_jobs``: checkpoint running imports first (resumable later)."""
+        paused: List[str] = []
+        if pause_jobs:
+            paused = await self.pause_jobs("shooting")
         if self.pins and not force:
             return {"left": False, "reason": "%d transfer(s) running" % self.pins, **self.status()}
         cam = self.cam
         result = "not active"
+        was_active = self.active
         if self.active:
             async with cam.exclusive("files"):
                 # leaving playback = LUMIX Sync's live-view start (stopstream, recmode, startstream)
@@ -289,7 +358,10 @@ class FileBrowser:
                 cam.log_event("files", "left file browsing: recmode -> %s, cammode=%s"
                               % (result, cam.state.get("cammode")))
         self._publish()
-        return {"left": True, "recmode": result, **self.status()}
+        if was_active and not self._quiet and self.on_leave is not None:
+            with contextlib.suppress(Exception):
+                await self.on_leave()
+        return {"left": True, "recmode": result, "paused_jobs": paused, **self.status()}
 
     @contextlib.asynccontextmanager
     async def pinned(self) -> AsyncIterator[None]:
@@ -519,31 +591,130 @@ class FileBrowser:
                 yield r, name, res
 
     # ------------------------------------------------------------- import
-    def start_import(self, ids: List[str], dest: Optional[str] = None,
-                     include_raw: bool = True) -> ImportJob:
+    def new_job(self, ids: List[str], dest: Optional[str] = None, include_raw: bool = True,
+                folder: Optional[str] = None, label: Optional[str] = None) -> ImportJob:
         if not ids:
             raise ValueError("ids is empty")
         root = os.path.abspath(os.path.expanduser(dest or DEFAULT_DEST))
-        job = ImportJob([str(i) for i in ids], root, bool(include_raw))
+        return ImportJob([str(i) for i in ids], root, bool(include_raw),
+                         os.path.abspath(os.path.expanduser(folder)) if folder else None, label)
+
+    def start_import(self, ids: List[str], dest: Optional[str] = None,
+                     include_raw: bool = True) -> ImportJob:
+        job = self.new_job(ids, dest, include_raw)
+        self._add_job(job)
+        job.task = asyncio.ensure_future(self._run_import(job))
+        return job
+
+    def _add_job(self, job: ImportJob) -> None:
         self.jobs[job.id] = job
         while len(self.jobs) > 50:
             k, old = next(iter(self.jobs.items()))
-            if old.state in ("queued", "running"):
+            if old.state in ACTIVE_JOB_STATES + ("paused",):
                 break
             self.jobs.pop(k)
-        job.task = asyncio.ensure_future(self._run_import(job))
-        return job
+        self._save_jobs()
 
     def cancel_job(self, job_id: str) -> ImportJob:
         job = self.jobs[job_id]
         if job.task and not job.task.done():
             job.task.cancel()
+        elif job.state == "paused":
+            job.state, job.finished = "cancelled", time.time()
+            self._save_jobs()
         return job
 
-    async def _run_import(self, job: ImportJob) -> None:
+    # ------------------------------------------------------- pause / resume
+    def running_jobs(self) -> List[ImportJob]:
+        return [j for j in self.jobs.values() if j.state in ACTIVE_JOB_STATES]
+
+    def paused_jobs(self, by: Optional[str] = None) -> List[ImportJob]:
+        return [j for j in self.jobs.values()
+                if j.state == "paused" and (by is None or j.paused_by == by)]
+
+    async def pause_job(self, job_id: str, by: str = "user", timeout: float = 5.0) -> ImportJob:
+        """Checkpoint a running import: the transfer stops, the ``.part`` file
+        stays and is resumed with Range later. Already saved files are kept."""
+        job = self.jobs[job_id]
+        if job.state not in ACTIVE_JOB_STATES:
+            return job
+        job._pause_req = by
+        t = job.task
+        if t is not None and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                await asyncio.wait_for(asyncio.shield(t), timeout)
+        if job.state in ACTIVE_JOB_STATES:      # never started
+            job.state, job.paused_by, job.paused_at = "paused", by, time.time()
+            self._save_jobs()
+        return job
+
+    async def pause_jobs(self, by: str, timeout: float = 5.0) -> List[str]:
+        ids = [j.id for j in self.running_jobs()]
+        for i in ids:
+            await self.pause_job(i, by, timeout)
+        return ids
+
+    def resume_job(self, job_id: str) -> ImportJob:
+        job = self.jobs[job_id]
+        if job.state != "paused":
+            raise ValueError("job %s is %s, not paused" % (job_id, job.state))
+        job.state, job.paused_by, job.paused_at, job.finished = "queued", None, None, None
+        job.task = asyncio.ensure_future(self._run_import(job))
+        self._save_jobs()
+        return job
+
+    def resume_jobs(self, by: Optional[str] = None) -> List[str]:
+        out = []
+        for j in self.paused_jobs(by):
+            self.resume_job(j.id)
+            out.append(j.id)
+        return out
+
+    def _load_jobs(self) -> None:
+        if not self.jobs_path or not os.path.exists(self.jobs_path):
+            return
+        try:
+            with open(self.jobs_path) as f:
+                data = json.load(f)
+            for d in data.get("jobs") or []:
+                j = ImportJob.from_checkpoint(d)
+                self.jobs[j.id] = j
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            log.warning("cannot load import jobs from %s: %s", self.jobs_path, e)
+
+    def _save_jobs(self) -> None:
+        """Persist jobs that can still be resumed (queued/running/paused)."""
+        if not self.jobs_path:
+            return
+        keep = [j.checkpoint() for j in self.jobs.values()
+                if j.state in ACTIVE_JOB_STATES + ("paused",)]
+        try:
+            os.makedirs(os.path.dirname(self.jobs_path), exist_ok=True)
+            tmp = self.jobs_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": 1, "jobs": keep}, f, indent=1, default=str)
+            os.replace(tmp, self.jobs_path)
+        except OSError as e:
+            log.warning("cannot save import jobs: %s", e)
+
+    async def run_job(self, job: ImportJob) -> ImportJob:
+        """Run an import inline (the caller's task), e.g. timelapse frames."""
+        await self._run_import(job, publish=False)
+        return job
+
+    async def _run_import(self, job: ImportJob, publish: bool = True) -> None:
+        resumed = bool(job.saved) or job.started is not None
         job.state = "running"
-        job.started = time.time()
-        self.cam.log_event("files", "import %s: %d item(s) -> %s" % (job.id, len(job.ids), job.dest))
+        job.started = job.started or time.time()
+        job.current = None
+        done_paths = set(job.saved)
+        if resumed:          # recounted below; saved files stay counted in files_done
+            job.files_skipped = job.files_failed = 0
+        if publish:
+            self._save_jobs()
+        self.cam.log_event("files", "import %s: %d item(s) -> %s%s" % (
+            job.id, len(job.ids), job.folder or job.dest, " (resumed)" if resumed else ""))
         try:
             async with self.pinned():
                 await self.ensure_play()
@@ -561,9 +732,13 @@ class FileBrowser:
                         plan.append((it, it.raw, it.raw_name or it.raw.name))
                 job.files_total = len(plan)
                 job.bytes_total = sum(r.size or 0 for _, r, _ in plan)
+                job.bytes_done = 0
                 for it, res, name in plan:
-                    folder = os.path.join(job.dest, it.date_folder())
+                    folder = job.folder or os.path.join(job.dest, it.date_folder())
                     path = os.path.join(folder, name)
+                    if path in done_paths:          # saved before a pause
+                        job.bytes_done += res.size or 0
+                        continue
                     job.current = name
                     try:
                         if await self._download_to(job, res, path):
@@ -579,17 +754,26 @@ class FileBrowser:
                         job.errors.append({"id": it.id, "name": name, "error": "%s: %s" % (type(e).__name__, e)})
                 job.state = "done" if job.files_failed == 0 else "done_with_errors"
         except asyncio.CancelledError:
-            job.state = "cancelled"
+            if job._pause_req:
+                job.state, job.paused_by, job.paused_at = "paused", job._pause_req, time.time()
+            else:
+                job.state = "cancelled"
+            if not publish:
+                raise
         except Exception as e:
             job.state = "failed"
             job.errors.append({"error": "%s: %s" % (type(e).__name__, e)})
         finally:
+            job._pause_req = None
             job.current = None
-            job.finished = time.time()
+            job.finished = time.time() if job.state != "paused" else None
             self.touch()
-            self.cam.log_event("files", "import %s %s: %d saved, %d skipped, %d failed" % (
-                job.id, job.state, job.files_done, job.files_skipped, job.files_failed))
-            self.cam.bus.publish("job", job.to_dict())
+            self.cam.log_event("files", "import %s %s%s: %d saved, %d skipped, %d failed" % (
+                job.id, job.state, " (%s)" % job.paused_by if job.state == "paused" else "",
+                job.files_done, job.files_skipped, job.files_failed))
+            if publish:
+                self._save_jobs()
+                self.cam.bus.publish("job", job.to_dict())
 
     async def _download_to(self, job: ImportJob, res: Res, path: str) -> bool:
         """Download res to path. False = skipped (same name and size already there)."""

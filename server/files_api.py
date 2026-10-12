@@ -7,7 +7,7 @@ Routes (see README "Files API"):
   GET  /api/files/{id}/thumb | /preview
   GET  /api/files/{id}/download?variant=original|raw
   POST /api/files/import {ids, dest?, include_raw?}
-  GET  /api/jobs, GET /api/jobs/{id}, POST /api/jobs/{id}/cancel
+  GET  /api/jobs, GET /api/jobs/{id}, POST /api/jobs/{id}/cancel|pause|resume
 """
 
 from __future__ import annotations
@@ -74,7 +74,10 @@ async def files_status(request: web.Request) -> web.Response:
 
 @_guard
 async def done(request: web.Request) -> web.Response:
-    return _json(await _fb(request).leave())
+    """Back to shooting. Running imports are checkpointed (``paused``, by
+    "shooting") and continue in the next file browsing session or via
+    POST /api/jobs/{id}/resume."""
+    return _json(await _fb(request).leave(pause_jobs=True))
 
 
 def _image(which: str):
@@ -156,6 +159,25 @@ async def cancel_job(request: web.Request) -> web.Response:
     return _json(job.to_dict())
 
 
+@_guard
+async def pause_job(request: web.Request) -> web.Response:
+    try:
+        job = await _fb(request).pause_job(request.match_info["id"], "user")
+    except KeyError:
+        return _json({"error": "no such job"}, 404)
+    return _json(job.to_dict())
+
+
+@_guard
+async def resume_job(request: web.Request) -> web.Response:
+    try:
+        job = _fb(request).resume_job(request.match_info["id"])
+    except KeyError:
+        return _json({"error": "no such job"}, 404)
+    await asyncio.sleep(0.05)
+    return _json(job.to_dict(), 202)
+
+
 def setup(app: web.Application) -> None:
     """Routes; each camera session owns its FileBrowser (started with the session)."""
     from server.app import camera_route  # late import: server.app imports this module
@@ -170,5 +192,7 @@ def setup(app: web.Application) -> None:
         ("GET", "/api/jobs", list_jobs),
         ("GET", "/api/jobs/{id}", get_job),
         ("POST", "/api/jobs/{id}/cancel", cancel_job),
+        ("POST", "/api/jobs/{id}/pause", pause_job),
+        ("POST", "/api/jobs/{id}/resume", resume_job),
     ):
         camera_route(app, method, path, handler)
