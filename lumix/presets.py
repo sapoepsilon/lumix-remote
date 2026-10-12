@@ -35,7 +35,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from .camera import CONFIG_DIR, Camera
+from .camera import CONFIG_DIR, Busy, Camera
 
 Step = Tuple[str, str, Optional[str]]
 
@@ -157,10 +157,15 @@ class AutoPreset:
 
     async def _apply(self, target: str) -> Dict[str, Any]:
         cam = self.cam
-        if not self.state.get("on") or not self.state.get("saved"):
+        fresh = not self.state.get("on") or not self.state.get("saved")
+        if fresh:
             # Only snapshot manual values when coming from manual: re-applying
             # (or photo -> video) must not overwrite them with auto values.
-            self.state = {"saved": await self.snapshot()}
+            saved = await self.snapshot()
+            if not any(k != "recmode" for k in saved):
+                # nothing readable: applying now would lose the manual values
+                raise Busy("couldn't read the current settings from the camera; Auto not applied")
+            prev, self.state = self.state, {"saved": saved}
         before = await self.snapshot()
         plan = _plan(cam, target)
         results: List[Dict[str, Any]] = []
@@ -175,6 +180,12 @@ class AutoPreset:
             for ct, v, v2 in plan["steps"]:
                 res = await self._set(t, ct, v, v2)
                 results.append({"type": ct, "value": v, "value2": v2, "result": res})
+        if not any(r["result"] == "ok" for r in results):
+            # the camera took none of it (e.g. a dropped session): stay off
+            if fresh:
+                self.state = prev
+            last = results[-1]["result"] if results else "nothing sent"
+            raise Busy("the camera refused every Auto setting (%s); Auto not applied" % last)
         await cam.refresh_menu()
         after = await self.snapshot()
         self.state.update({"on": True, "target": target, "since": time.time(),
@@ -209,6 +220,11 @@ class AutoPreset:
                     res2 = await self._set(t, ct, v, None)
                     res = res2 if res2 == "ok" else res
                 results.append({"type": ct, "value": v, "value2": v2, "result": res})
+        tried = [r for r in results if r["result"] != "unchanged"]
+        if tried and not any(r["result"] == "ok" for r in tried):
+            # nothing went back: keep Auto on and the saved values for another try
+            raise Busy("the camera refused to restore your settings (%s); Auto stays on, "
+                       "try again" % tried[-1]["result"])
         await cam.refresh_menu()
         await cam.refresh_exposure()
         after = await self.snapshot()
