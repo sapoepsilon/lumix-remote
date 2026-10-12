@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import urllib.error
 import urllib.parse
@@ -125,6 +126,49 @@ class Client:
                 msg = raw.decode(errors="replace")[:200]
             raise HttpError(status, "server %d: %s" % (status, msg))
         return raw
+
+    def download(self, path: str, folder: str, fallback: str = "download",
+                 skip_same_size: bool = True, progress: Any = None) -> Dict[str, Any]:
+        """Stream a file response into ``folder`` (name from Content-Disposition).
+        Writes ``<name>.part`` and renames it when complete."""
+        req = urllib.request.Request(self.base + self.path(path), method="GET")
+        try:
+            r = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                msg = json.loads(raw.decode()).get("error")
+            except Exception:
+                msg = raw.decode(errors="replace")[:200]
+            raise HttpError(e.code, "server %d: %s" % (e.code, msg))
+        except (urllib.error.URLError, ConnectionError, socket.timeout, OSError) as e:
+            raise ServerUnreachable("cannot reach Lumix Remote server at %s (%s)"
+                                    % (self.base, getattr(e, "reason", e)))
+        with r:
+            disp = r.headers.get("Content-Disposition", "")
+            m = re.search(r"filename\*=UTF-8''([^;]+)", disp) or re.search(r'filename="([^"]+)"', disp)
+            name = os.path.basename(urllib.parse.unquote(m.group(1))) if m else fallback
+            size = int(r.headers.get("Content-Length") or 0)
+            dest = os.path.join(folder, name)
+            if skip_same_size and size and os.path.exists(dest) and os.path.getsize(dest) == size:
+                return {"path": dest, "bytes": size, "skipped": True}
+            part, got = dest + ".part", 0
+            with open(part, "wb") as f:
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if progress is not None:
+                        progress.write("\r%s %d%%" % (name, 100 * got // size if size else 0))
+                        progress.flush()
+            if progress is not None:
+                progress.write("\r" + " " * (len(name) + 6) + "\r")
+            if size and got != size:
+                raise CliError("%s: got %d of %d bytes (camera stalled?); %s kept" % (name, got, size, part))
+            os.replace(part, dest)
+            return {"path": dest, "bytes": got, "skipped": False}
 
     def patch(self, path: str, body: Any = None, **kw: Any) -> Any:
         return self.call("PATCH", path, body if body is not None else {}, **kw)

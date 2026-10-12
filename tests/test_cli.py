@@ -57,6 +57,15 @@ STATUS = {"status": "ready", "message": "S5 connected", "ip": "10.0.0.5",
                  "sd2_full": "false", "access": "off"},
           "lens": "LUMIX S 20-60", "liveview": {"fps": 24.0, "age": 0.03}, "op_owner": None, "powered_off": False}
 JPEG = b"\xff\xd8\xff\xe0fakejpeg\xff\xd9"
+FILES = [{"id": "11000009", "name": "P1000009.JPG", "kind": "photo", "date": "2026-10-12T01:00:00",
+          "size": 800, "has_raw": True, "raw_url": "/api/files/11000009/download?variant=raw"},
+         {"id": "11000008", "name": "P1000008.MP4", "kind": "video", "date": None, "size": 800,
+          "has_raw": False},
+         {"id": "11000007", "name": "P1000007.JPG", "kind": "photo", "date": "2026-10-12T00:59:00",
+          "size": 800, "has_raw": False}]
+JOB = {"id": "job1", "type": "import", "state": "done", "dest": "/x/Pictures/Lumix", "folder": None,
+       "paused_by": None, "files_total": 2, "files_done": 1, "files_skipped": 1, "files_failed": 0,
+       "bytes_total": 1600, "bytes_done": 1600, "errors": [], "items": 2}
 
 
 class FakeServer:
@@ -151,6 +160,29 @@ class FakeServer:
             return web.json_response([{"ts": 1.0, "kind": "cmd", "text": "a"}, {"ts": 2.0, "kind": "warn", "text": "b"}])
         if p == "/api/liveview.jpg":
             return web.Response(body=JPEG, content_type="image/jpeg")
+        if p == "/api/files":
+            kind = request.query.get("kind", "all")
+            items = [f for f in FILES if kind == "all" or f["kind"] == kind]
+            off, lim = int(request.query.get("offset", 0)), int(request.query.get("limit", 60))
+            return web.json_response({"total": len(items), "items": items[off:off + lim]})
+        if p == "/api/files/status":
+            return web.json_response({"active": True, "cammode": "play", "idle_left_s": 99.0,
+                                      "default_dest": "/x/Pictures/Lumix"})
+        if p == "/api/files/done":
+            return web.json_response({"left": True, "paused_jobs": []})
+        if p.startswith("/api/files/") and p.endswith("/download"):
+            fid = p.split("/")[3]
+            f = next(x for x in FILES if x["id"] == fid)
+            name = f["name"] if request.query.get("variant") != "raw" else f["name"][:-4] + ".RW2"
+            body = (fid * 100).encode()
+            return web.Response(body=body, headers={
+                "Content-Disposition": "attachment; filename=\"%s\"" % name})
+        if p == "/api/files/import":
+            return web.json_response(dict(JOB, state="queued"), status=202)
+        if p.startswith("/api/jobs/") and request.method == "GET":
+            return web.json_response(JOB)
+        if p == "/api/jobs":
+            return web.json_response([JOB])
         return web.json_response({"error": "nope"}, status=404)
 
 
@@ -327,10 +359,55 @@ class CliTest(unittest.TestCase):
         code, out, _ = self.cli("events", "-f", "--json", "--all", "--count", "2")
         self.assertEqual(json.loads(out.splitlines()[0])["type"], "status")
 
-    def test_coming_soon(self):
-        code, _, err = self.cli("files")
+    def test_files_list(self):
+        code, out, _ = self.cli("files", "list")
+        self.assertEqual(code, 0)
+        self.assertIn("P1000009.JPG   photo 2026-10-12 01:00:00", out)
+        self.assertIn("+RAW", out)
+        self.assertIn("3 of 3", out)
+        code, out, _ = self.cli("files", "list", "--kind", "video", "--names")
+        self.assertEqual(out.split(), ["P1000008.MP4"])
+        code, out, _ = self.cli("files", "list", "--limit", "1")
+        self.assertIn("(more: --offset 1, or --all)", out)
+        code, out, _ = self.cli("files", "status")
+        self.assertIn("default import folder: /x/Pictures/Lumix", out)
+
+    def test_files_download(self):
+        with tempfile.TemporaryDirectory() as d:
+            code, out, err = self.cli("files", "download", "p1000009.jpg", "--raw", "-o", d)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(sorted(os.listdir(d)), ["P1000009.JPG", "P1000009.RW2"])
+            self.assertEqual(os.path.getsize(os.path.join(d, "P1000009.JPG")), 800)
+            code, out, _ = self.cli("files", "download", "11000009", "-o", d)
+            self.assertIn("skipped", out)                       # same size already there
+            code, out, _ = self.cli("files", "download", "--latest", "2", "-o", d, "--json")
+            self.assertEqual(len(json.loads(out)), 2)
+        code, _, err = self.cli("files", "download", "NOPE.JPG")
+        self.assertEqual(code, 2)
+        self.assertIn("not on the card: NOPE.JPG", err)
+        code, _, err = self.cli("files", "download")
+        self.assertEqual(code, 2)
+
+    def test_files_import_and_jobs(self):
+        code, out, err = self.cli("files", "import", "--latest", "2", "--dest", "/tmp/x", "--no-raw")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.posts()[-1], ("/api/files/import", {"ids": ["11000009", "11000008"],
+                                                                 "include_raw": False, "dest": "/tmp/x"}))
+        self.assertIn("job1 done             2/2 files", out)
+        self.assertIn("1 already there", out)
+        code, out, _ = self.cli("files", "import", "P1000007.JPG", "--no-wait", "--json")
+        self.assertEqual(json.loads(out)["state"], "queued")
+        code, out, _ = self.cli("files", "jobs")
+        self.assertIn("job1", out)
+        self.srv.overrides["GET /api/jobs/job2"] = (200, dict(JOB, id="job2", state="failed",
+                                                               errors=[{"error": "stalled"}]))
+        self.srv.overrides["POST /api/files/import"] = (202, dict(JOB, id="job2", state="queued"))
+        code, out, err = self.cli("files", "import", "P1000007.JPG")
         self.assertEqual(code, 1)
-        self.assertIn("coming soon", err)
+        self.assertIn("error: stalled", out)
+        code, out, _ = self.cli("files", "done")
+        self.assertIn("back to shooting", out)
+        self.assertIn(("/api/files/done", {}), self.posts())
 
     def test_timelapse_commands(self):
         job = {"id": "j1", "name": "sunset", "engine": "server", "state": "running", "paused_by": None,

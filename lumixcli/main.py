@@ -720,11 +720,6 @@ def cmd_timelapse(c: Client, a: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_coming_soon(c: Client, a: argparse.Namespace) -> int:
-    sys.stderr.write("lumix %s: coming soon (the server exposes no %s API yet)\n" % (a.feature, a.feature))
-    return 1
-
-
 COMPLETION = r'''# lumix shell completion. bash: eval "$(lumix completion bash)"
 # zsh: autoload -U +X bashcompinit && bashcompinit && eval "$(lumix completion zsh)"
 _lumix() {
@@ -747,6 +742,8 @@ _lumix() {
     timelapse) if [ $n -eq 1 ]; then COMPREPLY=($(compgen -W "start status pause resume stop" -- "$cur"));
                else COMPREPLY=($(compgen -W "--interval --count --duration --start-at --native --import --video --ae-lock --name --fps --watch" -- "$cur")); fi;;
     server) COMPREPLY=($(compgen -W "start stop status" -- "$cur"));;
+    files) if [ $n -eq 1 ]; then COMPREPLY=($(compgen -W "list download import status done jobs cancel pause resume" -- "$cur"));
+           else COMPREPLY=($(compgen -W "--latest --all --kind --output --dest --raw --no-raw --no-wait --limit --offset --names" -- "$cur")); fi;;
     cameras) if [ $n -eq 1 ]; then COMPREPLY=($(compgen -W "list add remove use rename" -- "$cur"));
              else COMPREPLY=($(compgen -W "$(lumix cameras list --json 2>/dev/null | python3 -c 'import json,sys; print(" ".join(c["id"] for c in json.load(sys.stdin)["cameras"]))' 2>/dev/null)" -- "$cur")); fi;;
     completion) COMPREPLY=($(compgen -W "bash zsh" -- "$cur"));;
@@ -898,10 +895,8 @@ def build_parser() -> argparse.ArgumentParser:
         tp = ts.add_parser(act, parents=[common], help=h)
         tp.set_defaults(fn=cmd_timelapse)
 
-    for feat, help in (("files", "browse/download card files (coming soon)"),):
-        sp = add(feat, cmd_coming_soon, help)
-        sp.add_argument("rest", nargs=argparse.REMAINDER)
-        sp.set_defaults(feature=feat)
+    from . import files as files_cli
+    files_cli.add_parser(add, common)
 
     sp = add("completion", cmd_completion, "print a bash/zsh completion script")
     sp.add_argument("shell", choices=["bash", "zsh"])
