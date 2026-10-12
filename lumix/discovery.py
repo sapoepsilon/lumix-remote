@@ -29,11 +29,14 @@ AP_MODE_IP = "192.168.54.1"
 SSDP_GROUP = ("239.255.255.250", 1900)
 
 
-async def probe_ddd(ip: str, timeout: float = 2.0) -> Optional[dict]:
+UPNP_PORT = 60606
+
+
+async def probe_ddd(ip: str, timeout: float = 2.0, port: int = UPNP_PORT) -> Optional[dict]:
     """Return the parsed device description if ip is a Lumix camera."""
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get("http://%s:60606%s" % (ip, DDD_PATH),
+            async with s.get("http://%s:%d%s" % (ip, port, DDD_PATH),
                              timeout=aiohttp.ClientTimeout(total=timeout)) as r:
                 if r.status != 200:
                     return None
@@ -83,7 +86,11 @@ async def _port_open(ip: str, port: int, timeout: float) -> bool:
 
 
 async def scan(exclude: Iterable[str] = (), timeout: float = 0.6,
-               progress: Optional[Callable[[str], None]] = None) -> Optional[dict]:
+               progress: Optional[Callable[[str], None]] = None,
+               accept: Optional[Callable[[dict], bool]] = None,
+               port: int = UPNP_PORT) -> Optional[dict]:
+    """First Lumix on the local /24s whose ddd passes ``accept`` (e.g. the UDN
+    of a registered camera, or "not claimed by another session")."""
     excl = set(exclude)
     for net in local_networks():
         if progress:
@@ -93,13 +100,13 @@ async def scan(exclude: Iterable[str] = (), timeout: float = 0.6,
 
         async def check(ip: str) -> Optional[str]:
             async with sem:
-                return ip if await _port_open(ip, 60606, timeout) else None
+                return ip if await _port_open(ip, port, timeout) else None
 
         for coro in asyncio.as_completed([check(h) for h in hosts]):
             ip = await coro
             if ip:
-                d = await probe_ddd(ip)
-                if d:
+                d = await probe_ddd(ip, port=port)
+                if d and (accept is None or accept(d)):
                     return d
     return None
 

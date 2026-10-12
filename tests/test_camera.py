@@ -1,4 +1,5 @@
 """Camera wedge handling against a scripted fake transport (no camera needed)."""
+import isolate  # noqa: F401  (temp config dir; must come first)
 import asyncio
 import unittest
 from unittest import mock
@@ -85,6 +86,44 @@ class WedgeTest(unittest.TestCase):
         self.run_fast(cam.stop_liveview("file browsing"))
         self.assertEqual(cam.transport.sent, ["mode=stopstream"])
         self.assertFalse(cam._lv_running)
+
+    def test_capture_refused_for_whole_budget_flags_wedge(self):
+        """Emulator report: capture err_busy x5 on a healthy session left wedged=false."""
+        cam = self.make(cammode="rec", answer="err_busy")
+        cam.status = "ready"
+        fired = []
+
+        async def hook(c):
+            fired.append(c)
+        cam.wedge_hooks.append(hook)
+        res = self.run_fast(cam.capture())
+        self.assertEqual(res["result"], "err_busy")
+        self.assertTrue(cam.wedged)
+        self.assertEqual(sum(q == "mode=camcmd&value=capture" for q in cam.transport.sent), 5)
+        self.run_fast(asyncio.sleep(0))
+        self.assertEqual(len(fired), 1)
+
+    def test_single_busy_answer_is_not_a_wedge(self):
+        cam = self.make(cammode="rec", answer="ok")
+        answers = iter(["err_busy", "ok"])
+        real = cam.transport.cgi
+
+        async def cgi(mode, type=None, value=None, value2=None, timeout=6.0):
+            if mode == "camcmd":
+                cam.transport.answer = next(answers, "ok")
+            return await real(mode, type, value, value2, timeout)
+        cam.transport.cgi = cgi
+        self.run_fast(cam.cmd("camcmd", value="oneshot_af"))
+        self.assertFalse(cam.wedged)
+
+    def test_busy_body_capture_is_not_a_wedge(self):
+        cam = self.make(cammode="rec", answer="err_busy")
+        self.run_fast(cam.cmd("camcmd", value="capture"))
+        self.assertTrue(cam.wedged)
+        cam2 = self.make(cammode="rec", answer="err_busy")
+        cam2.body_busy = True
+        self.run_fast(cam2.cmd("camcmd", value="capture"))
+        self.assertFalse(cam2.wedged)
 
 
 if __name__ == "__main__":

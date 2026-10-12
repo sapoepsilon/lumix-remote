@@ -304,7 +304,7 @@ class FileBrowser:
     # ------------------------------------------------------------- listing
     async def _browse(self, object_id: str, start: int, count: int) -> didl.BrowseResult:
         sess = await self._sess()
-        url = "http://%s:60606%s" % (self.cam.ip, didl.CDS_PATH)
+        url = "http://%s:%d%s" % (self.cam.ip, _port(self.cam, "upnp_port", 60606), didl.CDS_PATH)
         headers = {"SOAPACTION": didl.SOAP_ACTION, "Content-Type": 'text/xml; charset="utf-8"',
                    "User-Agent": didl.UA}
         body = didl.browse_body(object_id, start, count)
@@ -458,7 +458,8 @@ class FileBrowser:
     def _url(self, res: Res) -> URL:
         # The camera puts its own IP in <res>; trust only the path.
         u = URL(res.url)
-        return URL.build(scheme="http", host=self.cam.ip, port=u.port or 50001,
+        fp = _port(self.cam, "files_port", 50001)
+        return URL.build(scheme="http", host=self.cam.ip, port=fp if fp != 50001 else (u.port or 50001),
                          path=u.path, encoded=True)
 
     async def image(self, item_id: str, which: str) -> Tuple[bytes, str]:
@@ -639,3 +640,8 @@ class FileBrowser:
                 log.info("download %s retry %d: %s", res.name, attempt + 1, e)
                 await asyncio.sleep(1.5 * (attempt + 1))
         return False
+
+
+def _port(cam: Any, name: str, default: int) -> int:
+    """Camera-side port from the camera config (emulators override them)."""
+    return int(getattr(getattr(cam, "cfg", None), name, None) or default)

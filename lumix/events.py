@@ -1,6 +1,7 @@
 """UPnP GENA event subscription (camera -> us push events).
 
-We run a tiny HTTP server reachable by the camera (default port 49153) and send
+We run a tiny HTTP server reachable by the camera (default port 49153, shared by
+all camera sessions, one callback path each) and send
 ``SUBSCRIBE /Server0/CMS_event`` to the camera's :60606 with our callback URL.
 The camera then POSTs ``NOTIFY`` requests whose body is a UPnP propertyset;
 Panasonic-specific events arrive as ``<X_Panasonic_Cam_Sync>value</...>``
@@ -84,13 +85,84 @@ async def raw_request(ip: str, port: int, method: str, path: str,
     return {"status": int(m.group(1)) if m else 0, "headers": hdrs, "raw": text}
 
 
-class EventListener:
-    """HTTP server for NOTIFY callbacks + subscription bookkeeping."""
+class _CallbackServer:
+    """One HTTP server per callback port, shared by every camera session:
+    NOTIFYs are routed by callback path (``/Camera/event/<camera id>``), then
+    by SID, then by the sender's IP."""
 
-    def __init__(self, port: int = 49153, on_event: Optional[EventHandler] = None):
+    def __init__(self, port: int):
         self.port = port
-        self.on_event = on_event
+        self.listeners: List["EventListener"] = []
         self._runner: Optional[web.AppRunner] = None
+        self._lock = asyncio.Lock()     # sessions start concurrently: bind once
+
+    async def start(self) -> None:
+        async with self._lock:
+            await self._start()
+
+    async def _start(self) -> None:
+        if self._runner is not None:
+            return
+        app = web.Application()
+        app.router.add_route("*", "/{tail:.*}", self._handle)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", self.port, reuse_address=True)
+        try:
+            await site.start()
+        except OSError:
+            await runner.cleanup()
+            raise
+        self._runner = runner
+        if self.port == 0 and site._server is not None and site._server.sockets:  # type: ignore[attr-defined]
+            self.port = site._server.sockets[0].getsockname()[1]  # type: ignore[attr-defined]
+        log.info("event callback server on :%d", self.port)
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+
+    def route(self, req: web.Request) -> Optional["EventListener"]:
+        path = req.path.rstrip("/")
+        for lst in self.listeners:
+            if lst.path.rstrip("/") == path:
+                return lst
+        sid = req.headers.get("SID")
+        for lst in self.listeners:
+            if sid and lst.sid == sid:
+                return lst
+        for lst in self.listeners:
+            if lst.sub_ip and lst.sub_ip == req.remote:
+                return lst
+        return self.listeners[0] if len(self.listeners) == 1 else None
+
+    async def _handle(self, req: web.Request) -> web.Response:
+        lst = self.route(req)
+        if lst is None:
+            log.warning("NOTIFY %s from %s matches no camera session", req.path, req.remote)
+            await req.read()
+            return web.Response(status=412)
+        return await lst._handle(req)
+
+
+_SERVERS: Dict[int, _CallbackServer] = {}
+
+
+class EventListener:
+    """GENA subscription bookkeeping for one camera + its NOTIFY handler.
+
+    Listeners on the same port share one callback HTTP server; each camera
+    session gets its own callback ``path``. ``upnp_port`` is the camera's
+    UPnP port (60606 on real bodies)."""
+
+    def __init__(self, port: int = 49153, on_event: Optional[EventHandler] = None,
+                 path: str = "/Camera/event", upnp_port: int = 60606):
+        self.port = port
+        self.path = path
+        self.upnp_port = upnp_port
+        self.on_event = on_event
+        self._server: Optional[_CallbackServer] = None
         self.sid: Optional[str] = None
         self.sub_ip: Optional[str] = None
         self.sub_time = 0.0
@@ -99,20 +171,33 @@ class EventListener:
         self.count = 0
 
     async def start(self) -> None:
-        if self._runner is not None:
+        if self._server is not None:
             return
-        app = web.Application()
-        app.router.add_route("*", "/{tail:.*}", self._handle)
-        self._runner = web.AppRunner(app, access_log=None)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, "0.0.0.0", self.port, reuse_address=True)
-        await site.start()
-        log.info("event callback server on :%d", self.port)
+        srv = _SERVERS.get(self.port) if self.port else None
+        if srv is None:
+            srv = _CallbackServer(self.port)
+            if self.port:
+                _SERVERS[self.port] = srv      # before the await: concurrent starts share it
+        try:
+            await srv.start()
+        except OSError:
+            if _SERVERS.get(self.port) is srv and not srv.listeners:
+                del _SERVERS[self.port]
+            raise
+        srv.listeners.append(self)
+        self._server = srv
+        self.port = srv.port
 
     async def stop(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
-            self._runner = None
+        srv, self._server = self._server, None
+        if srv is None:
+            return
+        if self in srv.listeners:
+            srv.listeners.remove(self)
+        if not srv.listeners:
+            if _SERVERS.get(srv.port) is srv:
+                del _SERVERS[srv.port]
+            await srv.stop()
 
     async def _handle(self, req: web.Request) -> web.Response:
         body = await req.read()
@@ -121,7 +206,7 @@ class EventListener:
         props = parse_propertyset(body)
         ev = {"method": req.method, "sid": req.headers.get("SID"), "seq": req.headers.get("SEQ"),
               "from": req.remote, "props": props}
-        log.debug("NOTIFY %s", ev)
+        log.debug("NOTIFY %s %s", self.path, ev)
         if self.on_event is not None:
             try:
                 await self.on_event(ev)
@@ -131,9 +216,9 @@ class EventListener:
 
     async def subscribe(self, camera_ip: str) -> Dict[str, object]:
         me = local_ip_for(camera_ip)
-        r = await raw_request(camera_ip, 60606, "SUBSCRIBE", "/Server0/CMS_event", [
+        r = await raw_request(camera_ip, self.upnp_port, "SUBSCRIBE", "/Server0/CMS_event", [
             ("User-Agent", UA),
-            ("CALLBACK", "<http://%s:%d/Camera/event>" % (me, self.port)),
+            ("CALLBACK", "<http://%s:%d%s>" % (me, self.port, self.path)),
             ("NT", "upnp:event"),
             ("TIMEOUT", "Second-%d" % self.timeout_s),
         ])
@@ -145,7 +230,7 @@ class EventListener:
             m = re.search(r"Second-(\d+)", hdrs.get("TIMEOUT", ""))  # type: ignore[union-attr]
             if m:
                 self.timeout_s = int(m.group(1))
-        return {"status": r["status"], "sid": self.sid, "callback_ip": me}
+        return {"status": r["status"], "sid": self.sid, "callback_ip": me, "path": self.path}
 
     async def renew(self, fallback: bool = True) -> Dict[str, object]:
         """Renew with the SID; optionally fall back to a fresh subscription.
@@ -153,7 +238,7 @@ class EventListener:
         Callers on the S5 should pass fallback=False and re-subscribe from play
         mode themselves (a fresh SUBSCRIBE in rec mode wedges camcmd)."""
         if self.sid and self.sub_ip:
-            r = await raw_request(self.sub_ip, 60606, "SUBSCRIBE", "/Server0/CMS_event", [
+            r = await raw_request(self.sub_ip, self.upnp_port, "SUBSCRIBE", "/Server0/CMS_event", [
                 ("User-Agent", UA), ("SID", self.sid), ("TIMEOUT", "Second-%d" % self.timeout_s)])
             if r["status"] == 200:
                 self.sub_time = time.time()
@@ -172,7 +257,7 @@ class EventListener:
     async def unsubscribe(self) -> None:
         if self.sid and self.sub_ip:
             try:
-                await raw_request(self.sub_ip, 60606, "UNSUBSCRIBE", "/Server0/CMS_event",
+                await raw_request(self.sub_ip, self.upnp_port, "UNSUBSCRIBE", "/Server0/CMS_event",
                                   [("User-Agent", UA), ("SID", self.sid)], timeout=3)
             except (OSError, asyncio.TimeoutError):
                 pass

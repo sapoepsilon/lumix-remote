@@ -21,6 +21,10 @@ with ``getsetting`` (value plus ``value2`` from the element text) and stored in
 settings), so manual values survive server restarts too. Picture quality,
 size and video quality are left alone: they are the user's storage choices,
 not exposure decisions.
+
+The plan (values, fallbacks, restore order) comes from the camera's model
+profile (``lumix/models``); ``AUTO``/``SAVED_TYPES`` below are the defaults for
+a camera object without one.
 """
 
 from __future__ import annotations
@@ -56,6 +60,18 @@ AUTO: Dict[str, Dict[str, Any]] = {
 # afmode before focusmode: AF mode is locked while focus is MF.
 SAVED_TYPES = ["recmode", "drivemode", "afmode", "focusmode", "iso", "whitebalance",
                "exposure", "lightmetering", "focal", "shtrspeed"]
+
+
+def _plan(cam: Any, target: str) -> Dict[str, Any]:
+    prof = getattr(cam, "profile", None)
+    if prof is not None and target in (prof.auto_preset or {}):
+        return prof.auto_preset[target]
+    return AUTO[target]
+
+
+def _saved_types(cam: Any) -> List[str]:
+    prof = getattr(cam, "profile", None)
+    return list(prof.auto_saved_types) if prof is not None and prof.auto_saved_types else SAVED_TYPES
 
 
 class AutoPreset:
@@ -108,7 +124,7 @@ class AutoPreset:
     async def snapshot(self) -> Dict[str, List[Optional[str]]]:
         out: Dict[str, List[Optional[str]]] = {}
         async with self.cam.exclusive("preset") as t:
-            for ct in SAVED_TYPES:
+            for ct in _saved_types(self.cam):
                 v = await self._get(t, ct)
                 if v is None and ct == "recmode":
                     await self.cam.refresh_menu()
@@ -146,7 +162,7 @@ class AutoPreset:
             # (or photo -> video) must not overwrite them with auto values.
             self.state = {"saved": await self.snapshot()}
         before = await self.snapshot()
-        plan = AUTO[target]
+        plan = _plan(cam, target)
         results: List[Dict[str, Any]] = []
         async with cam.exclusive("preset") as t:
             used = None
@@ -178,7 +194,7 @@ class AutoPreset:
         before = await self.snapshot()
         results: List[Dict[str, Any]] = []
         async with cam.exclusive("preset") as t:
-            for ct in SAVED_TYPES:
+            for ct in _saved_types(cam):
                 if ct not in saved:
                     continue
                 v, v2 = saved[ct]

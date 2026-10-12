@@ -17,25 +17,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
-import json
 import logging
 import os
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Deque, Dict, List, Optional, Set
+from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Set
 
-from . import discovery, exposure
+from . import discovery, exposure, models
 from .events import EventListener
 from .liveview import LiveViewReceiver
 from .menu import MenuModel
-from .protocol import CamError, CamTransport, Reply, parse_ddd, parse_state
+from .models import ModelProfile
+from .protocol import CamError, CamTransport, Reply, encrypt_acc, parse_ddd, parse_nonce, parse_state
+from .registry import JsonStore
 
 log = logging.getLogger("lumix.camera")
 
 CONFIG_DIR = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/lumix-remote"))
-SUBSCRIBE_SETTLE_S = 30.0      # max wait for the post-SUBSCRIBE mod_Play
+SUBSCRIBE_SETTLE_S = 30.0      # default max wait for the post-SUBSCRIBE mod_Play (see models)
 LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
 
 
@@ -50,9 +51,24 @@ class CameraConfig:
     lv_port: int = 49199                    # UDP live view port
     event_port: int = 49153                 # HTTP NOTIFY callback port
     scan_exclude: List[str] = field(default_factory=list)
+    scan: bool = True                       # TCP-scan the local /24s when nothing else finds it
     keepalive_s: float = 1.0
     approval_timeout_s: float = 180.0
     log_dir: Optional[str] = None           # raw request/response log
+    # --- per-camera identity (multi-camera; see lumix/registry.py)
+    cam_id: str = "camera"                  # registry id; names the log file and callback path
+    model: str = "auto"                     # model profile id, "auto" = from ddd modelNumber
+    udn: Optional[str] = None               # bind to this camera (ddd UDN); None = any Lumix
+    client_uuid: Optional[str] = None       # req_acc value (MEI0 id); None = this machine's
+    event_path: str = "/Camera/event"       # GENA callback path on event_port
+    # --- camera-side ports (real bodies: 80 / 60606 / 50001; emulators override)
+    http_port: int = 80
+    upnp_port: int = 60606
+    files_port: int = 50001
+    # IPs owned by other camera sessions: discovery skips them
+    claimed_ips: Optional[Callable[[], Set[str]]] = None
+    # where last IP / identity are remembered (load() -> dict, save(**kw)); None = state.json
+    store: Any = None
 
 
 class Bus:
@@ -87,6 +103,8 @@ def _client_uuid() -> str:
 class Camera:
     def __init__(self, cfg: CameraConfig):
         self.cfg = cfg
+        self.store = cfg.store if cfg.store is not None else JsonStore(os.path.join(CONFIG_DIR, "state.json"))
+        self.profile: ModelProfile = models.resolve(cfg.model, None)
         self.bus = Bus()
         self.status = "idle"
         self.status_msg = ""
@@ -101,9 +119,10 @@ class Camera:
         self.menu: Optional[MenuModel] = None
         self.events: Deque[Dict[str, Any]] = deque(maxlen=300)
         self.connected_at: Optional[float] = None
-        self.liveview = LiveViewReceiver(cfg.lv_port)
+        self.liveview = LiveViewReceiver(cfg.lv_port, self.profile.liveview)
         self.liveview_wanted = True
-        self.listener = EventListener(cfg.event_port, self._on_notify)
+        self.listener = EventListener(cfg.event_port, self._on_notify, path=cfg.event_path,
+                                      upnp_port=cfg.upnp_port)
         self.transport: Optional[CamTransport] = None
         self._op_lock = asyncio.Lock()
         self.op_owner: Optional[str] = None
@@ -173,7 +192,7 @@ class Camera:
         self.busy_streak += 1
         # cmd() retries err_busy 5 x 1 s, so 10 = two commands that exhausted
         # LUMIX Sync's whole retry budget while the body is not reported busy
-        if self.busy_streak >= 10:
+        if self.busy_streak >= self.profile.connect.wedge_busy_streak:
             self._mark_wedged("camcmd/startstream")
 
     def _mark_wedged(self, why: str) -> None:
@@ -190,6 +209,7 @@ class Camera:
     def status_dict(self) -> Dict[str, Any]:
         st = self.state
         return {
+            "camera_id": self.cfg.cam_id, "model": self.profile.id, "model_name": self.profile.name,
             "status": self.status, "message": self.status_msg, "ip": self.ip,
             "camera": {k: self.ddd.get(k) for k in ("friendlyName", "modelNumber", "X_FirmVersion",
                                                     "serialNumber")},
@@ -211,7 +231,10 @@ class Camera:
     def start(self) -> None:
         if self.cfg.log_dir:
             os.makedirs(self.cfg.log_dir, exist_ok=True)
-            path = os.path.join(self.cfg.log_dir, "camera-%s.log" % dt.date.today().isoformat())
+            name = "camera-%s.log" % dt.date.today().isoformat()
+            if self.cfg.cam_id not in ("camera", ""):
+                name = "camera-%s-%s.log" % (self.cfg.cam_id, dt.date.today().isoformat())
+            path = os.path.join(self.cfg.log_dir, name)
             self._log_fh = open(path, "a")
         self._task = asyncio.ensure_future(self._run())
 
@@ -286,7 +309,8 @@ class Camera:
         """Drop the session and connect again (to ``ip`` if given; ``forget``
         clears the remembered camera so discovery starts from scratch)."""
         if forget:
-            self._save_state(last_ip=None)
+            self._save_state(last_ip=None, udn=None)
+            self.cfg.udn = None
             self.ip_fixed = False
             self.ip = None
         if ip:
@@ -306,22 +330,45 @@ class Camera:
             self._ssdp_seen = ip
             self.log_event("ssdp", "camera announced itself at %s" % ip)
 
+    def _claimed(self) -> Set[str]:
+        """IPs other sessions own *on our UPnP port* (emulators share an IP and
+        differ by port, so claims are "ip:upnp_port")."""
+        try:
+            keys = set(self.cfg.claimed_ips()) if self.cfg.claimed_ips else set()
+        except Exception:
+            return set()
+        suffix = ":%d" % self.cfg.upnp_port
+        return {k[:-len(suffix)] for k in keys if k.endswith(suffix)}
+
+    def accepts(self, ddd: Dict[str, str]) -> bool:
+        """Is this device description ours? A session bound to a UDN only takes
+        that camera; an unbound one takes any Lumix no other session owns."""
+        if self.cfg.udn:
+            return ddd.get("UDN") == self.cfg.udn
+        return ddd.get("ip") not in self._claimed()
+
     async def _discover(self) -> Optional[str]:
         if self.ip:
             return self.ip
         self._set_status("discovering", "looking for a Lumix camera")
         cands: List[str] = []
         cached = self._load_state().get("last_ip")
+        claimed = self._claimed()
         for c in (self._ssdp_seen, cached, discovery.AP_MODE_IP):
-            if c and c not in cands and c not in self.cfg.scan_exclude:
+            if c and c not in cands and c not in self.cfg.scan_exclude and c not in claimed:
                 cands.append(c)
         for c in cands:
-            d = await discovery.probe_ddd(c, timeout=2.5)
-            if d:
+            d = await discovery.probe_ddd(c, timeout=2.5, port=self.cfg.upnp_port)
+            if d and self.accepts(d):
                 self.ip = c
                 return c
-        d = await discovery.scan(self.cfg.scan_exclude,
-                                 progress=lambda m: self._set_status("discovering", m))
+        if not self.cfg.scan:
+            self._set_status("discovering", "no camera at the remembered address (LAN scan is off); "
+                                            "is it on with Wi-Fi remote shooting enabled?")
+            return None
+        d = await discovery.scan(list(self.cfg.scan_exclude) + sorted(claimed),
+                                 progress=lambda m: self._set_status("discovering", m),
+                                 accept=self.accepts, port=self.cfg.upnp_port)
         if d:
             self.ip = d["ip"]
             return self.ip
@@ -339,20 +386,35 @@ class Camera:
         if self.transport is None or self.transport.ip != ip:
             if self.transport is not None:
                 await self.transport.close()
-            self.transport = CamTransport(ip, user_agent=LUMIX_SYNC_UA, trace=self._trace)
+            self.transport = CamTransport(ip, user_agent=LUMIX_SYNC_UA, trace=self._trace,
+                                          port=self.cfg.http_port)
         t = self.transport
         self.liveview.camera_ip = ip
         self.busy_streak = 0
         self.wedged, self.wedged_since, self.body_busy = False, None, False
         self._lv_running = False
         # 1. device description (also proves the camera is there)
-        raw = await t.get_raw(60606, discovery.DDD_PATH, timeout=6)
-        self.ddd = parse_ddd(raw)
-        self._save_state(last_ip=ip)
+        raw = await t.get_raw(self.cfg.upnp_port, discovery.DDD_PATH, timeout=6)
+        ddd = parse_ddd(raw)
+        if self.cfg.udn and ddd.get("UDN") and ddd.get("UDN") != self.cfg.udn:
+            if not self.ip_fixed:
+                self.ip = None
+            raise Disconnected("%s is another camera (%s)" % (ip, ddd.get("friendlyName")))
+        self.ddd = ddd
+        self.profile = models.resolve(self.cfg.model, ddd)
+        self.liveview.rules = self.profile.liveview
+        q = self.profile.connect
+        if ddd.get("UDN"):
+            self.cfg.udn = ddd["UDN"]
+        self._save_state(last_ip=ip, udn=ddd.get("UDN"), model_number=ddd.get("modelNumber"),
+                         friendly_name=ddd.get("friendlyName"), firmware=ddd.get("X_FirmVersion"))
+        self.log_event("conn", "%s %s (fw %s): model profile %s" % (
+            ddd.get("modelNumber"), ddd.get("friendlyName"), ddd.get("X_FirmVersion"), self.profile.id))
         # 2. access request; "ok_under_research*" = wait (camera may show a prompt)
+        acc_type, acc_v1, acc_v2 = await self._access_values(t)
         deadline = time.monotonic() + self.cfg.approval_timeout_s
         while True:
-            r = await t.cgi("accctrl", "req_acc", _client_uuid(), self.cfg.device_name)
+            r = await t.cgi("accctrl", acc_type, acc_v1, acc_v2)
             if r.text.startswith("ok,"):
                 break
             if r.text.startswith("ok_under_research"):
@@ -364,13 +426,17 @@ class Camera:
                 raise CamError("access not granted: %s" % r.text)
             await asyncio.sleep(1.0)
         self.log_event("conn", "access granted: %s" % r.text)
+        if acc_type == "req_acc_e":
+            # LUMIX Sync, encrypted bodies: device_name before the SUBSCRIBE
+            await t.cgi("setsetting", "device_name", self.cfg.device_name)
         # 3. event subscription, right after the accept (moves the S5 off "Connecting")
         self._mod_play.clear()
         sub_at = time.monotonic()
         await self._subscribe_safely(ip)
         await asyncio.sleep(0.2)
         # 4. read-only setup, as LUMIX Sync does it
-        await t.cgi("setsetting", "raw_img_send", "enable")
+        if q.raw_img_send:
+            await t.cgi("setsetting", "raw_img_send", "enable")
         cap = await t.cgi("getinfo", "capability")
         self.capability = _capability_dict(cap)
         await self._load_menu()
@@ -385,19 +451,37 @@ class Camera:
         # before that answers err_critical and wedges the camera (seen at 20:41,
         # 21:24, 22:01 and 22:45 on 2026-10-11). LUMIX Sync never sends recmode
         # at connect, so it never hits this window. Wait for mod_Play.
-        left = SUBSCRIBE_SETTLE_S - (time.monotonic() - sub_at)
+        left = (q.settle_s if q.settle_event else q.settle_min_s) - (time.monotonic() - sub_at)
         if left > 0 and not self._mod_play.is_set():
             self._set_status("connecting", "waiting for the camera to settle after subscribing")
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._mod_play.wait(), left)
         self.log_event("conn", "camera settled after SUBSCRIBE in %.1fs (%s)" % (
-            time.monotonic() - sub_at, "mod_Play" if self._mod_play.is_set() else "timeout"))
+            time.monotonic() - sub_at, (q.settle_event or "settle") if self._mod_play.is_set() else "timeout"))
         await self._refresh_state(strict=True)
         # 6. live view start (the only recmode at connect)
         if self.liveview_wanted:
             await self.start_liveview("connect")
         self.connected_at = time.time()
+        self._save_state(connected_at=int(self.connected_at), provisional=False)
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
+
+    async def _access_values(self, t: CamTransport) -> "tuple[str, str, str]":
+        """accctrl type and values for this body: plain req_acc, or LUMIX Sync's
+        encrypted req_acc_g (nonce) + req_acc_e when X_CamCapability says so."""
+        cid = self.cfg.client_uuid or _client_uuid()
+        name = self.cfg.device_name
+        if self.profile.handshake_for(self.ddd) == "req_acc_g":
+            g = await t.cgi("accctrl", "req_acc_g")
+            try:
+                nonce = parse_nonce(g.text)
+            except ValueError:
+                if not self.profile.handshake_fallback:
+                    raise CamError("req_acc_g -> %s" % g.text[:40])
+                self.log_event("conn", "req_acc_g -> %s; falling back to req_acc" % g.result)
+            else:
+                return "req_acc_e", encrypt_acc(cid, nonce), encrypt_acc(name, nonce)
+        return "req_acc", cid, name
 
     async def _load_menu(self) -> None:
         assert self.transport
@@ -448,7 +532,7 @@ class Camera:
         """
         assert self.transport
         await self._refresh_state()
-        if self.state.get("cammode") == "rec":
+        if self.profile.connect.subscribe_only_in_play and self.state.get("cammode") == "rec":
             r = await self.cmd("camcmd", value="playmode")
             for _ in range(10):
                 await asyncio.sleep(0.4)
@@ -475,6 +559,13 @@ class Camera:
             await asyncio.sleep(1.0)
             r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
             n += 1
+        # One camcmd/startstream refused for LUMIX Sync's whole retry budget is the
+        # wedge (2026-10-11: capture err_busy x5 never cleared without a power
+        # cycle). recmode is judged by ensure_rec(), which also checks cammode.
+        if (n >= tries and r.result in ("err_busy", "err_critical")
+                and (mode == "startstream" or (mode == "camcmd" and value not in ("recmode", "poweroff")))
+                and self.profile.connect.busy_budget_exhausted_is_wedge):
+            self._mark_wedged("%s %s refused %d times" % (mode, value or "", n))
         return r
 
     async def ensure_rec(self) -> bool:
@@ -492,7 +583,8 @@ class Camera:
         # whole retry budget is wedged (2026-10-11 22:46/23:08: err_busy x5 from
         # play, power cycle needed). Flag it now instead of after a second command,
         # so nothing else (watchdog, UI, scripts) keeps sending camcmds.
-        if (r.result in ("err_busy", "err_critical")
+        if (self.profile.connect.recmode_refused_from_play_is_wedge
+                and r.result in ("err_busy", "err_critical")
                 and self.state.get("cammode") == "play"):
             self._mark_wedged("recmode from play")
         return False
@@ -506,13 +598,15 @@ class Camera:
             self.log_event("lv", "live view start (%s) skipped: camera %s"
                            % (reason, "in use" if self.body_busy else "wedged"))
             return False
-        if self._lv_running:
+        q = self.profile.connect
+        if self._lv_running or not q.stopstream_only_if_running:
             # stopstream with no stream running answers err_critical on the S5
             await self.cmd("stopstream")
         await self._refresh_state()
         # recmode only when needed: every recmode makes the camera echo
         # lens_Atta/mod_Rec, and recmode churn is part of how the S5 wedges
-        if self.state.get("cammode") != "rec" and not await self.ensure_rec():
+        need_rec = self.state.get("cammode") != "rec" or not q.recmode_only_if_needed
+        if need_rec and not await self.ensure_rec():
             self._lv_running = False
             self.log_event("warn", "live view start (%s): camera stays in %s"
                            % (reason, self.state.get("cammode")))
@@ -523,7 +617,8 @@ class Camera:
         return r.ok
 
     async def stop_liveview(self, reason: str) -> None:
-        if self.transport is None or not self._lv_running:
+        if self.transport is None or (not self._lv_running
+                                      and self.profile.connect.stopstream_only_if_running):
             # stopstream with no stream running answers err_critical on the S5
             # (22:45:23 on 2026-10-11, right before the recmode that wedged it);
             # LUMIX Sync only stops a stream it started
@@ -611,7 +706,8 @@ class Camera:
                         and tick % 3 == 0):
                     await self.refresh_exposure()
                 if self.listener.needs_renew():
-                    rr = await self.listener.renew(fallback=False)
+                    rr = await self.listener.renew(
+                        fallback=not self.profile.connect.renew_by_sid_only)
                     if rr.get("status") != 200:
                         # LUMIX Sync never re-subscribes a live session: tear down
                         raise Disconnected("subscription renew refused: %s" % rr)
@@ -667,7 +763,8 @@ class Camera:
                 # live view once. Outside a busy window it is just the camera's echo
                 # of our own recmode; reacting to it would loop recmode -> lens_Atta
                 # -> recmode, which wedged the S5 (2026-10-11 22:01).
-                if self.body_busy or self._busy_ended:
+                if (self.body_busy or self._busy_ended
+                        or not self.profile.connect.lens_atta_restart_only_after_busy):
                     self._busy_ended = False
                     if self.liveview_wanted:
                         self._lv_pending = "lens_Atta after camera use"
@@ -827,17 +924,16 @@ class Camera:
     # ----------------------------------------------------------- persistence
     def _load_state(self) -> Dict[str, Any]:
         try:
-            with open(os.path.join(CONFIG_DIR, "state.json")) as f:
-                return json.load(f)
-        except (OSError, ValueError):
+            return self.store.load()
+        except Exception:
+            log.exception("camera store load failed")
             return {}
 
     def _save_state(self, **kw: Any) -> None:
-        st = self._load_state()
-        st.update(kw)
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(os.path.join(CONFIG_DIR, "state.json"), "w") as f:
-            json.dump(st, f)
+        try:
+            self.store.save(**kw)
+        except Exception:
+            log.exception("camera store save failed")
 
 
 def _oneline(text: str, limit: int = 400) -> str:
