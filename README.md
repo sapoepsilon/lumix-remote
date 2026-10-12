@@ -56,7 +56,7 @@ IP, the camera's UDN (once seen, the entry only ever connects to that body),
 client UUID (LUMIX Sync-style MEI0 id), Bluetooth name/address/identity, home
 SSID for the BLE Wi-Fi join, camera-side ports (`http` 80, `upnp` 60606, `files`
 50001; emulators change them), its live-view port, and settings
-(`autoconnect`, `watchdog`). Auto preset state is per camera in
+(`autoconnect`, `watchdog`, `resume_on_reconnect`). Auto preset state is per camera in
 `cameras/<id>/presets.json`. The server runs one session per camera at the same
 time (own live-view UDP port, own GENA callback path `/Camera/event/<id>` on the
 shared event port); discovery in one session never takes a camera another
@@ -80,10 +80,90 @@ SSDP announcement heard since start > camera AP address 192.168.54.1 > TCP scan
 of the local /24 for port 60606. The S5 ignores SSDP M-SEARCH and only
 announces itself when it joins the network, so the scan is the usual fallback.
 
-### Power
+### Power and graceful shutdown (quiesce)
 
-"Power off" sends `camcmd poweroff` after a confirm dialog. The camera can't
-be switched back on over Wi-Fi; see "Bluetooth" below for waking it over BLE.
+"Power off" sends `camcmd poweroff` after a confirm sheet that lists what is
+running. The camera can't be switched back on over Wi-Fi; see "Bluetooth" below
+for waking it over BLE.
+
+Before anything disruptive the server **quiesces** the camera session
+(`server/quiesce.py`), one central path for:
+
+| Trigger | Imports | Recording | Timelapse | Live view + UNSUBSCRIBE |
+|---|---|---|---|---|
+| Camera power-off (UI, `lumix poweroff --yes`, BLE power-cycle) | paused | stopped | paused | yes |
+| Server stop (SIGTERM/SIGINT, `lumix server stop`, a new server taking over) | paused | stopped | paused | yes |
+| Camera removed | paused | stopped | paused | yes |
+| Entering file browsing | keep running | stopped | paused | (play mode stops it) |
+| Back to shooting (`POST /api/files/done`, starting a timelapse) | paused | - | resumed | - |
+
+Steps, each with a timeout (the whole thing stays under the 10 s a new server
+waits before SIGKILL): import jobs are checkpointed (the transfer stops, the
+`.part` file stays and continues later with a `Range` request; checkpoints live
+in `cameras/<id>/imports.json`), the timelapse is paused after the shot in flight
+(in-camera runs: `camctrl interval pause`), a video recording is stopped with
+`video_recstop` and the server waits until getstate reports `rec` and
+`sd_access` off (card written), then `stopstream` (only a stream we started) and
+UNSUBSCRIBE. The report lists what was paused/stopped. A refused poweroff makes
+the session reconnect (its event subscription is gone).
+
+**Resume:** when the camera is back (the next connect reaching "ready", which
+includes the first connect after a server restart), work paused by power-off or
+server stop resumes automatically: the timelapse first, imports only when no
+timelapse needs rec mode (else they wait for the next file browsing session).
+Switch it off per camera with `settings.resume_on_reconnect` (`PATCH
+/api/cameras/{id} {"settings": {"resume_on_reconnect": false}}`); then
+`POST /api/resume`, `POST /api/timelapse/resume` or `POST /api/jobs/{id}/resume`
+continue by hand. A timelapse paused by the user never resumes on its own.
+
+## Timelapse
+
+Per camera, two engines (`lumix/timelapse.py`):
+
+- **Server-driven** (default): the server takes one photo per interval
+  (`camcmd capture`, one short hold of the camera lock per shot, so UI commands
+  still get through). Shots sit on a fixed grid; a slot that cannot be shot is
+  skipped, never queued: while the camera reports `busy` (someone uses the body)
+  nothing is sent for up to half an interval, then the slot is skipped;
+  `err_busy` gets at most two quick retries; a video recording or file browsing
+  skips/pauses; while the camera reconnects the job waits and counts missed
+  slots, then continues on the grid (AE lock and the fixed exposure are
+  re-applied after a reconnect). `count` = photos taken (skipped slots extend
+  the run), `duration` = a cap on the slot grid (pauses don't count), either or
+  both. Optional start time, AE/AF lock + fixed exposure (`ae_lock`: the run's
+  aperture/shutter/ISO are read at the start and put back after a reconnect,
+  plus `camctrl af_ae_lock on`).
+- **In-camera** (`native`): the camera's own interval shooting, as LUMIX Sync
+  drives it: drive mode `stopmotion_interval`, `interval_shoot_interval`,
+  `interval_shoot_num`, `interval_start_time -1`, `camctrl interval set`
+  (repeated while `ok_under_research`), then the shutter starts the run;
+  pause/resume/stop = `camctrl interval pause|restart|stop`; progress from
+  getstate `interval_status`/`interval_remain_num`; the drive mode is restored
+  at the end. Only for models whose profile has `capabilities.interval_native`
+  (S5: yes; generic: no). While it runs the body answers `err_busy` to
+  capture/mode switches, so the shutter and file browsing are refused (409) and
+  that `err_busy` never counts as the wedge. A run the camera lost (power cycle)
+  is re-armed with the remaining shots. Verified against the emulator only.
+
+Options for both: `import` copies the frames to
+`~/Pictures/Lumix/<YYYY-MM-DD>/timelapse-<name>/` (after every shot when the
+interval is at least 30 s, else at the end; the frames are the newest N photos
+on the card, so photos taken by other means during a run end up in it), `video`
+assembles `timelapse-<name>.mp4` there with ffmpeg (`brew install ffmpeg`;
+24 fps by default; implies `import`). The live view frame at each shot is the
+"last frame" thumbnail.
+
+Job state is written to `cameras/<id>/timelapse.json` on every change: a server
+restart resumes a running job (a crash too: the file still says `running`), and
+a job paused by power-off/server stop resumes when the camera is back.
+
+UI: the TIMELAPSE mode shows a panel over the live view: engine (Mac /
+In-camera), interval and shots-or-time pickers, AE lock / Import / MP4 / Later
+toggles and a summary (shots, run time, clip length). While running: a progress
+ring with shots taken, time left and finish time, next shot countdown, skipped
+slots with the reason, the last frame, Pause/Resume and Stop. The shutter (or
+Space) starts/stops it. Screenshots: `evidence/timelapse-*.png`,
+`evidence/poweroff-*.png`.
 
 ## Web UI
 
@@ -99,7 +179,7 @@ home screen (Share > Add to Home Screen; needs `--lan`) and it opens full screen
   "camera busy" banner when live view stalls after `err_busy` answers.
 - **Shooting view:** big round shutter, PHOTO / VIDEO / TIMELAPSE strip (swipe
   it or the live view, or use the arrow keys), exposure readout, one-shot AF,
-  tap to focus. Timelapse is a placeholder for now.
+  tap to focus. TIMELAPSE: see "Timelapse" above.
 - **AUTO** button: one tap applies the Auto preset (below); tap again to get
   your own settings back.
 - **Controls sheet** (sliders button or `P`): Auto switch, quick controls
@@ -201,7 +281,13 @@ lumix cmd recmode                # raw camcmd passthrough
 lumix snapshot -o frame.jpg      # latest live view frame ('-o -' = stdout)
 lumix events -n 20               # recent event log
 lumix events -f                  # follow the WebSocket feed (--json, --all, --count N)
-lumix poweroff --yes             # cannot be switched back on over Wi-Fi
+lumix poweroff                   # shows what would be paused/stopped (exit 2 without --yes)
+lumix poweroff --yes             # quiesce, then power off; cannot be switched back on over Wi-Fi
+
+lumix timelapse start --interval 10 --count 360 [--native] [--import] [--video]
+lumix timelapse start -i 5 --duration 1h30m --start-at 18:45 --ae-lock --name sunset
+lumix timelapse status [--watch]  # shots, skipped, time left, next shot, frames, video
+lumix timelapse pause|resume|stop # stop = finish early (frames are still imported/assembled)
 ```
 
 Setting names and option tokens are shell-safe for completion
@@ -209,8 +295,7 @@ Setting names and option tokens are shell-safe for completion
 completion: `eval "$(lumix completion bash)"`, or for zsh
 `autoload -U +X bashcompinit && bashcompinit && eval "$(lumix completion zsh)"`.
 
-`lumix timelapse` and `lumix files` are placeholders until the server grows
-those features.
+`lumix files` is a placeholder; the files API below works.
 
 ### Tests
 
@@ -221,6 +306,10 @@ those features.
 `tests/test_cli.py` runs every CLI command against a fake server (aiohttp in a
 background thread), including the WebSocket feed and `server start/stop` with a
 stand-in `run.sh`; no camera needed.
+`tests/test_timelapse_emu.py` runs the real server app against an in-process
+emulator (ephemeral ports, ~90 s): both timelapse engines, busy windows,
+reconnect mid-run via `/emu/power-cycle`, resume after a server restart (clean
+and crashed), import checkpoint + Range resume, power-off quiesce and resume.
 
 ## HTTP API
 
@@ -260,7 +349,14 @@ the active camera. `{id}` may also be the nickname. `/api/status` answers
 | `POST /api/af` | One-shot AF |
 | `POST /api/zoom` `{"action"}` | Power zoom: `tele-normal`, `tele-fast`, `wide-normal`, `wide-fast`, `zoomstop` |
 | `POST /api/camcmd` `{"value"}` | Any `camcmd` (e.g. `recmode`, `playmode`, `oneshot_af`); not `poweroff` |
-| `POST /api/power/off` `{"confirm": true}` | Power the camera off |
+| `POST /api/power/off` `{"confirm": true}` | Quiesce (see "Power and graceful shutdown"), then power the camera off; returns `result` + `quiesce` `{paused, stopped, errors}`. Without `confirm`: 400 + `plan` |
+| `GET /api/power/plan[?reason=poweroff\|server-stop\|remove\|files\|shooting]` | What a quiesce would pause/stop now: `{items: [{kind: import\|recording\|timelapse\|liveview\|events, action, label, detail, resumable}], resume_on_reconnect}` |
+| `POST /api/quiesce` `{"reason"}` | Run a quiesce without acting (testing/scripts) |
+| `POST /api/resume` | Resume what a power-off/server stop paused (ignores `resume_on_reconnect`) |
+| `GET /api/timelapse` | `{job, active, history, capabilities: {native, ffmpeg, ...}, frame_url}`; job: `state` (`scheduled`, `running`, `paused`, `stopping`, `importing`, `assembling`, `done`, `stopped`, `failed`), `paused_by`, `waiting`, `shots`, `target`, `skipped`, `missed`, `failed`, `progress`, `eta_s`, `next_shot_at`, `skips`, `frames`, `folder`, `video_path` |
+| `POST /api/timelapse` or `/api/timelapse/start` `{"interval", "count"?, "duration"?, "start_at"?, "native"?, "ae_lock"?, "import"?, "import_mode"?: "auto"\|"each"\|"end", "video"?, "fps"?, "name"?, "dest"?}` | Start (201). `start_at`: epoch, ISO time, `HH:MM` or `+SECONDS`. 409 when one is already active |
+| `POST /api/timelapse/pause`, `/resume`, `/stop` | Pause (after the shot in flight), resume (re-anchors the grid), stop early |
+| `GET /api/timelapse/frame.jpg` | Last frame (live view at the last shot) |
 | `GET /api/liveview.jpg` | Latest live view frame |
 | `GET /api/liveview.mjpg` | MJPEG stream (`multipart/x-mixed-replace`) |
 | `GET /api/ws` | WebSocket push: `status`, `exposure`, `settings` (changed ids), `event`, `events`, `preset`, `cameras` (list changed); the plain `/api/ws` closes with `active` when the active camera changes |
@@ -281,7 +377,9 @@ The camera serves its card only in play mode, and live view only runs in rec
 mode. The first files request switches the camera to play mode and pauses live
 view; `POST /api/files/done`, or 120 s without any files request, switches back
 to rec mode and live view resumes. A running download or import keeps play
-mode (the idle timer waits). Mode switches take the camera lock, so they never
+mode (the idle timer waits); `POST /api/files/done` checkpoints running imports
+(`paused`, continued in the next file browsing session). Entering file browsing
+pauses a running timelapse and stops a recording; leaving resumes the timelapse. Mode switches take the camera lock, so they never
 interleave with a capture or setting change. If the camera refuses play mode
 the API answers 409 with the camera's reply (see Known issues).
 
@@ -292,9 +390,10 @@ the API answers 409 with the camera's reply (see Known issues).
 | `GET /api/files/{id}/preview` | Large preview JPEG (camera `DL` file, cached; thumbnail if none) |
 | `GET /api/files/{id}/download?variant=original\|raw` | Streams the file with `Content-Disposition: attachment; filename=...`; `Range` is passed through (206) |
 | `POST /api/files/import` `{"ids":[...], "dest":"~/Pictures/Lumix", "include_raw":true}` | Background import, 202 + job. Files go to `<dest>/YYYY-MM-DD/<name>` (shot date); default dest `~/Pictures/Lumix`; a file with the same name and size is skipped; `.part` + Range resume on errors |
-| `GET /api/jobs`, `GET /api/jobs/{id}` | Job progress: `state` (`queued`, `running`, `done`, `done_with_errors`, `failed`, `cancelled`), `files_total/done/skipped/failed`, `bytes_total/done`, `progress` 0..1, `current`, `saved`, `errors` |
-| `POST /api/jobs/{id}/cancel` | Cancel an import |
-| `POST /api/files/done` | Leave file browsing: rec mode + live view |
+| `GET /api/jobs`, `GET /api/jobs/{id}` | Job progress: `state` (`queued`, `running`, `paused`, `done`, `done_with_errors`, `failed`, `cancelled`), `paused_by`, `files_total/done/skipped/failed`, `bytes_total/done`, `progress` 0..1, `current`, `saved`, `errors` |
+| `POST /api/jobs/{id}/cancel` | Cancel an import (also a paused one) |
+| `POST /api/jobs/{id}/pause`, `/resume` | Checkpoint / continue an import (`.part` + Range) |
+| `POST /api/files/done` | Leave file browsing: running imports checkpointed (`paused_jobs`), rec mode + live view |
 | `GET /api/files/status` | `{active, cammode, pins, idle_left_s, cached_items, last_error, jobs}` |
 
 Card layout on the S5: the top level holds single files plus groups (time
@@ -389,15 +488,20 @@ lumix/            camera client library (no web code)
   registry.py     cameras.json: per-camera config, migration, pidfile path
   didl.py         ContentDirectory Browse SOAP + DIDL-Lite parser
   files.py        FileBrowser: play-mode session, listing cache, thumbs, downloads, import jobs
+                  (pause/resume checkpoints)
+  timelapse.py    TimelapseEngine: server-driven + in-camera interval jobs, import, MP4
 server/           aiohttp app (API, MJPEG, WebSocket) + static UI
   sessions.py     one camera session per registered camera, active camera
   cameras_api.py  /api/cameras, /api/models routes
   ui_api.py       /api/presets, /api/connection routes
+  timelapse_api.py /api/timelapse routes
+  quiesce.py      quiesce/resume: power-off, server stop, removal, files <-> shooting
   static/         web UI (index.html, app.js, style.css, manifest, icons)
 lumixcli/         `lumix` command line client (HTTP API only)
 bin/lumix         CLI wrapper (uses .venv)
 tests/            unit tests: real S5 menu dumps, CLI against a fake server, profiles,
-                  registry/migration, multi-camera routing
+                  registry/migration, multi-camera routing; test_timelapse_emu.py runs
+                  the server against the emulator (timelapse engines, quiesce)
 docs/             protocol research notes
 tools/            stand-alone protocol probe
 ```

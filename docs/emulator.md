@@ -35,7 +35,7 @@ LUMIX_REMOTE_HOME=/tmp/lumix-emu ./run.sh --port 8770 --camera-ip 127.0.0.1 \
 
 Use a separate `LUMIX_REMOTE_HOME` so the emulator doesn't overwrite the real camera's remembered IP/registry and so the server's pidfile takeover doesn't kill a server that's driving the real body.
 
-Other flags: `--model dc-s5` (the only profile), `--approval auto|prompt|refuse`, `--session-timeout 30` (0 = never), `--fps 25`, `--interval-scale 0.01` (time-lapse 100x faster), `--card-photos 4`, `--card-group 120`, `--no-range`, `--seed N`, `--control-port`, `--port-stride`, `-v`.
+Other flags: `--model dc-s5` (the only profile), `--approval auto|prompt|refuse`, `--session-timeout 30` (0 = never), `--fps 25`, `--interval-scale 0.01` (time-lapse 100x faster), `--card-photos 4`, `--card-group 120`, `--no-range`, `--dl-rate BYTES_PER_S` (throttle :50001 so an import can be paused mid-file; also `dl_rate` via `/emu/config`), `--seed N`, `--control-port`, `--port-stride`, `-v`.
 
 Each camera gets a fake identity: MAC `02:4C:58:E0:00:0N` (locally administered), friendlyName `S5-E0000N` (the S5 uses `S5-` + last 3 MAC bytes), serial `EMU000000N`, UDN `uuid:4D454930-0100-1000-8000-024C58E0000N`.
 
@@ -48,7 +48,7 @@ Each camera gets a fake identity: MAC `02:4C:58:E0:00:0N` (locally administered)
 | Session | `text/plain` CSV for accctrl and `getinfo lens`, `text/xml` otherwise, `Server: Panasonic`, `Connection: close` on every reply. Before req_acc only `getstate`/`getinfo` answer (as recorded); everything else `err_reject`. After a session drop (idle `--session-timeout`, or `POST /emu/drop-session`) **every** command, `getstate` included, answers `err_reject` until a new req_acc. |
 | `getstate` | Recorded field lists for rec and play mode; live `cammode`, `rec`, `progress_time`, `sd_access` (on during card writes), `remaincapacity`, `burst_interval_status` (on with drive mode `stopmotion_interval`), `interval_*`, `warn_disp`. |
 | `getinfo` | `capability`, `allmenu` (recorded), `curmenu` (recorded, updated by setsetting), `lens` (recorded CSV); others `err_param`. |
-| `getsetting` / `setsetting` | Stateful. Values from the server log (`focal 1055/256`, `shtrspeed 0/256`, `iso auto`, `afmode 1area_asst` + text `auto`, `touch_type 5`, ...). Unknown getsetting types answer `err_critical` (as recorded for `mf_assist`, `recmode`). setsetting accepts every `(cmd_type, cmd_value)` in allmenu (updating the matching curmenu item) plus the direct types LUMIX Sync uses; other values `err_param`. |
+| `getsetting` / `setsetting` | Stateful. Values from the server log (`focal 1055/256`, `shtrspeed 0/256`, `iso auto`, `afmode 1area_asst` + text `auto`, `touch_type 5`, ...). Unknown getsetting types answer `err_critical` (as recorded for `mf_assist`, `recmode`). setsetting accepts every `(cmd_type, cmd_value)` in allmenu (updating the matching curmenu item), free values for `__value__` items such as `interval_shoot_num` / `interval_shoot_interval` / `interval_start_time` (stored in that item's curmenu value, which the time lapse uses), plus the direct types LUMIX Sync uses; other values `err_param`. |
 | `camcmd` | `recmode`/`playmode` (mode flips 0.3 s later; recmode echoes NOTIFY `lens_Atta` + `mod_Rec`), `capture` (adds a photo, card-write busy window), `video_recstart/stop` (adds an MP4), `oneshot_af`, `capture_cancel`, `menu_entry/exit`, `autoreviewunlock`, `lcd_on`, touch releases, zoom, `poweroff`. Unknown values `err_param` (also while wedged). |
 | `camctrl` | `touch` (`on` twice without `off` -> `err_reject`), `touch_trace`, `touchaf_chg_pos`, `pinch`, `asst_disp`, `focus`, `af_ae_lock`, `touchae_ctrl`, ... -> ok in rec. `interval set` (needs drive mode `stopmotion_interval`) answers `ok_under_research` once then `ok`; the next `capture` starts the run; `pause/restart/continue/cancel/stop`. |
 | Time lapse | Each shot lands in a new `Interval` container on the card (`<firstid>DIR`), at the curmenu interval (30 s) x `--interval-scale`, for curmenu `interval_shoot_num` shots. |
@@ -104,7 +104,7 @@ While wedged: every valid camcmd -> `err_busy`, unknown camcmd -> `err_param`, `
 
 ## Tests
 
-`tests/test_emulator.py` (unittest, no camera): handshake + ddd scrubbing, GENA subscribe/NOTIFY/renew/412, session drop and idle timeout, the three wedge triggers, busy windows, touch, poweroff/power-on, body events, realism off, live-view datagram layout/fps/stop rules, "Connecting" (no frames before SUBSCRIBE), Browse 701 + paging of a 120-item group, Range downloads, time lapse, two independent cameras.
+`tests/test_timelapse_emu.py` drives the real server against the emulator (timelapse engines, quiesce). `tests/test_emulator.py` (unittest, no camera): handshake + ddd scrubbing, GENA subscribe/NOTIFY/renew/412, session drop and idle timeout, the three wedge triggers, busy windows, touch, poweroff/power-on, body events, realism off, live-view datagram layout/fps/stop rules, "Connecting" (no frames before SUBSCRIBE), Browse 701 + paging of a 120-item group, Range downloads, time lapse, two independent cameras.
 
 ```sh
 .venv/bin/python -m unittest tests.test_emulator
