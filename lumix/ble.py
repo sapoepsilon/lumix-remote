@@ -171,6 +171,31 @@ def save_config(**kw: Any) -> None:
     reg.update(cid, ble=ble)
 
 
+def mark_registered(name: Optional[str] = None, address: Optional[str] = None) -> bool:
+    """Self-heal: a BLE login whose reads succeeded proves the camera knows our
+    client UUID, so record that in the camera's entry (registered_at, identity,
+    name, address). Covers pairings that ran before registered_at was saved.
+    Keeps an existing registered_at. Returns True when something was written."""
+    try:
+        cur = load_config()
+        kw: Dict[str, Any] = {}
+        if not cur.get("registered_at"):
+            kw["registered_at"] = int(time.time())
+        cid = _client_id()
+        if cur.get("identity") != cid:
+            kw["identity"] = cid
+        if name and NAME_RE.match(name) and cur.get("camera_name") != name:
+            kw["camera_name"] = name
+        if address and cur.get("address") != address:
+            kw["address"] = address
+        if kw:
+            save_config(**kw)
+        return bool(kw)
+    except Exception as e:  # never fail a wake/status over bookkeeping
+        log.warning("could not save BLE registration: %s", e)
+        return False
+
+
 def parse_sta_ssid(raw: bytes) -> Optional[str]:
     """9c781c60 value: 1 status/flag byte, then the NUL-terminated SSID."""
     if len(raw) < 2:
@@ -260,6 +285,8 @@ class LumixBle:
         self.name = name
         self.scan_timeout = scan_timeout
         self.client = None
+        self.found_name: Optional[str] = None   # advertised name of the camera we connected to
+        self.address: Optional[str] = None
         self.notes: List[Tuple[float, str, str]] = []
         self._waiters: Dict[str, asyncio.Queue] = {}
         self._on_event = on_event or (lambda s: log.info("%s", s))
@@ -282,6 +309,7 @@ class LumixBle:
         if dev is None:
             raise RuntimeError("camera not advertising (name=%s)" % (self.name or "any Lumix"))
         self.ev("found %s" % (dev.name or dev.address))
+        self.found_name, self.address = dev.name or None, dev.address
 
         def on_disc(_c):
             self.ev("disconnected")
@@ -445,6 +473,7 @@ async def pair(name: Optional[str] = None, wait: float = 300.0,
                 key = await c.read(CH_INITIAL_INFORM, timeout=30)
                 if c.disconnected.is_set():
                     raise RuntimeError("dropped after registration")
+                mark_registered(c.found_name or name, c.address)
                 return {"ok": True, "tries": tries, "camera_ssid": _printable(ssid),
                         "initial_inform_len": len(key), "notifies": c.notes,
                         "elapsed_s": round(time.time() - t0, 1)}
@@ -475,6 +504,8 @@ async def status(name: Optional[str] = None, log: Callable[[str], None] = print,
                     info[label] = "ERR %s" % e
             out["info"] = info
             out["registered"] = not any(str(v).startswith("ERR") for v in info.values())
+            if out["registered"]:
+                out["saved"] = mark_registered(c.found_name or name, c.address)
     except Exception as e:
         out["registered"] = False
         out["error"] = "%s: %s" % (type(e).__name__, e)
@@ -522,6 +553,9 @@ async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait
     async with LumixBle(name, scan_timeout=30, on_event=log) as c:
         out["ble_connected_s"] = round(time.time() - t0, 1)
         await c.login()
+        # login() read INITIAL_INFORM: an unknown central is cut off on its first read
+        out["registered"] = True
+        out["saved"] = mark_registered(c.found_name or name, c.address)
         try:
             await c.set_clock()
         except Exception as e:

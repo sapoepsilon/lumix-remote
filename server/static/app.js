@@ -1178,6 +1178,38 @@ function renderCamDetail() {
   $("camauto").checked = !(c.settings && c.settings.autoconnect === false);
   $("camwd").checked = !!(c.settings && c.settings.watchdog);
   $("camuse").hidden = c.id === state.camId;
+  renderBleCheck();
+}
+
+// "Check Bluetooth pairing": GET /api/ble/status?probe=1 logs in over BLE; when the camera
+// answers the reads, the server records the pairing (registered_at) and the UI shows "paired".
+const bleCheck = { running: null };
+async function checkBlePairing(id) {
+  if (!id || bleCheck.running) return;
+  haptic();
+  bleCheck.running = id;
+  renderBleCheck();
+  try {
+    const r = await fetch(`/api/cameras/${enc(id)}/ble/status?probe=1`);
+    let d = null;
+    try { d = await r.json(); } catch (_) { /* non-JSON */ }
+    const p = (d && d.probe) || {};
+    if (r.ok && d && d.registered && p.registered) { haptic([8, 30, 8]); toast("Paired: this computer can turn the camera on over Bluetooth"); }
+    else if (!r.ok || !d) toast(`Bluetooth check failed: server answered ${r.status}`, true);
+    else if (p.advertising === false) toast("Camera not found over Bluetooth. Turn it on (or check its Bluetooth is on) and try again.", true);
+    else toast("Not paired: " + (p.error || "the camera didn't accept this computer") + ". Pair it in Run setup again…", true);
+  } catch (e) {
+    toast("Lost the server: " + e.message, true);
+  }
+  bleCheck.running = null;
+  renderBleCheck();
+  await loadCameras();
+}
+function renderBleCheck() {
+  const busy = !!bleCheck.running;
+  $("camblecheck").disabled = busy;
+  $("camblechecksub").textContent = busy ? "Checking over Bluetooth… up to a minute"
+    : "Connects over Bluetooth; marks it paired if the camera knows this computer";
 }
 
 async function patchCamera(id, body, okMsg) {
@@ -1204,6 +1236,7 @@ function wireCameras() {
   $("camauto").addEventListener("change", (e) => patchCamera(camDetailId, { settings: { autoconnect: e.target.checked } }));
   $("camwd").addEventListener("change", (e) => patchCamera(camDetailId, { settings: { watchdog: e.target.checked } }));
   $("camuse").addEventListener("click", () => switchCamera(camDetailId, true));
+  $("camblecheck").addEventListener("click", () => checkBlePairing(camDetailId));
   $("camsetup").addEventListener("click", () => { const id = camDetailId; closeSheet(); openWizard({ camId: id, reuse: true, step: "wifi" }); });
   $("camremove").addEventListener("click", () => {
     const c = state.cameras.find((x) => x.id === camDetailId);
@@ -1707,7 +1740,9 @@ function quiesceToast(r) {
 // ---------------------------------------------------------------- Bluetooth wake
 // POST /api/ble/wake: BLE login + "start Wi-Fi via network". Powers the camera up from
 // off when its Remote Wakeup is on, then the server reconnects. Takes 30-90 s.
-const wake = { running: false, camId: null, t0: 0, secs: 0, ok: null, data: null, error: "", needPair: false, timer: null };
+// unsure: no recorded pairing (e.g. paired before the server saved it). We still try; a
+// successful wake records the pairing server-side, a failed one shows the pairing hint.
+const wake = { running: false, camId: null, t0: 0, secs: 0, ok: null, data: null, error: "", unsure: false, needPair: false, timer: null };
 function blePaired() { const c = currentCamera(); return !!(c && c.ble && c.ble.registered); }
 // worth offering: the server is up, a camera is set up, and it isn't connected
 function canWake(s) { return !!s && !["ready", "offline", "no_camera", "paused", "starting"].includes(s.status || "starting"); }
@@ -1715,8 +1750,7 @@ function canWake(s) { return !!s && !["ready", "offline", "no_camera", "paused",
 async function bleWake() {
   if (wake.running) return;
   haptic();
-  Object.assign(wake, { camId: state.camId, ok: null, data: null, error: "", needPair: !blePaired() });
-  if (wake.needPair) { renderWake(); return; }
+  Object.assign(wake, { camId: state.camId, ok: null, data: null, error: "", unsure: !blePaired(), needPair: false });
   wake.running = true; wake.t0 = Date.now(); wake.secs = 0;
   wake.timer = setInterval(() => { wake.secs = Math.round((Date.now() - wake.t0) / 1000); renderWake(); }, 1000);
   renderWake();
@@ -1732,6 +1766,7 @@ async function bleWake() {
   }
   clearInterval(wake.timer); wake.timer = null;
   wake.running = false; wake.secs = Math.round((Date.now() - wake.t0) / 1000);
+  wake.needPair = !wake.ok && wake.unsure;
   if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); } else toast("Bluetooth wake failed: " + wake.error, true);
   renderWake();
 }
@@ -1752,7 +1787,7 @@ function renderWake() {
   const label = wake.running ? `Turning on… ${wake.secs} s` : "Turn on over Bluetooth";
   $("wakelabel").textContent = label;
   $("wakesub").textContent = wake.running ? "Keep the camera near this computer. Takes up to 90 s."
-    : paired ? "Switches the camera on and joins it to Wi-Fi" : "Needs Bluetooth pairing first";
+    : paired ? "Switches the camera on and joins it to Wi-Fi" : "Pairing not confirmed; tries anyway";
   $("btnwake").disabled = wake.running;
   $("cswake").textContent = label;
   $("cswake").disabled = wake.running;
@@ -1765,12 +1800,13 @@ function renderWake() {
     if (wake.running) {
       box.className = "wake-state callout";
       box.replaceChildren(el("div", { class: "wake-head" }, el("span", { class: "spinner" }),
-        el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. ${wake.secs} s so far.`))));
+        el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. ${wake.secs} s so far.`
+          + (wake.unsure ? " This computer may not be paired yet; trying anyway." : "")))));
     } else if (wake.needPair) {
       box.className = "wake-state callout warn";
-      box.replaceChildren(el("b", {}, "Not paired over Bluetooth"),
-        el("span", {}, "Pair this computer once in Cameras › your camera › Run setup again… (Bluetooth step). To power up from off, the camera also needs Remote Wakeup on."),
-        el("button", { class: "link", onclick: openPairing }, "Run setup again…"));
+      box.replaceChildren(el("b", {}, "Couldn't turn it on. This computer may not be paired over Bluetooth"),
+        el("span", {}, wake.error.replace(/[.\s]+$/, "") + ". If it was never paired, pair it once in Cameras › your camera › Run setup again… (Bluetooth step). To power up from off, the camera also needs Remote Wakeup on."),
+        el("button", { class: "link", onclick: openPairing }, "Run setup again…"), wakeDetails());
     } else if (wake.ok) {
       box.className = "wake-state callout ok";
       box.replaceChildren(el("b", {}, "Camera is waking up"),

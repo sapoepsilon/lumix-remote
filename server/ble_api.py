@@ -1,6 +1,7 @@
 """Bluetooth power control: wake / power-cycle the camera, plus an opt-in watchdog.
 
 GET  /api/ble/status         manager state, last results; ?probe=1 also scans + reads info over BLE
+                             (a probe whose reads succeed records the pairing: "Check Bluetooth pairing")
 POST /api/ble/wake           BLE login + "start Wi-Fi via network" (powers up from OFF with Remote Wakeup ON)
 POST /api/ble/power-cycle    Wi-Fi camcmd poweroff -> wait -> BLE wake -> reconnect
 POST /api/ble/watchdog       {"enabled": true|false} toggle the watchdog at runtime
@@ -88,7 +89,8 @@ class BleManager:
     async def run(self, *args: str, timeout: float = 240) -> Dict[str, Any]:
         if not os.access(BLE_BIN, os.X_OK):
             return {"ok": False, "error": "bin/lumix-ble missing"}
-        name = self.name
+        name = self.name                 # (reloads the entry)
+        was_registered = self.registered
         cmd = [BLE_BIN] + (["--name", name] if name else []) + list(args)
         env = dict(os.environ)
         if self.session is not None:
@@ -131,10 +133,47 @@ class BleManager:
             self.history.append(entry)
             if self.session is not None:
                 self.session.reload()      # the subprocess may have updated cameras.json
+                await self._self_heal(args[0], res, was_registered)
             self.cam.log_event("ble", "%s -> %s (%.0fs)%s" % (
                 args[0], "ok" if entry["ok"] else "FAILED", entry["elapsed_s"],
                 (": %s" % entry["error"]) if entry["error"] else ""))
             return res
+
+    @property
+    def registered(self) -> bool:
+        if self.session is None:
+            return False
+        return bool((self.session.entry.get("ble") or {}).get("registered_at"))
+
+    async def _self_heal(self, cmd: str, res: Dict[str, Any], was_registered: bool) -> None:
+        """A BLE login whose reads went through proves the camera knows this
+        computer (an unknown central is cut off on its first read). If the entry
+        has no registered_at yet -- a pairing from before it was saved --
+        record it, so the UI stops saying "not paired". lumix-ble saves it too;
+        this covers an older helper or a failed write, and tells the UI."""
+        proved = res.get("registered") is True or (cmd == "wake" and bool(res.get("ok")))
+        if not proved or self.session is None or was_registered:
+            return
+        if self.registered:              # lumix-ble already saved it
+            self.cam.log_event("ble", "Bluetooth pairing confirmed (%s)" % cmd)
+            with contextlib.suppress(Exception):
+                self.session.mgr.notify()
+            return
+        adv = res.get("adv") or {}
+        ble: Dict[str, Any] = {"registered_at": int(time.time())}
+        old = self.session.entry.get("ble") or {}
+        if adv.get("name") and not old.get("name"):
+            ble["name"] = adv["name"]
+        if adv.get("address") and not old.get("address"):
+            ble["address"] = adv["address"]
+        try:
+            await self.session.mgr.update(self.session.id, ble=ble)
+        except Exception:
+            log.exception("could not save BLE registration")
+            return
+        self.cam.log_event("ble", "Bluetooth pairing confirmed (%s); saved" % cmd)
+        with contextlib.suppress(Exception):
+            self.session.mgr.notify()
 
     # --------------------------------------------------------------- actions
     async def wake(self) -> Dict[str, Any]:
@@ -253,8 +292,7 @@ class BleManager:
         return {
             "camera_id": self.session.id if self.session is not None else None,
             "name": self.name, "running": self.running, "busy": self.lock.locked(),
-            "registered": bool(((self.session.entry.get("ble") or {}) if self.session is not None
-                                else {}).get("registered_at")),
+            "registered": self.registered,
             "history": list(self.history),
             "watchdog": {"enabled": self.watchdog_enabled, "wedge_after_s": self.wedge_after,
                          "max_per_hour": self.max_per_hour, "cycles_last_hour":
@@ -276,6 +314,7 @@ async def ble_status(request: web.Request) -> web.Response:
             out["probe"] = {"ok": False, "error": "busy (%s)" % m.running}
         else:
             out["probe"] = await m.run("status", timeout=60)
+            out["registered"] = m.registered     # a successful probe marks it paired
     return _json(out)
 
 
