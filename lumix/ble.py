@@ -92,11 +92,24 @@ def login_responses(challenge: bytes) -> Tuple[bytes, bytes]:
     return (struct.pack(">5I", *[n ^ k for k in _K1]), struct.pack(">5I", *[n ^ k for k in _K2]))
 
 
+def _client_id() -> str:
+    """The selected camera's client UUID (cameras.json), else this machine's
+    default 4D454930-0100-1000-8001-<12 hex of the MAC>; the same id the Wi-Fi
+    req_acc uses, so the camera knows us on both links."""
+    try:
+        reg, cid = _camera_entry()
+        e = reg.get(cid) if cid else None
+        if e and e.get("client_uuid"):
+            return str(e["client_uuid"])
+    except Exception:
+        pass
+    from .registry import default_client_uuid
+    return default_client_uuid()
+
+
 def client_uuid_bytes() -> bytes:
-    """16-byte LUMIX Sync client id; same identity as the Wi-Fi req_acc uuid
-    (lumix.camera._client_uuid): 4D454930-0100-1000-8001-<12 hex of the MAC>."""
-    import uuid as _uuid
-    return bytes.fromhex("4D454930010010008001%012X" % (_uuid.getnode() & 0xFFFFFFFFFFFF))
+    """16-byte LUMIX Sync client id (see _client_id)."""
+    return bytes.fromhex(_client_id().replace("-", ""))
 
 
 def clock_payload(now: Optional[_dt.datetime] = None) -> bytes:
@@ -115,33 +128,47 @@ def ssid_payload(ssid: str) -> bytes:
     return raw.ljust(32, b"\0")
 
 
-CONFIG_PATH = None  # set lazily: ~/.config/lumix-remote/ble.json (LUMIX_REMOTE_HOME overrides the dir)
 CH_CAMERA_STA_SSID = "9c781c60-3218-11e6-9932-" + _T     # read: 1 byte + saved home SSID (S5)
 
+# Per-camera BLE data lives in the camera's entry of ~/.config/lumix-remote/cameras.json
+# ("ble": name, address, identity, home_ssid, registered_at). LUMIX_CAMERA_ID picks the
+# camera (the server sets it for every lumix-ble subprocess); default = the active one.
+_BLE_KEYS = {"camera_name": "name", "address": "address", "identity": "identity",
+             "home_ssid": "home_ssid", "registered_at": "registered_at"}
 
-def _config_path() -> str:
+
+def _camera_entry() -> "Tuple[Any, Optional[str]]":
     import os
-    d = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/lumix-remote"))
-    return os.path.join(d, "ble.json")
+    from . import registry
+    reg = registry.Registry()
+    registry.migrate(reg)      # older single-camera ble.json/state.json
+    return reg, os.environ.get("LUMIX_CAMERA_ID") or reg.active_id()
 
 
 def load_config() -> Dict[str, Any]:
-    import json
-    try:
-        with open(_config_path()) as f:
-            return json.load(f)
-    except (OSError, ValueError):
+    """BLE data of the selected camera, with the old ble.json key names."""
+    reg, cid = _camera_entry()
+    e = reg.get(cid) if cid else None
+    if not e:
         return {}
+    b = e.get("ble") or {}
+    out = {old: b.get(new) for old, new in _BLE_KEYS.items() if b.get(new) is not None}
+    if e.get("fixed_ip") or e.get("last_ip"):
+        out["last_ip"] = e.get("fixed_ip") or e.get("last_ip")
+    return out
 
 
 def save_config(**kw: Any) -> None:
-    import json
-    import os
-    cfg = load_config()
-    cfg.update({k: v for k, v in kw.items() if v is not None})
-    os.makedirs(os.path.dirname(_config_path()), exist_ok=True)
-    with open(_config_path(), "w") as f:
-        json.dump(cfg, f, indent=1)
+    reg, cid = _camera_entry()
+    ble = {_BLE_KEYS[k]: v for k, v in kw.items() if k in _BLE_KEYS}
+    if not ble:
+        return
+    if cid is None or reg.get(cid) is None:
+        name = kw.get("camera_name")
+        m = NAME_RE.match(name or "")
+        reg.add(name.split("-")[0] if m else "Camera", ble=ble)
+        return
+    reg.update(cid, ble=ble)
 
 
 def parse_sta_ssid(raw: bytes) -> Optional[str]:
@@ -154,7 +181,7 @@ def parse_sta_ssid(raw: bytes) -> Optional[str]:
 
 def current_ssid() -> Optional[str]:
     """Home network for "join network". Not secret. Order: LUMIX_HOME_SSID,
-    ~/.config/lumix-remote/ble.json "home_ssid" (saved from the camera's own
+    the camera's "home_ssid" in cameras.json (saved from the camera's own
     9c781c60 value by register/wake), the SSID macOS reports (redacted without Location permission), then the
     first entry of the Wi-Fi preferred-networks list."""
     import os
@@ -455,12 +482,9 @@ async def status(name: Optional[str] = None, log: Callable[[str], None] = print,
 
 
 def _last_ip() -> Optional[str]:
-    import json
-    import os
     try:
-        with open(os.path.expanduser("~/.config/lumix-remote/state.json")) as f:
-            return json.load(f).get("last_ip")
-    except (OSError, ValueError):
+        return load_config().get("last_ip")
+    except Exception:
         return None
 
 
@@ -521,15 +545,17 @@ def wifi_poweroff(ip: str, server: Optional[str], log: Callable[[str], None] = p
     import urllib.request
     if server:
         try:
-            req = urllib.request.Request(server.rstrip("/") + "/api/power/off", data=b"{\"confirm\": true}",
+            import os
+            cam = os.environ.get("LUMIX_CAMERA_ID")
+            path = "/api/cameras/%s/power/off" % cam if cam else "/api/power/off"
+            req = urllib.request.Request(server.rstrip("/") + path, data=b"{\"confirm\": true}",
                                          headers={"Content-Type": "application/json"}, method="POST")
             with urllib.request.urlopen(req, timeout=15) as r:
                 return {"via": "server", "reply": json.loads(r.read() or b"{}")}
         except Exception as e:
             log("server poweroff failed (%s); trying the camera directly" % e)
-    import uuid as _uuid
-    # Same client id as lumix.camera._client_uuid(), so the camera knows us already.
-    cid = "4D454930-0100-1000-8001-%012X" % (_uuid.getnode() & 0xFFFFFFFFFFFF)
+    # Same client id as the server's req_acc, so the camera knows us already.
+    cid = _client_id()
     base = "http://%s/cam.cgi?" % ip
     replies = []
     for q in ("mode=accctrl&type=req_acc&value=%s&value2=LumixRemote" % cid,
@@ -620,10 +646,9 @@ async def first_register(name: Optional[str] = None, wait: float = 300.0, wifi_i
     4. Forget the camera AP and toggle Wi-Fi so macOS rejoins the home network.
     The AP password is used in-process only and never logged or returned.
     """
-    import uuid as _uuid
     t0 = time.time()
     out: Dict[str, Any] = {"ok": False}
-    cid = "4D454930-0100-1000-8001-%012X" % (_uuid.getnode() & 0xFFFFFFFFFFFF)
+    cid = _client_id()
     while time.time() - t0 < wait:
         res = await scan(5.0, name)
         if any(r.get("state_byte") == 3 for r in res):
@@ -677,6 +702,7 @@ async def first_register(name: Optional[str] = None, wait: float = 300.0, wifi_i
                 await asyncio.sleep(1)
             out["home_ip_after"] = _sh("ipconfig", "getifaddr", wifi_if)
     if out["ok"]:
-        save_config(camera_name=name or ap_ssid, registered_at=int(time.time()))
+        save_config(camera_name=name or ap_ssid, registered_at=int(time.time()),
+                    identity=cid, address=getattr(getattr(c, "client", None), "address", None))
     out["elapsed_s"] = round(time.time() - t0, 1)
     return out

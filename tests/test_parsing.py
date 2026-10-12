@@ -1,3 +1,4 @@
+import isolate  # noqa: F401  (temp config dir; must come first)
 import os
 import struct
 import unittest

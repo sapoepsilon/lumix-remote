@@ -1,4 +1,5 @@
 """FileBrowser paging over a fake ContentDirectory (no camera needed)."""
+import isolate  # noqa: F401  (temp config dir; must come first)
 import asyncio
 import unittest
 
