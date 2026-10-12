@@ -1,0 +1,46 @@
+# XcodeGen spec for "Lumix Remote Camera.app" + its CoreMediaIO camera extension.
+# Do not open/commit a generated .xcodeproj: scripts/build-webcam.sh generates it with
+# LUMIX_TEAM_ID (your Apple Developer team) and LUMIX_BUNDLE_PREFIX from the environment.
+name: LumixRemoteCamera
+options:
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: ${LUMIX_TEAM_ID}
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    LUMIX_APP_ID: ${LUMIX_BUNDLE_PREFIX}.LumixRemoteCamera
+targets:
+  LumixRemoteCamera:
+    type: application
+    platform: macOS
+    sources: [App]
+    settings:
+      base:
+        PRODUCT_NAME: "Lumix Remote Camera"
+        PRODUCT_BUNDLE_IDENTIFIER: $(LUMIX_APP_ID)
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+    dependencies:
+      - target: CameraExtension
+        embed: true
+        codeSign: true
+  CameraExtension:
+    type: system-extension
+    platform: macOS
+    sources: [CameraExtension]
+    settings:
+      base:
+        PRODUCT_NAME: "$(LUMIX_APP_ID).CameraExtension"
+        PRODUCT_BUNDLE_IDENTIFIER: $(LUMIX_APP_ID).CameraExtension
+        INFOPLIST_FILE: CameraExtension/Info.plist
+        CODE_SIGN_ENTITLEMENTS: CameraExtension/CameraExtension.entitlements
+        SKIP_INSTALL: YES

@@ -679,6 +679,8 @@ server/           aiohttp app (API, MJPEG, WebSocket) + static UI
   quiesce.py      quiesce/resume: power-off, server stop, removal, files <-> shooting
   static/         web UI (index.html, app.js, style.css, manifest, icons)
 lumixcli/         `lumix` command line client (HTTP API only)
+macos/            "Lumix Remote Camera.app" + CoreMediaIO camera extension (webcam; XcodeGen
+                  project.yml, built by scripts/build-webcam.sh)
 bin/lumix         CLI wrapper (uses .venv)
 tests/            unit tests: real S5 menu dumps, CLI against a fake server, profiles,
                   registry/migration, multi-camera routing; test_timelapse_emu.py runs
@@ -739,6 +741,45 @@ back-off (10 s .. 120 s), never while the camera is busy or wedged.
 - **Camera models:** `docs/camera-models.md`.
 - **Events:** `camera.bus.publish(kind, data)` reaches every WebSocket client;
   `camera.log_event(kind, text)` adds to the event log.
+
+## Use as a webcam
+
+`macos/` holds **Lumix Remote Camera.app**, a small host app with a CoreMediaIO camera
+extension (the modern macOS 13+ virtual camera; no OBS, no DAL plug-in). It adds a camera
+called **Lumix S5 (Wi-Fi)** that Zoom, FaceTime, Google Meet, Photo Booth and any other
+AVFoundation app can pick.
+
+- The extension reads `GET /api/liveview.mjpg` from the server (default
+  `http://127.0.0.1:8770`; set another server, a full MJPEG URL or a `.jpg` snapshot URL in the
+  app's *Source* field). It only connects while an app is actually using the camera.
+- Output: 1920x1080 or 1280x720, 30 fps, BGRA. The 640x360 live view is aspect-fit with
+  Lanczos scaling plus light luminance sharpening; the last frame repeats when the camera is
+  slower than 30 fps, and a "Camera offline" card shows after ~2.5 s without frames.
+- Keep the Lumix Remote server running with the camera connected; the webcam is a viewer, it
+  sends no camera commands.
+
+Build and install (needs Xcode, `brew install xcodegen`, and a paid Apple Developer Program
+team signed in under Xcode > Settings > Accounts; camera extensions need the System
+Extension capability, which free accounts don't get):
+
+```bash
+scripts/build-webcam.sh                 # build, copy to /Applications, request activation
+scripts/build-webcam.sh --build         # build only (macos/build/)
+scripts/build-webcam.sh --uninstall     # remove the extension
+LUMIX_TEAM_ID=ABCDE12345 LUMIX_BUNDLE_PREFIX=com.example scripts/build-webcam.sh
+```
+
+The team id defaults to the one in your "Apple Development" certificate; the bundle ids
+default to `io.github.lumixremote.LumixRemoteCamera[.CameraExtension]`. The first install
+needs one approval:
+
+- Open System Settings.
+- General > Login Items & Extensions.
+- Camera Extensions: turn on Lumix Remote Camera.
+
+Check it: `system_profiler SPCameraDataType` lists *Lumix S5 (Wi-Fi)*, and
+`swift macos/tools/webcam-check.swift /tmp/lumix-webcam-frame.png` lists cameras and saves
+one frame from it. Extension logs: `log stream --predicate 'subsystem == "lumixremote.camera"'`.
 
 ## Known issues
 
