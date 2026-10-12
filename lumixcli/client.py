@@ -54,10 +54,26 @@ class CameraError(CliError):
         self.result = result
 
 
+GLOBAL_PATHS = ("/api/cameras", "/api/models")
+
+
 class Client:
-    def __init__(self, base: Optional[str] = None, timeout: float = 30.0):
+    """``camera``: send camera routes to /api/cameras/<camera>/... instead of the
+    server's active camera (env LUMIX_CAMERA)."""
+
+    def __init__(self, base: Optional[str] = None, timeout: float = 30.0,
+                 camera: Optional[str] = None):
         self.base = normalize_url(base)
         self.timeout = timeout
+        self.camera = camera if camera is not None else (os.environ.get("LUMIX_CAMERA") or None)
+
+    def path(self, path: str) -> str:
+        """/api/x -> /api/cameras/<camera>/x when a camera is selected."""
+        if (not self.camera or not path.startswith("/api/")
+                or any(path == g or path.startswith(g + "/") or path.startswith(g + "?")
+                       for g in GLOBAL_PATHS)):
+            return path
+        return "/api/cameras/%s/%s" % (urllib.parse.quote(self.camera, safe=""), path[len("/api/"):])
 
     # ----------------------------------------------------------- transport
     def _request(self, method: str, path: str, body: Any = None,
@@ -67,7 +83,8 @@ class Client:
         if body is not None:
             data = json.dumps(body).encode()
             headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+        req = urllib.request.Request(self.base + self.path(path), data=data, method=method,
+                                     headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                 return r.status, r.headers.get("Content-Type", ""), r.read()
@@ -109,10 +126,16 @@ class Client:
             raise HttpError(status, "server %d: %s" % (status, msg))
         return raw
 
+    def patch(self, path: str, body: Any = None, **kw: Any) -> Any:
+        return self.call("PATCH", path, body if body is not None else {}, **kw)
+
+    def delete(self, path: str, **kw: Any) -> Any:
+        return self.call("DELETE", path, **kw)
+
     def ws_url(self, path: str = "/api/ws") -> str:
         p = urllib.parse.urlsplit(self.base)
         scheme = "wss" if p.scheme == "https" else "ws"
-        return urllib.parse.urlunsplit((scheme, p.netloc, p.path + path, "", ""))
+        return urllib.parse.urlunsplit((scheme, p.netloc, p.path + self.path(path), "", ""))
 
     def reachable(self) -> bool:
         try:

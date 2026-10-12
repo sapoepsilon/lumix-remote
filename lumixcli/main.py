@@ -15,7 +15,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
 from . import resolve, servermgr
-from .client import CameraError, CliError, Client, check
+from .client import CameraError, CliError, Client, ServerUnreachable, check
 from .resolve import ResolveError, short_id
 
 EXIT_USAGE = 2
@@ -470,6 +470,115 @@ def cmd_server(c: Client, a: argparse.Namespace) -> int:
         raise CliError(str(e))
 
 
+# ----------------------------------------------------------------- cameras
+def fmt_cameras(d: Dict[str, Any]) -> str:
+    cams = d.get("cameras") or []
+    if not cams:
+        return "no cameras set up (lumix cameras add NAME, or open the web UI)"
+    rows = []
+    for cam in cams:
+        info = cam.get("camera") or {}
+        prof = cam.get("profile") or {}
+        model = info.get("modelNumber") or prof.get("name") or cam.get("model")
+        rows.append("%s %-14s %-16s %-14s %-12s %s%s" % (
+            "*" if cam.get("active") else " ", cam["id"], cam.get("nickname") or "", model or "?",
+            cam.get("status") or "-", cam.get("ip") or "",
+            "  [ble]" if (cam.get("ble") or {}).get("registered") else ""))
+    if d.get("offline"):
+        rows.append("(server not running: read from %s)" % d.get("path"))
+    return "\n".join(rows)
+
+
+def _registry():
+    from lumix import registry
+    reg = registry.Registry()
+    registry.migrate(reg)
+    return registry, reg
+
+
+def _offline_list() -> Dict[str, Any]:
+    registry, reg = _registry()
+    d = reg.load()
+    cams = [{"id": e["id"], "nickname": e.get("nickname"), "active": e["id"] == d["active"],
+             "model": e.get("model"), "profile": {"name": e.get("model")},
+             "camera": {"modelNumber": e.get("model_number"), "friendlyName": e.get("friendly_name")},
+             "status": "offline", "ip": e.get("fixed_ip") or e.get("last_ip"),
+             "ble": {"registered": bool((e.get("ble") or {}).get("registered_at"))}}
+            for e in d["cameras"]]
+    return {"active": d["active"], "cameras": cams, "offline": True, "path": reg.path}
+
+
+def _cam_path(cam_id: str, tail: str = "") -> str:
+    return "/api/cameras/%s%s" % (urllib.parse.quote(cam_id, safe=""), tail)
+
+
+def cmd_cameras(c: Client, a: argparse.Namespace) -> int:
+    """Registry commands. Through the server when it runs (sessions start/stop
+    right away), else straight on ~/.config/lumix-remote/cameras.json."""
+    action = a.cameras_cmd
+    try:
+        if action == "list":
+            out(a, c.get("/api/cameras"), fmt_cameras)
+        elif action == "add":
+            body: Dict[str, Any] = {"nickname": a.name}
+            if a.model:
+                body["model"] = a.model
+            if a.ip:
+                body["ip"] = a.ip
+            ports = {k: v for k, v in (("http", a.http_port), ("upnp", a.upnp_port),
+                                       ("files", a.files_port)) if v}
+            if ports:
+                body["ports"] = ports
+            if a.use:
+                body["activate"] = True
+            r = c.post("/api/cameras", body)
+            out(a, r, lambda r: "added %s (%s)%s" % (r["id"], r.get("nickname"),
+                                                    ", now active" if r.get("active") else ""))
+        elif action == "remove":
+            r = c.delete(_cam_path(a.id))
+            out(a, r, lambda r: "removed %s%s" % (r["removed"], "; active: %s" % r["active"] if r.get("active") else ""))
+        elif action == "use":
+            r = c.post(_cam_path(a.id, "/activate"))
+            out(a, r, lambda r: "active camera: %s (%s)" % (r["id"], r.get("nickname")))
+        elif action == "rename":
+            r = c.patch(_cam_path(a.id), {"nickname": a.name})
+            out(a, r, lambda r: "%s is now %r" % (r["id"], r.get("nickname")))
+        return 0
+    except ServerUnreachable:
+        pass
+    registry, reg = _registry()
+    try:
+        if action == "list":
+            out(a, _offline_list(), fmt_cameras)
+            return 0
+        if action == "add":
+            ports = {k: v for k, v in (("http", a.http_port), ("upnp", a.upnp_port),
+                                       ("files", a.files_port)) if v}
+            fields: Dict[str, Any] = {"model": a.model or "auto"}
+            if a.ip:
+                fields["fixed_ip"] = a.ip
+            if ports:
+                fields["ports"] = ports
+            e = reg.add(a.name, activate=a.use, **fields)
+            out(a, e, lambda e: "added %s (%s) to %s" % (e["id"], e["nickname"], reg.path))
+            return 0
+        e = reg.find(a.id)
+        if e is None:
+            raise registry.RegistryError("no camera %r (see lumix cameras list)" % a.id)
+        if action == "remove":
+            reg.remove(e["id"])
+            out(a, {"removed": e["id"]}, lambda d: "removed %s" % d["removed"])
+        elif action == "use":
+            reg.set_active(e["id"])
+            out(a, {"active": e["id"]}, lambda d: "active camera: %s" % d["active"])
+        elif action == "rename":
+            e = reg.rename(e["id"], a.name)
+            out(a, e, lambda e: "%s is now %r" % (e["id"], e["nickname"]))
+    except registry.RegistryError as e:
+        raise ResolveError(str(e))
+    return 0
+
+
 def cmd_coming_soon(c: Client, a: argparse.Namespace) -> int:
     sys.stderr.write("lumix %s: coming soon (the server exposes no %s API yet)\n" % (a.feature, a.feature))
     return 1
@@ -480,10 +589,10 @@ COMPLETION = r'''# lumix shell completion. bash: eval "$(lumix completion bash)"
 _lumix() {
   local cur prev words cword
   cur="${COMP_WORDS[COMP_CWORD]}"; prev="${COMP_WORDS[COMP_CWORD-1]}"
-  local cmds="status info state get set settings shoot video af focus zoom cmd snapshot events poweroff server timelapse files completion"
+  local cmds="status info state get set settings shoot video af focus zoom cmd snapshot events poweroff cameras server timelapse files completion"
   local i sub="" n=0
   for ((i=1; i<COMP_CWORD; i++)); do
-    case "${COMP_WORDS[i]}" in --server|--timeout) ((i++));; -*) ;; *) [ -z "$sub" ] && sub="${COMP_WORDS[i]}"; ((n++));; esac
+    case "${COMP_WORDS[i]}" in --server|--timeout|--camera) ((i++));; -*) ;; *) [ -z "$sub" ] && sub="${COMP_WORDS[i]}"; ((n++));; esac
   done
   case "$sub" in
     "") COMPREPLY=($(compgen -W "$cmds" -- "$cur"));;
@@ -495,6 +604,8 @@ _lumix() {
     video) COMPREPLY=($(compgen -W "start stop toggle" -- "$cur"));;
     zoom) COMPREPLY=($(compgen -W "tele wide stop --fast" -- "$cur"));;
     server) COMPREPLY=($(compgen -W "start stop status" -- "$cur"));;
+    cameras) if [ $n -eq 1 ]; then COMPREPLY=($(compgen -W "list add remove use rename" -- "$cur"));
+             else COMPREPLY=($(compgen -W "$(lumix cameras list --json 2>/dev/null | python3 -c 'import json,sys; print(" ".join(c["id"] for c in json.load(sys.stdin)["cameras"]))' 2>/dev/null)" -- "$cur")); fi;;
     completion) COMPREPLY=($(compgen -W "bash zsh" -- "$cur"));;
   esac
 }
@@ -515,6 +626,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                         help="machine-readable JSON output")
     common.add_argument("--timeout", type=float, default=argparse.SUPPRESS, help="HTTP timeout in seconds")
+    common.add_argument("--camera", "-c", default=argparse.SUPPRESS, metavar="ID",
+                        help="camera id or nickname (env LUMIX_CAMERA, default: the server's active camera)")
 
     p = argparse.ArgumentParser(
         prog="lumix", description="Control a Lumix camera through the Lumix Remote server.",
@@ -523,6 +636,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="server URL (env LUMIX_SERVER, default 127.0.0.1:8770)")
     p.add_argument("--json", action="store_true", default=False, help="machine-readable JSON output")
     p.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout in seconds (default 30)")
+    p.add_argument("--camera", "-c", default=None, metavar="ID",
+                   help="camera id or nickname (env LUMIX_CAMERA, default: the server's active camera)")
     sub = p.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
@@ -581,6 +696,31 @@ def build_parser() -> argparse.ArgumentParser:
     sp = add("poweroff", cmd_poweroff, "power the camera off (cannot be switched back on over Wi-Fi)")
     sp.add_argument("--yes", action="store_true", help="really power off")
 
+    sp = add("cameras", None, "list / add / remove / use / rename cameras (works without the server too)")
+    cs = sp.add_subparsers(dest="cameras_cmd", metavar="list|add|remove|use|rename")
+    cs.required = True
+    cp = cs.add_parser("list", parents=[common], help="registered cameras ('*' = active)")
+    cp.set_defaults(fn=cmd_cameras)
+    cp = cs.add_parser("add", parents=[common], help="register a camera (the server finds it on the LAN)")
+    cp.add_argument("name", help="nickname, e.g. \"S5 B-cam\" (the id is derived from it)")
+    cp.add_argument("--model", help="model profile id (default auto-detect; see GET /api/models)")
+    cp.add_argument("--ip", help="fixed camera IP (default: discover)")
+    cp.add_argument("--http-port", type=int, help="camera cam.cgi port (emulator)")
+    cp.add_argument("--upnp-port", type=int, help="camera :60606 port (emulator)")
+    cp.add_argument("--files-port", type=int, help="camera :50001 port (emulator)")
+    cp.add_argument("--use", action="store_true", help="make it the active camera")
+    cp.set_defaults(fn=cmd_cameras)
+    cp = cs.add_parser("remove", parents=[common], help="forget a camera")
+    cp.add_argument("id")
+    cp.set_defaults(fn=cmd_cameras)
+    cp = cs.add_parser("use", parents=[common], help="make a camera the active one")
+    cp.add_argument("id")
+    cp.set_defaults(fn=cmd_cameras)
+    cp = cs.add_parser("rename", parents=[common], help="change a camera's nickname")
+    cp.add_argument("id")
+    cp.add_argument("name")
+    cp.set_defaults(fn=cmd_cameras)
+
     sp = add("server", cmd_server, "start/stop/status of the background web server (./run.sh)")
     sp.add_argument("action", choices=["start", "stop", "status"])
     sp.add_argument("extra", nargs=argparse.REMAINDER,
@@ -607,7 +747,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.error("unrecognized arguments: %s" % " ".join(extra))
     if getattr(a, "extra", None) and a.extra[0] == "--":
         a.extra = a.extra[1:]
-    c = Client(a.server, timeout=a.timeout)
+    c = Client(a.server, timeout=a.timeout, camera=a.camera)
     try:
         return a.fn(c, a)
     except ResolveError as e:

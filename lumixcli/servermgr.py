@@ -1,4 +1,10 @@
-"""`lumix server start|stop|status`: run ./run.sh in the background with a pidfile."""
+"""`lumix server start|stop|status`: run ./run.sh in the background with a pidfile.
+
+The pidfile is the server's own (~/.config/lumix-remote/server.pid, see
+lumix.registry.pidfile_path): the server writes it at start-up too, so `stop`
+also finds a server started with ./run.sh. A logs/lumix-server.pid left by an
+older version is adopted once.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,8 @@ import time
 import urllib.parse
 from typing import List, Optional
 
+from lumix.registry import migrate_pidfile, pidfile_path
+
 from .client import Client
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,7 +25,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 def _paths() -> "tuple[str, str, str]":
     run_sh = os.environ.get("LUMIX_RUN_SH") or os.path.join(ROOT, "run.sh")
     log_dir = os.environ.get("LUMIX_LOG_DIR") or os.path.join(ROOT, "logs")
-    return run_sh, os.path.join(log_dir, "lumix-server.pid"), os.path.join(log_dir, "lumix-server.log")
+    migrate_pidfile([os.path.join(log_dir, "lumix-server.pid")])
+    return run_sh, pidfile_path(), os.path.join(log_dir, "lumix-server.log")
 
 
 def read_pid(pidfile: str) -> Optional[int]:
@@ -53,6 +62,7 @@ def start(client: Client, extra: List[str], wait: float = 20.0) -> dict:
     if pid is not None:
         raise RuntimeError("pid %d from %s is alive but %s does not answer; "
                            "`lumix server stop` first" % (pid, pidfile, client.base))
+    os.makedirs(os.path.dirname(logfile), exist_ok=True)
     args = list(extra)
     port = urllib.parse.urlsplit(client.base).port
     if port and port != 8770 and "--port" not in args:
@@ -90,7 +100,7 @@ def stop(client: Client, wait: float = 10.0) -> dict:
             os.unlink(pidfile)
         msg = "not running (no live pid in %s)" % pidfile
         if client.reachable():
-            msg += "; a server not started by `lumix server start` answers at %s, stop it yourself" % client.base
+            msg += "; a server without a pidfile answers at %s, stop it yourself" % client.base
         return {"stopped": False, "message": msg}
     # run.sh execs python, so the pid is the server; signal its group to be safe
     for sig in (signal.SIGTERM, signal.SIGKILL):
@@ -107,7 +117,8 @@ def stop(client: Client, wait: float = 10.0) -> dict:
             time.sleep(0.2)
         if read_pid(pidfile) is None:
             break
-    os.unlink(pidfile)
+    if os.path.exists(pidfile):
+        os.unlink(pidfile)
     return {"stopped": True, "pid": pid, "message": "stopped pid %d" % pid}
 
 

@@ -2,6 +2,7 @@
 
 Run: .venv/bin/python -m unittest discover -s tests
 """
+import isolate  # noqa: F401  (temp config dir; must come first)
 
 import asyncio
 import contextlib
@@ -17,7 +18,9 @@ import unittest
 
 from aiohttp import web
 
-from lumixcli import resolve
+from lumix import registry
+from lumixcli import resolve, servermgr
+from lumixcli.client import Client
 from lumixcli.main import main
 
 
@@ -331,6 +334,93 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.cli("files")[0], 1)
 
 
+class CamerasCliTest(unittest.TestCase):
+    """`--camera` routing and `lumix cameras ...`, through the server and offline."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = FakeServer()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.close()
+
+    def setUp(self):
+        self.srv.requests.clear()
+        self.srv.overrides.clear()
+
+    def test_camera_flag_namespaces_camera_routes(self):
+        self.srv.overrides["GET /api/cameras/b-cam/status"] = (200, dict(STATUS, camera_id="b-cam"))
+        code, out, err = run(self.srv.url, "--camera", "b-cam", "status")
+        self.assertEqual(code, 0, err)
+        code, out, err = run(self.srv.url, "shoot", "-c", "b-cam")
+        paths = [p for _, p, _ in self.srv.requests]
+        self.assertIn("/api/cameras/b-cam/status", paths)
+        self.assertIn("/api/cameras/b-cam/capture", paths)
+        os.environ["LUMIX_CAMERA"] = "b-cam"
+        try:
+            run(self.srv.url, "info")
+        finally:
+            del os.environ["LUMIX_CAMERA"]
+        self.assertIn("/api/cameras/b-cam/info", [p for _, p, _ in self.srv.requests])
+        c = Client("http://x", camera="b cam")
+        self.assertEqual(c.path("/api/cameras"), "/api/cameras")
+        self.assertEqual(c.path("/api/models/dc_s5"), "/api/models/dc_s5")
+        self.assertEqual(c.path("/api/files?limit=3"), "/api/cameras/b%20cam/files?limit=3")
+        self.assertTrue(c.ws_url().endswith("/api/cameras/b%20cam/ws"))
+
+    def test_cameras_commands_via_server(self):
+        cams = {"active": "s5", "cameras": [
+            {"id": "s5", "nickname": "S5", "active": True, "status": "ready", "ip": "10.0.0.5",
+             "camera": {"modelNumber": "DC-S5"}, "profile": {"name": "Lumix S5"}, "ble": {"registered": True}},
+            {"id": "b", "nickname": "B", "active": False, "status": "discovering", "ip": None,
+             "camera": {}, "profile": {"name": "Other"}, "ble": {}}]}
+        self.srv.overrides.update({
+            "GET /api/cameras": (200, cams),
+            "POST /api/cameras": (201, {"id": "studio", "nickname": "Studio", "active": False}),
+            "POST /api/cameras/b/activate": (200, {"id": "b", "nickname": "B"}),
+            "PATCH /api/cameras/b": (200, {"id": "b", "nickname": "Bee"}),
+            "DELETE /api/cameras/b": (200, {"removed": "b", "active": "s5"}),
+        })
+        code, out, err = run(self.srv.url, "cameras", "list")
+        self.assertEqual(code, 0, err)
+        self.assertIn("* s5", out)
+        self.assertIn("[ble]", out)
+        code, out, _ = run(self.srv.url, "cameras", "add", "Studio", "--model", "dc_s5", "--ip", "10.0.0.7",
+                           "--http-port", "8080")
+        self.assertIn("added studio", out)
+        body = [b for m, p, b in self.srv.requests if m == "POST" and p == "/api/cameras"][0]
+        self.assertEqual(body, {"nickname": "Studio", "model": "dc_s5", "ip": "10.0.0.7", "ports": {"http": 8080}})
+        self.assertIn("active camera: b", run(self.srv.url, "cameras", "use", "b")[1])
+        self.assertIn("'Bee'", run(self.srv.url, "cameras", "rename", "b", "Bee")[1])
+        self.assertIn("removed b", run(self.srv.url, "cameras", "remove", "b")[1])
+
+    def test_cameras_offline_edits_registry(self):
+        with tempfile.TemporaryDirectory() as d:
+            home = os.environ.get("LUMIX_REMOTE_HOME")
+            os.environ["LUMIX_REMOTE_HOME"] = d
+            dead = "http://127.0.0.1:9"
+            try:
+                self.assertIn("added a-cam", run(dead, "cameras", "add", "A cam")[1])
+                self.assertIn("added b-cam", run(dead, "cameras", "add", "B cam", "--ip", "127.0.0.1",
+                                                 "--http-port", "8080")[1])
+                code, out, _ = run(dead, "cameras", "list")
+                self.assertIn("* a-cam", out)
+                self.assertIn("server not running", out)
+                run(dead, "cameras", "use", "B cam")
+                run(dead, "cameras", "rename", "a-cam", "Main")
+                reg = registry.Registry()
+                self.assertEqual(reg.active_id(), "b-cam")
+                self.assertEqual(reg.get("a-cam")["nickname"], "Main")
+                self.assertEqual(reg.get("b-cam")["ports"]["http"], 8080)
+                run(dead, "cameras", "remove", "b-cam")
+                self.assertEqual([c["id"] for c in reg.cameras()], ["a-cam"])
+                self.assertEqual(run(dead, "cameras", "use", "nope")[0], 2)
+            finally:
+                if home:
+                    os.environ["LUMIX_REMOTE_HOME"] = home
+
+
 class ResolveTest(unittest.TestCase):
     def test_find_setting(self):
         s = [ISO, EXPO, PEAK]
@@ -379,14 +469,17 @@ class ServerManagerTest(unittest.TestCase):
             port = s.getsockname()[1]
             s.close()
             url = "http://127.0.0.1:%d" % port
-            os.environ.update(LUMIX_RUN_SH=script, LUMIX_LOG_DIR=d)
+            home = os.environ.get("LUMIX_REMOTE_HOME")
+            os.environ.update(LUMIX_RUN_SH=script, LUMIX_LOG_DIR=d, LUMIX_REMOTE_HOME=d)
+            pidfile = os.path.join(d, "server.pid")       # the server's own pidfile, unified
             try:
+                self.assertEqual(registry.pidfile_path(), pidfile)
                 code, out, err = run(url, "server", "status")
                 self.assertEqual(code, 1)
                 code, out, err = run(url, "server", "start")
                 self.assertEqual(code, 0, out + err)
                 self.assertIn("started pid", out)
-                self.assertTrue(os.path.exists(os.path.join(d, "lumix-server.pid")))
+                self.assertTrue(os.path.exists(pidfile))
                 code, out, err = run(url, "--json", "server", "status")
                 st = json.loads(out)
                 self.assertTrue(st["reachable"] and st["managed"])
@@ -395,12 +488,32 @@ class ServerManagerTest(unittest.TestCase):
                 code, out, err = run(url, "server", "stop")
                 self.assertEqual(code, 0)
                 self.assertIn("stopped pid", out)
-                self.assertFalse(os.path.exists(os.path.join(d, "lumix-server.pid")))
+                self.assertFalse(os.path.exists(pidfile))
                 time.sleep(0.3)
                 self.assertEqual(run(url, "server", "status")[0], 1)
             finally:
                 os.environ.pop("LUMIX_RUN_SH", None)
                 os.environ.pop("LUMIX_LOG_DIR", None)
+                if home:
+                    os.environ["LUMIX_REMOTE_HOME"] = home
+
+    def test_legacy_logs_pidfile_is_adopted(self):
+        """A pidfile from an older `lumix server start` (logs/lumix-server.pid) moves
+        to the unified one, so `lumix server stop` still finds that server."""
+        with tempfile.TemporaryDirectory() as d:
+            home = os.environ.get("LUMIX_REMOTE_HOME")
+            os.environ.update(LUMIX_LOG_DIR=d, LUMIX_REMOTE_HOME=os.path.join(d, "cfg"))
+            try:
+                with open(os.path.join(d, "lumix-server.pid"), "w") as f:
+                    f.write("%d\n" % os.getpid())
+                st = servermgr.status(Client("http://127.0.0.1:9"))
+                self.assertEqual(st["pidfile"], os.path.join(d, "cfg", "server.pid"))
+                self.assertEqual(st["pid"], os.getpid())
+                self.assertFalse(os.path.exists(os.path.join(d, "lumix-server.pid")))
+            finally:
+                os.environ.pop("LUMIX_LOG_DIR", None)
+                if home:
+                    os.environ["LUMIX_REMOTE_HOME"] = home
 
 
 if __name__ == "__main__":
