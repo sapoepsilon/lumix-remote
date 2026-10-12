@@ -222,3 +222,16 @@ class ForgetAndAddressTest(EmuTestCase):
             st, d = await r.call("PATCH", "/api/cameras/emu", {"ip": "127.0.0.1"})   # unchanged entry
             await r.wait(lambda: r.sess.cam.status == "ready" and r.sess.cam.ip == "127.0.0.1", 30, "back")
         self.run_(go(), 60)
+
+
+class PausedStatusTest(EmuTestCase):
+    def test_not_running_camera_says_why(self):
+        r = self.rig
+
+        async def go():
+            st, d = await r.call("PATCH", "/api/cameras/emu", {"settings": {"autoconnect": False}})
+            self.assertEqual(st, 200)
+            st, d = await r.call("GET", "/api/status")
+            self.assertEqual(d["status"], "paused")
+            self.assertIn("Connect automatically is off", d["message"])
+        self.run_(go(), 30)
