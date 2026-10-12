@@ -616,10 +616,11 @@ kbd {
   display: flex; align-items: center; gap: 10px; padding: 8px 8px 8px 16px; border-radius: 22px;
   animation: rise .4s var(--spring);
 }
-.files-bar #selcount { flex: 1; font-weight: 600; font-size: 14px; white-space: nowrap; }
+.files-bar #selcount { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 600; font-size: 14px; white-space: nowrap; }
 .files-bar .btn { height: 40px; padding: 0 14px; font-size: 14px; white-space: nowrap; }
 .raw-toggle { white-space: nowrap; }
 @media (max-width: 420px) { .files-bar { gap: 6px; padding-left: 12px; } .files-bar .btn { padding: 0 11px; } .files-bar .btn.primary svg { display: none; } }
+@media (max-width: 360px) { .files-bar .wide { display: none; } .files-bar { left: 8px; right: 8px; } }
 .raw-toggle { font-size: 13px; color: var(--text2); display: flex; gap: 5px; align-items: center; }
 @keyframes rise { from { transform: translateY(30px); opacity: 0; } }
 .job {

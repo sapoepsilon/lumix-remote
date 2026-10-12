@@ -710,6 +710,7 @@ function openSheet(page) {
   const s = $("prosheet");
   $("proscrim").hidden = false;
   s.setAttribute("aria-hidden", "false");
+  s.inert = false;
   s.hidden = false;
   requestAnimationFrame(() => s.classList.add("open"));
   if (page && currentPage() !== page) push(page);
@@ -717,6 +718,7 @@ function openSheet(page) {
 }
 function closeSheet() {
   const s = $("prosheet");
+  s.inert = true;            // off-screen: keep its controls out of the Tab order
   s.classList.remove("open");
   s.style.transform = "";
   s.setAttribute("aria-hidden", "true");
