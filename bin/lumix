@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# lumix CLI wrapper: runs lumixcli with the repo's .venv (falls back to python3).
+# Symlink it onto your PATH, e.g. ln -s "$PWD/bin/lumix" ~/.local/bin/lumix
+set -euo pipefail
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+root="$(cd -P "$(dirname "$src")/.." && pwd)"
+py="$root/.venv/bin/python"
+[ -x "$py" ] || py="${PYTHON:-python3}"
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m lumixcli "$@"

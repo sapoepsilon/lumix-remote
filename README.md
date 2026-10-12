@@ -58,6 +58,73 @@ will need to turn it on by hand.
 
 Works at phone width.
 
+## CLI
+
+`bin/lumix` drives the camera from a terminal or script. It only talks to the
+server's HTTP/WebSocket API (the camera accepts a single controller, and the
+server holds that session), so the server must be running. It uses the repo's
+`.venv` (no extra dependencies); put it on your PATH with
+`ln -s "$PWD/bin/lumix" ~/.local/bin/lumix`.
+
+Server address: `--server URL` or `LUMIX_SERVER`, default `127.0.0.1:8770`.
+Every read command takes `--json`. Exit codes: 0 ok, 1 camera or server error
+(the camera's raw answer such as `err_busy` goes to stderr), 2 usage error or
+unknown setting/value, 3 server unreachable.
+
+```sh
+lumix server start               # background ./run.sh, pid + log in logs/lumix-server.{pid,log}
+lumix server start -- --camera-ip 192.168.1.50
+lumix server status              # also: lumix server stop (only stops a server it started)
+
+lumix status                     # battery, cards, mode, remaining shots/video, live view
+lumix status --json | jq .remain_photos
+lumix info                       # device, lens, capabilities, aperture/shutter
+lumix state                      # raw getstate fields
+
+lumix get                        # quick controls: aperture, shutter, mode, ISO, WB, ...
+lumix get iso                    # one setting: current value + allowed values
+lumix get --raw focal            # raw camera getsetting
+lumix settings list              # all 50+ menu settings, current + allowed values
+lumix settings list -f bracket --brief
+lumix settings options whitebalance   # '*' marks the current one
+
+lumix set iso 400                # by command type, short name (sensitivity) or title
+lumix set exposure3 -1/3         # value, title or token from `settings options`
+lumix set whitebalance daylight
+lumix set aperture 5.6           # also F5.6 or 1440/256
+lumix set shutter 250            # 1/250; 1s or 2" for slow speeds
+lumix set --raw focal 1024/256   # raw setsetting TYPE VALUE [VALUE2]
+
+lumix shoot
+lumix video start|stop|toggle
+lumix af                         # one-shot AF
+lumix focus 50% 50%              # touch AF; 0..1000, 0.0..1.0 or percent
+lumix zoom tele --fast; lumix zoom stop
+lumix cmd recmode                # raw camcmd passthrough
+lumix snapshot -o frame.jpg      # latest live view frame ('-o -' = stdout)
+lumix events -n 20               # recent event log
+lumix events -f                  # follow the WebSocket feed (--json, --all, --count N)
+lumix poweroff --yes             # cannot be switched back on over Wi-Fi
+```
+
+Setting names and option tokens are shell-safe for completion
+(`lumix settings list --names`, `lumix settings options iso --names`). Shell
+completion: `eval "$(lumix completion bash)"`, or for zsh
+`autoload -U +X bashcompinit && bashcompinit && eval "$(lumix completion zsh)"`.
+
+`lumix timelapse` and `lumix files` are placeholders until the server grows
+those features.
+
+### Tests
+
+```sh
+.venv/bin/python -m unittest discover -s tests
+```
+
+`tests/test_cli.py` runs every CLI command against a fake server (aiohttp in a
+background thread), including the WebSocket feed and `server start/stop` with a
+stand-in `run.sh`; no camera needed.
+
 ## HTTP API
 
 Everything the UI does goes through this JSON API, so scripts and a CLI can use
@@ -108,7 +175,9 @@ lumix/            camera client library (no web code)
   exposure.py     aperture/shutter code tables, lens limits
   discovery.py    SSDP listener, ddd probe, subnet scan
 server/           aiohttp app (API, MJPEG, WebSocket) + static UI
-tests/            unit tests with real S5 menu dumps (python -m unittest)
+lumixcli/         `lumix` command line client (HTTP API only)
+bin/lumix         CLI wrapper (uses .venv)
+tests/            unit tests: real S5 menu dumps, CLI against a fake server
 docs/             protocol research notes
 tools/            stand-alone protocol probe
 ```
