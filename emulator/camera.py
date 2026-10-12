@@ -219,6 +219,7 @@ class EmuCamera:
                          "group": None, "task": None}
         self.settings: Dict[str, Tuple[str, str]] = dict(GETSETTING_DEFAULTS)
         self.curmenu = self.data["curmenu"]
+        self._sync_settings_from_curmenu()
         self.card = Card(photos=self._card_args[0], group_size=self._card_args[1],
                          base_date="2020-02-10T13:15:54")
         self.counters: Dict[str, int] = {}
@@ -355,12 +356,29 @@ class EmuCamera:
         walk(root, None)
 
     def _curmenu_set(self, item_id: str, value: str) -> None:
-        pat = re.compile(r'(<item id="%s" enable="[a-z]+" value=")[^"]*(")' % re.escape(item_id))
+        # curmenu items carry other attributes too (active="yes" on the S5)
+        pat = re.compile(r'(<item id="%s"[^>]*? value=")[^"]*(")' % re.escape(item_id))
         self.curmenu = pat.sub(lambda m: m.group(1) + value + m.group(2), self.curmenu, count=1)
 
+    def _sync_settings_from_curmenu(self) -> None:
+        """The recorded getsetting values and curmenu come from different moments
+        (e.g. curmenu says EV +1/3 and drive Time Lapse, the log getsetting 0 and
+        normal). A real body answers both from one state, so getsetting follows
+        curmenu wherever curmenu holds a value allmenu offers for that type."""
+        parents: Dict[str, List[str]] = {}
+        for (t, v), items in self.menu_map.items():
+            for it in items:
+                if it not in parents.setdefault(t, []):
+                    parents[t].append(it)
+        for typ in list(self.settings):
+            for item in parents.get(typ, []):
+                v = self.curmenu_value(item)
+                if v and (typ, v) in self.menu_map:
+                    self.settings[typ] = (v, self.settings[typ][1])
+                    break
+
     def curmenu_value(self, item_id: str) -> Optional[str]:
-        m = re.search(r'<item id="%s" enable="[a-z]+" value="([^"]*)"' % re.escape(item_id),
-                      self.curmenu)
+        m = re.search(r'<item id="%s"[^>]*? value="([^"]*)"' % re.escape(item_id), self.curmenu)
         return m.group(1) if m else None
 
     # ================================================================ cam.cgi

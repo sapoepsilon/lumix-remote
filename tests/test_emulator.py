@@ -507,6 +507,8 @@ class IntervalTest(EmuTestBase):
 
     async def test_interval_run(self):
         await self.ready_in_rec()
+        # the recorded body boots in Time Lapse drive (curmenu); start from Single
+        self.assertEqual(await self.result(mode="setsetting", type="drivemode", value="normal"), "ok")
         self.assertEqual(await self.result(mode="camctrl", type="interval", value="set"),
                          "err_reject")                  # drive mode is not interval yet
         self.assertEqual(await self.result(mode="setsetting", type="drivemode",

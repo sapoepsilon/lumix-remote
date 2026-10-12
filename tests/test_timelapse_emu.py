@@ -301,6 +301,8 @@ class NativeEngineTest(EmuTestCase):
         async def go():
             st, d = await r.call("GET", "/api/timelapse")
             self.assertTrue(d["capabilities"]["native"])
+            await r.call("POST", "/api/setting", {"type": "drivemode", "value": "normal"})
+            drive0 = r.emu.settings["drivemode"][0]
             st, d = await r.call("POST", "/api/timelapse/start",
                                  {"interval": 2, "count": 4, "native": True, "import": True,
                                   "dest": self.dest, "name": "nat"})
@@ -321,7 +323,7 @@ class NativeEngineTest(EmuTestCase):
             j = r.job()
             self.assertEqual(j.shots, 4)
             self.assertEqual(len(j.frames), 4)
-            self.assertEqual(r.emu.settings["drivemode"][0], "normal")   # restored
+            self.assertEqual(r.emu.settings["drivemode"][0], drive0)   # restored
             self.assertIsNone(r.sess.cam.interval_owner)
             self.assertFalse(r.sess.cam.wedged)
             # frames are the camera's Interval group, oldest first
