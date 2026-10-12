@@ -50,6 +50,8 @@ def main() -> None:
     p.add_argument("--card-photos", type=int, default=4)
     p.add_argument("--card-group", type=int, default=120, help="photos in the time-lapse group")
     p.add_argument("--no-range", action="store_true", help=":50001 ignores Range (200 + full body)")
+    p.add_argument("--dl-rate", type=float, default=0.0, metavar="BYTES_PER_S",
+                   help="cap :50001 downloads at this rate (QA of paused/resumed imports; 0 = off)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("-v", "--verbose", action="store_true")
     a = p.parse_args()
@@ -61,7 +63,8 @@ def main() -> None:
         return EmuConfig(wedge_realism=a.wedge_realism == "on", settle_min=a.settle[0],
                          settle_max=a.settle[1], approval=a.approval,
                          session_timeout_s=a.session_timeout, fps=a.fps,
-                         interval_scale=a.interval_scale, dl_range=not a.no_range, seed=a.seed)
+                         interval_scale=a.interval_scale, dl_range=not a.no_range, dl_rate=a.dl_rate,
+                         seed=a.seed)
 
     async def run() -> None:
         nodes = []

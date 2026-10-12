@@ -258,10 +258,13 @@ class EmulatorNode:
             if req.method == "HEAD":
                 return resp
             pos = start
+            rate = cam.cfg.dl_rate
             while pos <= end:
-                n = min(65536, end - pos + 1)
+                n = min(65536 if not rate else max(1024, min(65536, int(rate / 10))), end - pos + 1)
                 await resp.write(cam.card.read(entry, variant, pos, n))
                 pos += n
+                if rate:
+                    await asyncio.sleep(n / rate)
             await resp.write_eof()
             return resp
 

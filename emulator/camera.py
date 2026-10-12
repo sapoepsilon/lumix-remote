@@ -119,6 +119,7 @@ class EmuConfig:
     interval_scale: float = 1.0      # time-lapse interval multiplier (0.01 = 100x faster)
     browse_max: int = 100            # max items per Browse page (guess)
     dl_range: bool = True            # honour Range on :50001 (unverified on the S5)
+    dl_rate: float = 0.0             # :50001 throughput cap in bytes/s (0 = unlimited; for QA)
     seed: Optional[int] = None
 
 
@@ -336,6 +337,7 @@ class EmuCamera:
         root = ET.fromstring(self.data["allmenu"].encode())
         self.menu_types: Set[str] = set()
         self.menu_map: Dict[Tuple[str, str], List[str]] = {}
+        self.value_items: Dict[str, str] = {}     # cmd_type -> item id of a "__value__" item
 
         def walk(el: ET.Element, parent_item: Optional[str]) -> None:
             for c in el:
@@ -343,6 +345,8 @@ class EmuCamera:
                     if c.get("cmd_mode") == "setsetting":
                         t, v = c.get("cmd_type", ""), c.get("cmd_value", "")
                         self.menu_types.add(t)
+                        if v == "__value__" and c.get("id"):
+                            self.value_items.setdefault(t, c.get("id", ""))
                         if parent_item:
                             self.menu_map.setdefault((t, v), []).append(parent_item)
                     walk(c, c.get("id"))
@@ -536,6 +540,10 @@ class EmuCamera:
         if (typ, value) in self.menu_map:
             for item in self.menu_map[(typ, value)]:
                 self._curmenu_set(item, value)
+        elif typ in self.value_items:
+            # free-value item (interval_shoot_num, interval_shoot_interval, ...): the
+            # item itself carries the value in curmenu
+            self._curmenu_set(self.value_items[typ], value)
         elif typ not in SETSETTING_EXTRA and (typ, "__value__") not in self.menu_map:
             return self._xml("err_param")            # not a value allmenu offers
         old_text = self.settings.get(typ, ("", ""))[1]
