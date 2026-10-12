@@ -34,7 +34,8 @@ class RegistryTest(unittest.TestCase):
         a = self.reg.add("cam", ports={"http": 8080})
         e = self.reg.update(a["id"], ports={"upnp": 1234}, settings={"watchdog": True})
         self.assertEqual((e["ports"]["http"], e["ports"]["upnp"], e["ports"]["files"]), (8080, 1234, 50001))
-        self.assertEqual(e["settings"], {"autoconnect": True, "watchdog": True})
+        self.assertEqual(e["settings"], {"autoconnect": True, "watchdog": True,
+                                         "resume_on_reconnect": True})
 
     def test_find_rename_remove_use(self):
         a, b = self.reg.add("One"), self.reg.add("Two")

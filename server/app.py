@@ -17,6 +17,7 @@ from aiohttp import WSMsgType, web
 
 from lumix.camera import Busy, Camera
 from lumix.liveview import FrameSource
+from server import quiesce
 from server.sessions import CameraSession, SessionManager
 
 log = logging.getLogger("server")
@@ -224,8 +225,25 @@ async def zoom(request: web.Request) -> web.Response:
 async def poweroff(request: web.Request) -> web.Response:
     b = await _body(request)
     if b.get("confirm") is not True:
-        return _json({"error": "send {\"confirm\": true}; the camera cannot be woken over Wi-Fi"}, 400)
-    return _json(await camera(request).poweroff())
+        return _json({"error": "send {\"confirm\": true}; the camera cannot be woken over Wi-Fi",
+                      "plan": quiesce.plan(session(request), "poweroff")}, 400)
+    return _json(await quiesce.power_off(session(request)))
+
+
+async def power_plan(request: web.Request) -> web.Response:
+    """What power-off (or ?reason=server-stop|remove|files|shooting) would pause."""
+    return _json(quiesce.plan(session(request), request.query.get("reason", "poweroff")))
+
+
+@_guard
+async def quiesce_now(request: web.Request) -> web.Response:
+    b = await _body(request)
+    return _json(await session(request).quiesce(str(b.get("reason") or "poweroff")))
+
+
+@_guard
+async def resume_now(request: web.Request) -> web.Response:
+    return _json(await quiesce.resume_after_reconnect(session(request), force=True))
 
 
 async def events(request: web.Request) -> web.Response:
@@ -352,6 +370,9 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
         ("POST", "/api/af", af),
         ("POST", "/api/zoom", zoom),
         ("POST", "/api/power/off", poweroff),
+        ("GET", "/api/power/plan", power_plan),
+        ("POST", "/api/quiesce", quiesce_now),
+        ("POST", "/api/resume", resume_now),
         ("GET", "/api/events", events),
         ("GET", "/api/liveview.jpg", frame),
         ("GET", "/api/liveview.mjpg", mjpeg),
@@ -366,15 +387,24 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
     files_api.setup(app)
     from server import ble_api  # Bluetooth wake / power-cycle + err_busy watchdog
     ble_api.setup(app)
+    from server import timelapse_api  # server-driven + in-camera time-lapse
+    timelapse_api.setup(app)
     for setup in FEATURES:
         setup(app)
 
     async def on_startup(app: web.Application) -> None:
         await mgr.start()
 
+    async def on_shutdown(app: web.Application) -> None:
+        # SIGTERM/SIGINT: checkpoint imports, pause timelapses, stop recordings,
+        # live view and event subscriptions before the sessions go away. Bounded:
+        # `lumix server stop` / a new server SIGKILLs after 10 s.
+        await mgr.quiesce_all("server-stop", timeout=7.0)
+
     async def on_cleanup(app: web.Application) -> None:
         await mgr.stop()
 
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
     app.on_cleanup.append(on_cleanup)
     return app

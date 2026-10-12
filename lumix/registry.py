@@ -10,7 +10,8 @@ dir, ``LUMIX_REMOTE_HOME`` overrides it)::
                   "client_uuid": "4D454930-0100-1000-8001-...", "device_name": "LumixRemote",
                   "ble": {"name", "address", "identity", "home_ssid", "registered_at"},
                   "ports": {"http": 80, "upnp": 60606, "files": 50001, "liveview": 49199},
-                  "settings": {"autoconnect": true, "watchdog": false},
+                  "settings": {"autoconnect": true, "watchdog": false,
+                               "resume_on_reconnect": true},
                   "provisional": false, "added_at": ..., "connected_at": ...}]}
 
 Per-camera files that change often (Auto preset state) live in
@@ -41,7 +42,7 @@ except ImportError:  # pragma: no cover - Windows
 VERSION = 1
 FILENAME = "cameras.json"
 DEFAULT_PORTS = {"http": 80, "upnp": 60606, "files": 50001, "liveview": 49199}
-DEFAULT_SETTINGS = {"autoconnect": True, "watchdog": False}
+DEFAULT_SETTINGS = {"autoconnect": True, "watchdog": False, "resume_on_reconnect": True}
 LEGACY_FILES = ("state.json", "presets.json", "ble.json")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 _BLE_NAME_RE = re.compile(r"^([A-Z0-9]{2,6})-[0-9A-F]{6}$")

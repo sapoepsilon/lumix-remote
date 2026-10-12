@@ -28,6 +28,7 @@ serialised by one lock.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -150,6 +151,10 @@ class BleManager:
         registered), wait for the camera to drop off, then BLE wake."""
         t0 = time.time()
         res: Dict[str, Any] = {"reason": reason, "ip": self.cam.ip}
+        if self.session is not None and getattr(self.session, "running", False):
+            # same central path as a power-off: imports/timelapse paused, recording stopped
+            with contextlib.suppress(Exception):
+                res["quiesce"] = await self.session.quiesce("poweroff", timeout=12)
         # The S5 rejects camcmd poweroff (err_reject) in play mode: go to rec first.
         try:
             if self.cam.state.get("cammode") != "rec":

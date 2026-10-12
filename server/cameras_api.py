@@ -65,7 +65,7 @@ def _fields(b: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("settings must be an object")
         st = {}
         for k, v in b["settings"].items():
-            if k not in ("autoconnect", "watchdog"):
+            if k not in ("autoconnect", "watchdog", "resume_on_reconnect"):
                 raise ValueError("unknown setting %r" % k)
             if not isinstance(v, bool):
                 raise ValueError("%s must be true or false" % k)

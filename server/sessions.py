@@ -21,6 +21,7 @@ from lumix.camera import Camera, CameraConfig
 from lumix.files import FileBrowser
 from lumix.presets import AutoPreset
 from lumix.registry import Registry, RegistryError, RegistryStore, migrate
+from lumix.timelapse import TimelapseEngine
 
 log = logging.getLogger("server.sessions")
 
@@ -53,12 +54,38 @@ class CameraSession:
         self.id: str = entry["id"]
         self.entry = entry
         self.cam = cam or Camera(mgr.camera_config(entry))
-        self.auto = AutoPreset(self.cam, os.path.join(mgr.registry.camera_dir(self.id), "presets.json"))
-        self.files = FileBrowser(self.cam)
+        cdir = mgr.registry.camera_dir(self.id)
+        self.auto = AutoPreset(self.cam, os.path.join(cdir, "presets.json"))
+        self.files = FileBrowser(self.cam, jobs_path=os.path.join(cdir, "imports.json"))
+        self.timelapse = TimelapseEngine(self.cam, self.files, cdir)
         from server.ble_api import BleManager  # late: ble_api imports server.app
         self.ble = BleManager(self.cam, session=self)
         self.sources: Dict[str, Any] = {"wifi": self.cam.liveview}
         self.running = False
+        # quiesce hooks (server/quiesce.py): files <-> shooting, reconnect resume
+        self.files.on_enter = self._files_enter
+        self.files.on_leave = self._files_leave
+        self.cam.ready_hooks.append(self._camera_ready)
+
+    def resume_on_reconnect(self) -> bool:
+        return bool((self.entry.get("settings") or {}).get("resume_on_reconnect", True))
+
+    async def quiesce(self, reason: str, timeout: float = 15.0) -> Dict[str, Any]:
+        from server import quiesce
+        return await quiesce.quiesce(self, reason, timeout)
+
+    async def _files_enter(self) -> None:
+        from server import quiesce
+        await quiesce.quiesce(self, "files", timeout=25)
+
+    async def _files_leave(self) -> None:
+        await self.timelapse.auto_resume("files")
+
+    async def _camera_ready(self, cam: Camera) -> None:
+        if not self.running:
+            return
+        from server import quiesce
+        await quiesce.resume_after_reconnect(self)
 
     def reload(self) -> Dict[str, Any]:
         e = self.mgr.registry.get(self.id)
@@ -73,12 +100,13 @@ class CameraSession:
         self.cam.start()
         self.files.start()
         self.ble.start()
+        self.timelapse.start()
 
     async def stop(self) -> None:
         if not self.running:
             return
         self.running = False
-        for coro in (self.ble.stop(), self.files.stop(), self.cam.stop()):
+        for coro in (self.timelapse.shutdown(), self.ble.stop(), self.files.stop(), self.cam.stop()):
             with contextlib.suppress(Exception):
                 await coro
 
@@ -102,6 +130,8 @@ class CameraSession:
             "ports": e.get("ports"), "settings": e.get("settings"),
             "connected_at": e.get("connected_at"), "added_at": e.get("added_at"),
             "wedged": st.get("wedged", False),
+            "timelapse": (self.timelapse.job.state if self.timelapse.job
+                          and self.timelapse.is_active() else None),
         }
 
 
@@ -199,6 +229,19 @@ class SessionManager:
         for s in list(self.sessions.values()):
             await s.stop()
 
+    async def quiesce_all(self, reason: str = "server-stop", timeout: float = 8.0) -> Dict[str, Any]:
+        """Quiesce every running session in parallel (server stop: SIGTERM/SIGINT)."""
+        run = [s for s in self.sessions.values() if s.running]
+        if not run:
+            return {}
+        res = await asyncio.gather(*(asyncio.wait_for(s.quiesce(reason, timeout), timeout + 1)
+                                     for s in run), return_exceptions=True)
+        out = {}
+        for s, r in zip(run, res):
+            out[s.id] = r if isinstance(r, dict) else {"error": repr(r)}
+            log.info("quiesce %s (%s): %s", s.id, reason, out[s.id])
+        return out
+
     # ------------------------------------------------------------- access
     def get(self, cam_id: Optional[str]) -> Optional[CameraSession]:
         if cam_id is None:
@@ -241,6 +284,9 @@ class SessionManager:
             s = self.sessions.pop(cam_id, None)
             if s is None:
                 raise RegistryError("no camera %r" % cam_id)
+            if s.running:
+                with contextlib.suppress(Exception):
+                    await s.quiesce("remove", timeout=10)
             await s.stop()
             e = self.registry.remove(cam_id)
             self.active_id = self.registry.active_id()
