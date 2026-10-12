@@ -49,40 +49,47 @@ def fmt_status(st: Dict[str, Any]) -> str:
     cam = st.get("camera") or {}
     sd = st.get("sd") or {}
     lv = st.get("liveview") or {}
-    name = cam.get("friendlyName") or "camera"
-    head = "%s (%s fw %s): %s%s" % (name, cam.get("modelNumber") or "?", cam.get("X_FirmVersion") or "?",
-                                   st.get("status"), "  " + st["ip"] if st.get("ip") else "")
+    name = cam.get("friendlyName") or st.get("camera_id") or "camera"
+    model = " (%s fw %s)" % (cam.get("modelNumber"), cam.get("X_FirmVersion") or "?") if cam.get("modelNumber") else ""
+    head = "%s%s: %s%s" % (name, model, st.get("status"), "  " + st["ip"] if st.get("ip") else "")
     rows = [head]
     if st.get("message"):
         rows.append("  message    %s" % st["message"])
+    if st.get("wedged"):
+        rows.append("  WEDGED     the camera answers err_busy to every command; switch it off and on")
+    if st.get("body_busy"):
+        rows.append("  in use     someone is operating the camera body")
+    if st.get("powered_off"):
+        rows.append("  camera was powered off over Wi-Fi; switch it on by hand")
+    if st.get("status") != "ready" and not st.get("cammode"):
+        return "\n".join(rows)          # never connected / no session: nothing else is known
     batt = st.get("battery")
     if st.get("battery_grip") and not str(st.get("battery_grip")).startswith("-1"):
         batt = "%s (grip %s)" % (batt, st["battery_grip"])
-    rows.append("  battery    %s" % batt)
+    rows.append("  battery    %s" % (batt or "-"))
     cards = []
     for k in ("sd1", "sd2"):
         if sd.get(k):
             full = sd.get(k + "_full") == "true"
             cards.append("%s %s%s%s" % (k, sd[k], " FULL" if full else "",
                                         " (active)" if sd.get("current") == k else ""))
-    rows.append("  card       %s%s" % (", ".join(cards) or "?",
+    rows.append("  card       %s%s" % (", ".join(cards) or "-",
                                       "  [writing]" if sd.get("access") == "on" else ""))
     rec = "recording %s" % (_fmt_secs(st.get("rec_progress")) if st.get("recording") else "no")
-    rows.append("  mode       %s, %s" % (st.get("cammode"), rec))
+    rows.append("  mode       %s, %s" % (st.get("cammode") or "-", rec))
     if st.get("remain_photos") is None and st.get("remain_video_s") is None:
         rows.append("  remaining  - (not reported in %s)" % ("playback" if st.get("cammode") == "play"
                                                            else "this state"))
     else:
         rows.append("  remaining  %s photos, video %s" % (st.get("remain_photos") or "-",
                                                          _fmt_secs(st.get("remain_video_s"))))
-    rows.append("  lens       %s" % st.get("lens"))
+    rows.append("  lens       %s" % (st.get("lens") or "-"))
     if st.get("temperature"):
         rows.append("  temp       %s" % st["temperature"])
-    rows.append("  liveview   %s fps, frame age %ss" % (lv.get("fps"), lv.get("age")))
+    rows.append("  liveview   %s" % ("%s fps, frame age %ss" % (lv.get("fps"), lv.get("age"))
+                                     if lv.get("age") is not None else "no frames"))
     if st.get("op_owner"):
         rows.append("  busy with  %s" % st["op_owner"])
-    if st.get("powered_off"):
-        rows.append("  camera was powered off over Wi-Fi; switch it on by hand")
     return "\n".join(rows)
 
 
