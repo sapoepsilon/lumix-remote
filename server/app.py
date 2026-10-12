@@ -28,6 +28,9 @@ SESSIONS = web.AppKey("sessions", SessionManager)
 # browser tab never holds the graceful stop past `lumix server stop`'s SIGKILL.
 OPEN_STREAMS = web.AppKey("open_streams", set)
 CAMERA_PREFIX = "/api/cameras/{cam}"
+# Work a request started (POST/PATCH/PUT/DELETE handlers) runs as a server-owned
+# task: closing the browser tab mid-request never cancels it half-way.
+DETACHED = web.AppKey("detached", set)
 
 # Quick controls are looked up by the camera's own cmd_type, so they follow
 # whatever allmenu exposes rather than hard-coded ids.
@@ -97,6 +100,46 @@ async def _body(request: web.Request) -> Dict[str, Any]:
         except ValueError:
             pass
     return {}
+
+
+# Methods whose handlers change something (camera commands, job start/stop, BLE).
+MUTATING = ("POST", "PUT", "PATCH", "DELETE")
+
+
+@web.middleware
+async def detach_mutations(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Run state-changing requests in a server-owned task.
+
+    A client that goes away (tab closed, page reloaded, phone locked) must never
+    stop what it started. aiohttp >= 3.9 does not cancel handlers on disconnect by
+    default, but a server built with ``handler_cancellation=True`` (or a proxy that
+    cancels) would cut a command sequence -- stopstream, recmode, startstream; a
+    BLE wake; a timelapse arming the camera -- in the middle. The request only
+    waits for the task; if it is cancelled the task carries on and its result is
+    logged."""
+    if request.method not in MUTATING:
+        return await handler(request)
+    task = asyncio.ensure_future(handler(request))
+    keep = request.app[DETACHED]
+    keep.add(task)
+
+    def done(t: "asyncio.Task[Any]") -> None:
+        keep.discard(t)
+        if t.cancelled():
+            return
+        e = t.exception()
+        if e is not None and not isinstance(e, web.HTTPException):
+            log.warning("%s %s (client gone) failed: %s: %s", request.method, request.path,
+                        type(e).__name__, e)
+
+    task.add_done_callback(done)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.done():
+            log.info("%s %s: client went away; the request keeps running on the server",
+                     request.method, request.path)
+        raise
 
 
 # ------------------------------------------------------------------ handlers
@@ -466,9 +509,10 @@ def build_app(mgr: "SessionManager | Camera") -> web.Application:
     """App for a SessionManager (a bare Camera is wrapped in a one-camera manager)."""
     if isinstance(mgr, Camera):
         mgr = SessionManager.single(mgr)
-    app = web.Application()
+    app = web.Application(middlewares=[detach_mutations])
     app[SESSIONS] = mgr
     app[OPEN_STREAMS] = set()
+    app[DETACHED] = set()
     r = app.router
     r.add_get("/", index)
     r.add_get("/manifest.webmanifest", manifest)

@@ -64,6 +64,7 @@ class BleManager:
         self.session = session        # server.sessions.CameraSession (None: stand-alone)
         self.lock: asyncio.Lock = session.mgr.ble_lock if session is not None else asyncio.Lock()
         self.running: Optional[str] = None
+        self.running_since: Optional[float] = None   # a reopened page shows the elapsed time
         self.history: Deque[Dict[str, Any]] = deque(maxlen=20)
         settings = (session.entry.get("settings") or {}) if session is not None else {}
         self.watchdog_enabled = bool(settings.get("watchdog")) or _env_on("LUMIX_BLE_WATCHDOG")
@@ -103,7 +104,7 @@ class BleManager:
             env["LUMIX_CAMERA_ID"] = self.session.id
         async with self.lock:
             self.running = args[0]
-            t0 = time.time()
+            t0 = self.running_since = time.time()
             self.cam.log_event("ble", "lumix-ble %s" % " ".join(args))
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -133,7 +134,7 @@ class BleManager:
                 tail = await err_task
                 res["log"] = tail[-40:]
             finally:
-                self.running = None
+                self.running = self.running_since = None
             entry = {"ts": t0, "cmd": args[0], "ok": bool(res.get("ok")),
                      "elapsed_s": round(time.time() - t0, 1), "error": res.get("error")}
             self.history.append(entry)
@@ -316,7 +317,8 @@ class BleManager:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "camera_id": self.session.id if self.session is not None else None,
-            "name": self.name, "running": self.running, "busy": self.lock.locked(),
+            "name": self.name, "running": self.running, "running_since": self.running_since,
+            "busy": self.lock.locked(),
             "registered": self.registered,
             "history": list(self.history),
             "wakes": {"max": self.wake_max, "window_s": self.wake_window,

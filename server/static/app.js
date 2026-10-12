@@ -1159,7 +1159,23 @@ function resetForCamera() {
   img.removeAttribute("src");
   img.src = cp("/api/liveview.mjpg") + "?t=" + Date.now();
   connectWs();
-  loadSettings(); loadConnection(); loadPresets(); tl.status = null; loadTimelapse();
+  loadSettings(); loadConnection(); loadPresets(); tl.status = null; tl.attached = false; loadTimelapse();
+  reattachJobs();
+}
+
+// A reopened page picks up what the server is still doing for it: an import from
+// the card (shown in Files, where its progress lives) and a Bluetooth wake. The
+// timelapse re-attaches in renderTimelapse, the recording timer comes with status.
+async function reattachJobs() {
+  try {
+    const jobs = await api("/api/jobs");
+    if ((jobs || []).some((x) => ["queued", "running"].includes(x.state)) && $("files").hidden) openFiles();
+  } catch (_) { /* older server / no camera */ }
+  try {
+    const r = await fetch(cp("/api/ble/status"));
+    const b = r.ok ? await r.json() : null;
+    if (b && b.busy && ["wake", "power-cycle"].includes(b.running) && !wake.running) adoptWake(b);
+  } catch (_) { /* no Bluetooth API */ }
 }
 
 async function switchCamera(id, fromList) {
@@ -1568,7 +1584,7 @@ const TL_INTERVALS = [1, 2, 3, 5, 10, 15, 30, 60, 120, 300, 600];
 const TL_COUNTS = [30, 60, 120, 240, 360, 720, 1440];
 const TL_DURATIONS = [300, 600, 1800, 3600, 7200, 14400, 28800];
 const tl = {
-  status: null, skew: 0, busy: false,
+  status: null, skew: 0, busy: false, attached: false,
   cfg: Object.assign({ engine: "server", interval: 10, lenmode: "count", count: 360, duration: 3600,
     ae_lock: false, import: false, video: false, later: false, start: "" }, LS.get("tlcfg", {})),
 };
@@ -1647,6 +1663,13 @@ function renderTimelapse(d) {
   if (d) { tl.status = d; const j = d.job; if (j && j.now) tl.skew = j.now - Date.now() / 1000; }
   const j = tlJob();
   const active = tlActive();
+  // Re-attach: the job runs on the server whether or not a page is open. The first
+  // status this page sees for a running timelapse brings up its panel (once, so
+  // switching to photo/video afterwards sticks).
+  if (d && !tl.attached) {
+    tl.attached = true;
+    if (active && state.mode !== "timelapse") setMode("timelapse", true);
+  }
   $("app").classList.toggle("tl-running", !!(j && ["scheduled", "running", "paused"].includes(j.state)));
   $("tlsetup").hidden = active;
   $("tlrun").hidden = !active;
@@ -1805,6 +1828,25 @@ async function bleWake() {
   renderWake();
 }
 
+// A wake started from a page that was closed since: show it running, then its result.
+async function adoptWake(b) {
+  Object.assign(wake, { camId: state.camId, ok: null, data: null, error: "", unsure: !blePaired(), needPair: false });
+  wake.running = true; wake.t0 = b.running_since ? b.running_since * 1000 : Date.now(); wake.secs = 0;
+  wake.timer = setInterval(() => { wake.secs = Math.round((Date.now() - wake.t0) / 1000); renderWake(); }, 1000);
+  renderWake();
+  let last = null;
+  for (;;) {
+    await sleep(2000);
+    try { const r = await fetch(cp("/api/ble/status")); if (r.ok) b = await r.json(); } catch (_) { continue; }
+    if (!b.busy) { last = (b.history || []).slice(-1)[0] || null; break; }
+  }
+  clearInterval(wake.timer); wake.timer = null;
+  wake.running = false; wake.secs = Math.round((Date.now() - wake.t0) / 1000);
+  wake.ok = !!(last && last.ok);
+  if (!wake.ok) wake.error = (last && last.error) || "Bluetooth wake ended";
+  renderWake();
+}
+
 function openPairing() {
   const id = state.camId;
   closeSheet();
@@ -1941,6 +1983,7 @@ function init() {
     loadConnection();
     loadPresets();
     loadTimelapse();
+    reattachJobs();
     hashRoute();
   });
   window.addEventListener("hashchange", hashRoute);

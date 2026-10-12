@@ -135,7 +135,11 @@ def main() -> None:
 
     # shutdown_timeout: open browser connections are closed in on_shutdown; this
     # only bounds stragglers, well inside the 10 s before `lumix server stop` SIGKILLs
-    web.run_app(make_app(), host=host, port=a.port, print=None, shutdown_timeout=3.0)
+    # handler_cancellation=False: a browser tab that closes mid-request must not
+    # cancel the handler (aiohttp's default since 3.9; spelled out because the
+    # whole server relies on it -- see detach_mutations in server/app.py)
+    web.run_app(make_app(), host=host, port=a.port, print=None, shutdown_timeout=3.0,
+                handler_cancellation=False)
 
 
 def re_id(s: str) -> bool:
