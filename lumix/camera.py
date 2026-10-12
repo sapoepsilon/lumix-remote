@@ -515,7 +515,7 @@ class Camera:
         # at connect, so it never hits this window. Wait for mod_Play.
         left = (q.settle_s if q.settle_event else q.settle_min_s) - (time.monotonic() - sub_at)
         if left > 0 and not self._mod_play.is_set():
-            self._set_status("connecting", "waiting for the camera to settle after subscribing")
+            self._set_status("connecting", "finishing the connection (the camera needs 5-30 s)")
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._mod_play.wait(), left)
         self.log_event("conn", "camera settled after SUBSCRIBE in %.1fs (%s)" % (
