@@ -67,6 +67,26 @@ class BleWakeApiTest(EmuTestCase):
             self.assertEqual(d["error"], "camera not found over Bluetooth")
         self.run_(go(), 30)
 
+    def test_wakes_are_rate_limited(self):
+        r = self.rig
+
+        async def go():
+            with self.wake('{"ok": false, "error": "wifi-wait: x", "step": "wifi-wait"}'):
+                for _ in range(2):
+                    st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {})
+                    self.assertEqual(st, 502, d)
+                st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {})
+                self.assertEqual(st, 429, d)
+                self.assertEqual(d["step"], "limit")
+                self.assertIn("battery", d["error"])
+                st, d = await r.call("POST", "/api/cameras/emu/ble/power-cycle", {})
+                self.assertEqual(st, 429, d)            # refused before any Wi-Fi poweroff
+                self.assertNotIn("poweroff", d)
+            st, s = await r.call("GET", "/api/cameras/emu/ble/status")
+            self.assertEqual(s["wakes"]["recent"], 2)
+            self.assertEqual([h["cmd"] for h in s["history"]], ["wake", "wake"])   # no retries
+        self.run_(go(), 30)
+
     def test_second_wake_while_running_is_409(self):
         r = self.rig
 
@@ -79,6 +99,23 @@ class BleWakeApiTest(EmuTestCase):
                 self.assertIn("BLE busy", d["error"])
                 st, d = await first
                 self.assertEqual(st, 200, d)
+        self.run_(go(), 30)
+
+
+class ClientUuidApiTest(EmuTestCase):
+    """PATCH client_uuid: restore the id the camera was paired with (BLE MEI0 +
+    Wi-Fi req_acc must be the same id; the S5 hangs up on any other)."""
+
+    def test_patch_client_uuid(self):
+        r = self.rig
+
+        async def go():
+            st, d = await r.call("PATCH", "/api/cameras/emu", {"client_uuid": "4d454930-0100-1000-8001-0a0b0c0d0e0f"})
+            self.assertEqual(st, 200, d)
+            self.assertEqual(d["entry"]["client_uuid"], "4D454930-0100-1000-8001-0A0B0C0D0E0F")
+            st, d = await r.call("PATCH", "/api/cameras/emu", {"client_uuid": "not-an-id"})
+            self.assertEqual(st, 400)
+            self.assertIn("client_uuid", d["error"])
         self.run_(go(), 30)
 
 
@@ -227,7 +264,8 @@ class WakeUiWiringTest(unittest.TestCase):
         self.assertNotIn("if (wake.needPair) { renderWake(); return; }", body)
         self.assertIn("unsure: !blePaired()", body)
         self.assertIn('fetch(cp("/api/ble/wake")', body)
-        self.assertIn("wake.needPair = !wake.ok && wake.unsure", body)
+        # ...or when lumix-ble says the camera doesn't know this computer's id
+        self.assertIn("wake.needPair = !wake.ok && (wake.unsure || !!(wake.data && wake.data.need_pair))", body)
         self.assertIn("may not be paired", js)
         self.assertNotIn("Needs Bluetooth pairing first", js)
 

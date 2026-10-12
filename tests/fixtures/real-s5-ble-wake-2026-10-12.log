@@ -1,0 +1,48 @@
+# Real DC-S5 (fw 2.03), power switch OFF, Bluetooth > Remote Wakeup ON, 2026-10-12.
+# bin/lumix-ble wake from macOS 26 (bleak 3, CoreBluetooth), stderr progress lines.
+# Scrubbed: camera name -> S5-XXXXXX, client ids -> <id-paired> / <id-new>,
+# home SSID payload -> <ssid>. tests/test_ble_session.py replays these.
+
+## run A 13:15:48  -- entry's client id had changed (<id-new>); camera knows <id-paired>
+[  2.33s] found S5-XXXXXX
+[ 12.07s] connected
+[ 12.08s] notify subscriptions refused: 10/10 (expected on macOS)
+[ 12.08s] write 8d08a420 4d454930010010008001<id-new>
+[ 12.25s] write cd7a71a0 4c756d697852656d6f7465
+[ 12.53s] disconnected
+{"ok": false, "error": "BleakError: disconnected", "elapsed_s": 12.5}
+
+## run B 13:18:16  -- paired id, old join sequence (SSID, 03, start 01)
+# adv state before: 02 (wakeup); after: 00 (normal) -> the body powered up,
+# but it never joined Wi-Fi (no :60606 and no ARP entry for 120 s).
+[  0.82s] found S5-XXXXXX
+[ 24.24s] connected
+[ 24.24s] notify subscriptions refused: 10/10 (expected on macOS)
+[ 24.24s] write 8d08a420 4d454930010010008001<id-paired>
+[ 24.42s] write cd7a71a0 4c756d697852656d6f7465
+[ 24.99s] initial_inform 7396af0a
+[ 25.01s] write ead55e60 ea070a0c0d12290098fe
+[ 25.35s] write 18345be0 <ssid>
+[ 26.15s] write 0d6f1880 03
+[ 26.31s] notify 18345be1 00
+[ 26.78s] write e182ec40 01
+[147.25s] disconnected
+{"ok": false, "registered": true, "ble_connected_s": 24.2, "wifi_cmd_s": 26.9, "wifi_up_s": null, "error": "camera did not answer on <ip>:60606 within 120s"}
+
+## run C 13:26:53  -- paired id, LUMIX Sync Remote-shooting sequence
+# SSID, 03, wait ack 18345be1=00, 02 (STA), start 03 -> Wi-Fi up 11.7 s later.
+adv: [('S5-XXXXXX', 'normal')]
+[  7.82s] found S5-XXXXXX
+[ 24.50s] connected
+[ 24.50s] notify subscriptions refused: 10/10 (expected on macOS)
+[ 24.50s] write 8d08a420 4d454930010010008001<id-paired>
+[ 24.86s] write cd7a71a0 4c756d697852656d6f7465
+[ 25.43s] initial_inform c005a143
+[ 25.43s] write ead55e60 ea070a0c0d1b1f0098fe
+[ 25.67s] write 18345be0 <ssid>
+[ 25.94s] write 0d6f1880 03
+[ 26.15s] notify 18345be1 00
+[ 26.15s] write 0d6f1880 02
+[ 26.63s] write e182ec40 03
+[ 38.52s] wifi up after 11.7
+[ 38.52s] disconnected

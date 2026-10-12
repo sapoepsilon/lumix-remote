@@ -19,6 +19,7 @@ Everything up to the bleak import is plain 3.9-compatible Python.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as _dt
 import logging
 import re
@@ -77,6 +78,45 @@ ADV_STATES = {0: "normal", 1: "sleep", 2: "wakeup", 3: "pairing", 4: "sleep_pow_
 
 # WIFI_CONNECT_TYPE values (CH_WIFI_CMD).
 WIFI_SOFTAP, WIFI_STA, WIFI_STA_SSID_SET = 1, 2, 3
+# CH_WIFI_START purpose LUMIX Sync uses for "Remote shooting" (5 = SoftAP variant
+# for the *_fast sleep states). Proven on the S5 with Remote Wakeup, 2026-10-12.
+PURPOSE_REMOTE = 3
+
+# Connecting to a camera that sleeps with the switch OFF takes longer: 24-27 s
+# for CoreBluetooth to bring the link up on the S5 (bleak's old 20 s cut it off).
+CONNECT_TIMEOUT = 45.0
+
+
+class BleStepError(RuntimeError):
+    """A BLE failure tagged with the step it happened in, so a caller (the web
+    UI) can say "connect: ..." instead of a bare "TimeoutError:"."""
+
+    def __init__(self, step: str, message: str, need_pair: bool = False):
+        super().__init__("%s: %s" % (step, message))
+        self.step = step
+        self.need_pair = need_pair
+
+
+def describe(e: BaseException) -> str:
+    """One-line error text that is never empty ("TimeoutError: " was)."""
+    if isinstance(e, BleStepError):
+        return str(e)
+    msg = str(e).strip()
+    if isinstance(e, asyncio.TimeoutError) or type(e).__name__ == "TimeoutError":
+        return "timed out" + (" (%s)" % msg if msg else "")
+    return "%s: %s" % (type(e).__name__, msg) if msg else type(e).__name__
+
+
+def error_fields(e: BaseException, step: Optional[str] = None) -> Dict[str, Any]:
+    """{"error", "step", "need_pair"} for a lumix-ble JSON result."""
+    if not isinstance(e, BleStepError) and step:
+        e = BleStepError(step, describe(e))
+    out: Dict[str, Any] = {"error": describe(e)}
+    if isinstance(e, BleStepError):
+        out["step"] = e.step
+        if e.need_pair:
+            out["need_pair"] = True
+    return out
 
 # G9II ("APS" bodies) answer constants from the Aikhjarto capture. Not used by
 # S5-generation bodies, which write the plain client UUID instead.
@@ -281,9 +321,12 @@ class LumixBle:
     """One BLE session. Use as ``async with LumixBle(name) as cam: ...``."""
 
     def __init__(self, name: Optional[str] = None, scan_timeout: float = 20.0,
-                 on_event: Optional[Callable[[str], None]] = None):
+                 on_event: Optional[Callable[[str], None]] = None,
+                 connect_timeout: float = CONNECT_TIMEOUT, connect_tries: int = 2):
         self.name = name
         self.scan_timeout = scan_timeout
+        self.connect_timeout = connect_timeout
+        self.connect_tries = max(1, connect_tries)
         self.client = None
         self.found_name: Optional[str] = None   # advertised name of the camera we connected to
         self.address: Optional[str] = None
@@ -304,19 +347,37 @@ class LumixBle:
         await self.close()
 
     async def connect(self) -> None:
+        """Scan, then connect. A sleeping S5 (switch OFF, Remote Wakeup on)
+        advertises slowly and takes 24-27 s to accept the link, so the connect
+        timeout is long and one fresh scan + connect is retried."""
         bleak = _bleak()
-        dev = await find(self.name, self.scan_timeout)
-        if dev is None:
-            raise RuntimeError("camera not advertising (name=%s)" % (self.name or "any Lumix"))
-        self.ev("found %s" % (dev.name or dev.address))
-        self.found_name, self.address = dev.name or None, dev.address
+        last: Optional[BaseException] = None
+        for attempt in range(1, self.connect_tries + 1):
+            dev = await find(self.name, self.scan_timeout)
+            if dev is None:
+                raise BleStepError("scan", "camera not advertising over Bluetooth after %.0f s (%s); is it "
+                                   "in range with Bluetooth on (and Remote Wakeup on, if switched off)?"
+                                   % (self.scan_timeout, self.name or "any Lumix"))
+            self.ev("found %s" % (dev.name or dev.address))
+            self.found_name, self.address = dev.name or None, dev.address
+            self.disconnected.clear()
 
-        def on_disc(_c):
-            self.ev("disconnected")
-            self.disconnected.set()
-        self.client = bleak.BleakClient(dev, disconnected_callback=on_disc, timeout=20)
-        await self.client.connect()
-        self.ev("connected")
+            def on_disc(_c):
+                self.ev("disconnected")
+                self.disconnected.set()
+            self.client = bleak.BleakClient(dev, disconnected_callback=on_disc, timeout=self.connect_timeout)
+            try:
+                await self.client.connect()
+            except Exception as e:  # TimeoutError / BleakError
+                last = e
+                self.ev("connect try %d failed: %s" % (attempt, describe(e)))
+                with contextlib.suppress(Exception):
+                    await self.client.disconnect()
+                continue
+            self.ev("connected")
+            return
+        raise BleStepError("connect", "camera found but the Bluetooth link didn't come up (%s, %d tries of %.0f s)"
+                           % (describe(last) if last else "?", self.connect_tries, self.connect_timeout))
 
     async def close(self) -> None:
         if self.client is not None and self.client.is_connected:
@@ -329,9 +390,9 @@ class LumixBle:
     async def read(self, uuid: str, timeout: float = 10.0) -> bytes:
         return bytes(await asyncio.wait_for(self.client.read_gatt_char(uuid), timeout))
 
-    async def write(self, uuid: str, data: bytes, response: bool = True) -> None:
+    async def write(self, uuid: str, data: bytes, response: bool = True, timeout: float = 10.0) -> None:
         self.ev("write %s %s" % (uuid[:8], data.hex()))
-        await self.client.write_gatt_char(uuid, data, response=response)
+        await asyncio.wait_for(self.client.write_gatt_char(uuid, data, response=response), timeout)
 
     async def subscribe(self, uuid: str) -> None:
         q: asyncio.Queue = asyncio.Queue()
@@ -402,19 +463,42 @@ class LumixBle:
         await self.write(CH_FRIENDLY_NAME, name.encode("ascii", "replace")[:20])
 
     async def login(self) -> bytes:
-        """Register, then read INITIAL_INFORM (the XOR key)."""
-        await self.register()
-        await self.read(CH_CAMERA_SSID)   # LUMIX Sync reads this next; keep the order
-        key = await self.read(CH_INITIAL_INFORM)
+        """Register, then read INITIAL_INFORM (the XOR key).
+
+        A camera that doesn't know our client id drops the link right after
+        the friendly-name write (seen on the S5 when the id had changed: HCI
+        disconnect ~0.3 s after the write, before any read). That is the one
+        failure re-pairing (or restoring the old id) fixes, so it is tagged
+        need_pair."""
+        try:
+            await self.register()
+            await self.read(CH_CAMERA_SSID)   # LUMIX Sync reads this next; keep the order
+            key = await self.read(CH_INITIAL_INFORM)
+        except Exception as e:
+            if self.disconnected.is_set():
+                raise BleStepError(
+                    "login", "the camera hung up right after this computer's id (%s) was sent, so it "
+                    "doesn't know that id. Pair again (camera: Bluetooth > SET > Pairing), or restore the "
+                    "id it was paired with" % _client_id(), need_pair=True) from e
+            raise BleStepError("login", describe(e)) from e
         self.ev("initial_inform %s" % key.hex())
         return key
 
     async def set_clock(self) -> None:
         await self.write(CH_CLOCK, clock_payload())
 
-    async def wifi_join(self, ssid: Optional[str] = None, purpose: int = 1) -> None:
+    async def wifi_join(self, ssid: Optional[str] = None, purpose: int = PURPOSE_REMOTE) -> None:
         """Bring Wi-Fi up joined to a known network (the camera keeps the
-        password). Verified on the S5: SSID -> connect type 03 -> start 01."""
+        password), the way LUMIX Sync does for Remote shooting:
+
+          SSID -> connect type 03 ("SSID set") -> camera acks 18345be1 = 00
+          -> connect type 02 (STA) -> start e182ec40 = 03.
+
+        The 02 after the ack is what a camera woken from OFF needs: without it
+        (SSID, 03, start 01 -- enough while the camera's Wi-Fi was already up)
+        the body powered up but never joined the network. A non-zero ack means
+        the camera wants its own access point instead; that is reported, not
+        followed (it would take the camera off the home network)."""
         if not ssid:
             try:
                 ssid = parse_sta_ssid(await self.read(CH_CAMERA_STA_SSID, 8))
@@ -425,10 +509,19 @@ class LumixBle:
         ssid = ssid or current_ssid()
         if not ssid:
             raise RuntimeError("no home SSID (set LUMIX_HOME_SSID)")
+        q = self._waiters.get(CH_WIFI_CMD_ACK)
+        while q is not None and not q.empty():   # drop stale acks
+            q.get_nowait()
         await self.write(CH_WIFI_SSID, ssid_payload(ssid))
-        await asyncio.sleep(0.5)
         await self.write(CH_WIFI_CMD, bytes([WIFI_STA_SSID_SET]))
-        await asyncio.sleep(0.5)
+        ack = await self.wait_notify(CH_WIFI_CMD_ACK, 5.0)
+        if ack is None:
+            self.ev("no join ack from the camera; sending STA anyway")
+        elif ack[:1] != b"\x00":
+            raise BleStepError("wifi", "the camera answered %s to joining %r (it wants its own access point; "
+                               "is that network saved on the camera?)" % (ack.hex(), ssid))
+        await self.write(CH_WIFI_CMD, bytes([WIFI_STA]))
+        await asyncio.sleep(0.3)
         await self.write(CH_WIFI_START, bytes([purpose]))
 
 
@@ -508,7 +601,7 @@ async def status(name: Optional[str] = None, log: Callable[[str], None] = print,
                 out["saved"] = mark_registered(c.found_name or name, c.address)
     except Exception as e:
         out["registered"] = False
-        out["error"] = "%s: %s" % (type(e).__name__, e)
+        out.update(error_fields(e, "login"))
     return out
 
 
@@ -544,32 +637,48 @@ async def wait_wifi(ip: Optional[str], timeout: float) -> Optional[float]:
 
 async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait: float = 90.0,
                camera_ip: Optional[str] = None, log: Callable[[str], None] = print) -> Dict[str, Any]:
-    """Connect, register, sync clock, start Wi-Fi joined to the home network."""
+    """Connect, log in, sync the clock, start Wi-Fi joined to the home network,
+    then wait for the camera on :60606. Powers the body up from switch-OFF when
+    Remote Wakeup is on. Never raises: a failure comes back as {"ok": false,
+    "step": scan|connect|login|wifi|wifi-wait, "error": "<step>: ..."}."""
     t0 = time.time()
     out: Dict[str, Any] = {"ok": False}
     ip = camera_ip or _last_ip()
     out["ip"] = ip
     took = None
-    async with LumixBle(name, scan_timeout=30, on_event=log) as c:
+    c = LumixBle(name, scan_timeout=30, on_event=log)
+    step = "connect"
+    try:
+        await c.connect()
         out["ble_connected_s"] = round(time.time() - t0, 1)
+        step = "login"
         await c.login()
-        # login() read INITIAL_INFORM: an unknown central is cut off on its first read
+        # login() read INITIAL_INFORM: an unknown central is cut off before that
         out["registered"] = True
         out["saved"] = mark_registered(c.found_name or name, c.address)
         try:
             await c.set_clock()
         except Exception as e:
-            log("clock: %r" % e)
+            log("clock: %s" % describe(e))
+        step = "wifi"
         await c.wifi_join(ssid)
         out["wifi_cmd_s"] = round(time.time() - t0, 1)
-        # Stay connected while the camera brings Wi-Fi up: in the run that came
-        # up from Wi-Fi-off, the camera itself dropped BLE once Wi-Fi was up.
+        # Stay connected while the camera brings Wi-Fi up (11-40 s); the camera
+        # drops BLE itself once it is on the network.
+        step = "wifi-wait"
         took = await wait_wifi(ip, wifi_wait)
+    except Exception as e:
+        out.update(error_fields(e, step))
+    finally:
         out["notifies"] = c.notes
+        with contextlib.suppress(Exception):
+            await c.close()
     out["wifi_up_s"] = round(time.time() - t0, 1) if took is not None else None
     out["ok"] = took is not None
-    if not out["ok"]:
-        out["error"] = "camera did not answer on %s:60606 within %ds" % (ip, wifi_wait)
+    if not out["ok"] and "error" not in out:
+        out["step"] = "wifi-wait"
+        out["error"] = ("wifi-wait: the camera took the Wi-Fi command but didn't answer on %s:60606 within %ds"
+                        % (ip, wifi_wait) if ip else "wifi-wait: no camera IP known to check")
     return out
 
 

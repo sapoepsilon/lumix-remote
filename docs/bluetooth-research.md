@@ -107,6 +107,13 @@ A *read* before step 3 is what killed every earlier attempt (HCI 0x13). bleak/Co
 - Wi-Fi never appeared on the LAN (no ARP entry, no :60606 anywhere) within 60-120 s, whether or not BLE stayed connected.
 So the camera does *something* on wake but waits for a step we don't send yet. Prime suspect: with Remote Wakeup the app may expect to join the camera's SoftAP (LUMIX Sync's "wakeup" handling in HomeActivity). Next test: after a wake, look for the camera's SoftAP (`S5-…`) with a Wi-Fi scan, and read `e1392720` (camera IP, per the Image App prior art). Measuring power-off → wake timings is blocked on this.
 
+**Wake from switch-OFF, 2026-10-12 (trace: tests/fixtures/real-s5-ble-wake-2026-10-12.log).**
+- Connecting to the sleeping body takes 24-27 s (bleak's 20 s timeout produced the UI's bare "TimeoutError:"). Now 45 s, one retry.
+- The S5 hangs up ~0.3 s after the friendly-name write when the MEI0 id isn't the one it was paired with. Our id had changed overnight: `uuid.getnode()` picks a different interface in the server's Python 3.9 and the BLE helper's 3.14 (and changes with USB adapters). The default id is now derived from the machine id; the camera entry's `client_uuid` can be PATCHed back to the paired id.
+- With the paired id, SSID, `03`, start `01` powered the body up (adv state 02 -> 00, the screen came on) but it never joined Wi-Fi.
+- LUMIX Sync's Remote-shooting sequence (APK 2.0.17, I5.g write-complete chain): SSID -> `0d6f1880=03` -> ack `18345be1=00` -> `0d6f1880=02` (STA) -> `e182ec40=03`. That brought the camera onto the home network 11.7 s after the commands.
+- After that, the server's Wi-Fi handshake didn't finish: req_acc under the old id got `err_user_refused`; under the paired id cam.cgi replies came back one request late (e.g. a `getinfo lens` reply to `req_acc`), so the camera looked like it rejected the session. Then the battery ran out. Every wake powers the body up, so wakes are now capped at 2 per 10 min.
+
 **Wi-Fi join over BLE (verified 6+ times while the camera's Wi-Fi was already up, once from Wi-Fi-off).** After registration:
 1. Write `18345be0` = home SSID (32 B NUL-padded).
 2. Write `0d6f1880` = `03`; the camera notifies `18345be1 = 00` about 0.15 s later.

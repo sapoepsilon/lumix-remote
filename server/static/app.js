@@ -1766,7 +1766,7 @@ async function bleWake() {
   }
   clearInterval(wake.timer); wake.timer = null;
   wake.running = false; wake.secs = Math.round((Date.now() - wake.t0) / 1000);
-  wake.needPair = !wake.ok && wake.unsure;
+  wake.needPair = !wake.ok && (wake.unsure || !!(wake.data && wake.data.need_pair));
   if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); } else toast("Bluetooth wake failed: " + wake.error, true);
   renderWake();
 }

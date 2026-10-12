@@ -98,7 +98,8 @@ def main() -> None:
     except KeyboardInterrupt:
         res = {"ok": False, "error": "interrupted"}
     except Exception as e:
-        res = {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+        res = {"ok": False}
+        res.update(ble.error_fields(e))
     res.setdefault("elapsed_s", round(time.time() - t0, 1))
     _out(res)
     sys.exit(0 if res.get("ok") else 1)

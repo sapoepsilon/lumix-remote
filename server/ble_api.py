@@ -75,6 +75,12 @@ class BleManager:
         self.next_allowed = 0.0
         self.watchdog_note = ""
         self._task: Optional[asyncio.Task] = None
+        # Every BLE wake powers the body up; on 2026-10-12 a run of wake tests
+        # emptied the S5's battery. Cap wakes (manual, API, watchdog alike); never
+        # retried automatically.
+        self.wake_max = int(_env_float("LUMIX_BLE_WAKE_MAX", 2))
+        self.wake_window = _env_float("LUMIX_BLE_WAKE_WINDOW", 600)
+        self.wakes: Deque[float] = deque()
 
     @property
     def name(self) -> Optional[str]:
@@ -176,11 +182,27 @@ class BleManager:
             self.session.mgr.notify()
 
     # --------------------------------------------------------------- actions
+    def wake_blocked(self) -> Optional[str]:
+        """Why a wake isn't allowed right now (None = allowed)."""
+        now = time.time()
+        while self.wakes and now - self.wakes[0] >= self.wake_window:
+            self.wakes.popleft()
+        if len(self.wakes) >= self.wake_max:
+            wait = int(self.wake_window - (now - self.wakes[0])) + 1
+            return ("already tried %d Bluetooth wakes in the last %d min; each one powers the camera up "
+                    "and costs battery. Try again in %d s" % (len(self.wakes), self.wake_window // 60, wait))
+        return None
+
     async def wake(self) -> Dict[str, Any]:
+        why = self.wake_blocked()
+        if why:
+            return {"ok": False, "step": "limit", "error": why, "rate_limited": True}
+        self.wakes.append(time.time())
         args = ["wake"]
         if self.cam.ip:
             args += ["--camera-ip", self.cam.ip]
-        res = await self.run(*args)
+        # scan 30 s + connect 45 s, twice when the first link attempt fails, + 90 s for Wi-Fi
+        res = await self.run(*args, timeout=330)
         if res.get("ok"):
             ip = res.get("ip") or None
             cam = self.cam
@@ -199,6 +221,9 @@ class BleManager:
         registered), wait for the camera to drop off, then BLE wake."""
         t0 = time.time()
         res: Dict[str, Any] = {"reason": reason, "ip": self.cam.ip}
+        why = self.wake_blocked()
+        if why:   # don't switch it off when the wake after that would be refused
+            return dict(res, ok=False, step="limit", error=why, rate_limited=True)
         if self.session is not None and getattr(self.session, "running", False):
             # same central path as a power-off: imports/timelapse paused, recording stopped
             with contextlib.suppress(Exception):
@@ -294,6 +319,9 @@ class BleManager:
             "name": self.name, "running": self.running, "busy": self.lock.locked(),
             "registered": self.registered,
             "history": list(self.history),
+            "wakes": {"max": self.wake_max, "window_s": self.wake_window,
+                      "recent": sum(1 for t in self.wakes if time.time() - t < self.wake_window),
+                      "blocked": self.wake_blocked()},
             "watchdog": {"enabled": self.watchdog_enabled, "wedge_after_s": self.wedge_after,
                          "max_per_hour": self.max_per_hour, "cycles_last_hour":
                          sum(1 for t in self.cycles if time.time() - t < 3600),
@@ -324,7 +352,7 @@ async def ble_wake(request: web.Request) -> web.Response:
     if m.lock.locked():
         return _json({"error": "BLE busy (%s)" % m.running}, 409)
     res = await m.wake()
-    return _json(res, 200 if res.get("ok") else 502)
+    return _json(res, 200 if res.get("ok") else 429 if res.get("rate_limited") else 502)
 
 
 @_guard
@@ -333,7 +361,7 @@ async def ble_power_cycle(request: web.Request) -> web.Response:
     if m.lock.locked():
         return _json({"error": "BLE busy (%s)" % m.running}, 409)
     res = await m.power_cycle("api")
-    return _json(res, 200 if res.get("ok") else 502)
+    return _json(res, 200 if res.get("ok") else 429 if res.get("rate_limited") else 502)
 
 
 @_guard

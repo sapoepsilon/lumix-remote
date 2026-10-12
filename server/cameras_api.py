@@ -3,7 +3,7 @@
 GET    /api/cameras                  {"active", "cameras": [summary...], "models": [...]}
 POST   /api/cameras                  {"nickname"?, "model"?, "ip"?, "ports"?, "settings"?, "activate"?}
 GET    /api/cameras/{cam}            summary + "entry" (registry) + "profile" (full model profile)
-PATCH  /api/cameras/{cam}            {"nickname"?, "model"?, "ip"?, "ports"?, "settings"?, "device_name"?,
+PATCH  /api/cameras/{cam}            {"nickname"?, "model"?, "ip"?, "ports"?, "settings"?, "device_name"?, "client_uuid"?,
                                       "ble"?: {"name"?, "home_ssid"?}}   (POST works too)
 DELETE /api/cameras/{cam}            forget the camera (stops its session)
 POST   /api/cameras/{cam}/activate   make it the camera behind the /api/* aliases
@@ -20,7 +20,7 @@ from typing import Any, Dict
 
 from aiohttp import web
 
-from lumix import models
+from lumix import models, registry
 from lumix.registry import RegistryError
 from server.app import SESSIONS, _body, _json, session
 
@@ -73,6 +73,13 @@ def _fields(b: Dict[str, Any]) -> Dict[str, Any]:
         out["settings"] = st
     if "device_name" in b:
         out["device_name"] = str(b["device_name"] or "LumixRemote")[:32]
+    if "client_uuid" in b:
+        # The id this computer is paired as (BLE MEI0 write + Wi-Fi req_acc). Set it
+        # back to the one the camera knows when a pairing was made under another id.
+        cu = str(b["client_uuid"] or "").strip().upper()
+        if not registry.CLIENT_UUID_RE.match(cu):
+            raise ValueError("client_uuid must look like 4D454930-0100-1000-8001-XXXXXXXXXXXX")
+        out["client_uuid"] = cu
     if "ble" in b:
         if not isinstance(b["ble"], dict):
             raise ValueError("ble must be an object")

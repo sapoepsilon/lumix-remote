@@ -61,9 +61,46 @@ def pidfile_path() -> str:
     return os.path.join(config_dir(), "server.pid")
 
 
+CLIENT_UUID_RE = re.compile(r"^4D454930-0100-1000-8001-[0-9A-F]{12}$")
+
+
+def _machine_id() -> Optional[str]:
+    """A per-machine id that every Python on the box agrees on (macOS
+    IOPlatformUUID, Linux /etc/machine-id), or None."""
+    import subprocess
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    try:
+        out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True,
+                             text=True, timeout=5).stdout
+        m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def default_client_uuid() -> str:
-    """LUMIX Sync-style client id: fixed MEI0 prefix + 12 hex chars of this machine."""
-    return "4D454930-0100-1000-8001-%012X" % (uuid.getnode() & 0xFFFFFFFFFFFF)
+    """LUMIX Sync-style client id: fixed MEI0 prefix + 12 hex chars of this machine.
+
+    Not uuid.getnode(): it picks a different network interface in different
+    Python versions (the server's 3.9 and the BLE helper's 3.14 disagreed on
+    one Mac) and changes when a USB/Thunderbolt adapter comes or goes. The
+    camera only accepts the id it was paired with, over BLE and over Wi-Fi."""
+    mid = _machine_id()
+    if mid:
+        import hashlib
+        node = int.from_bytes(hashlib.sha256(("lumix-remote:" + mid).encode()).digest()[:6], "big")
+    else:
+        node = uuid.getnode()
+    return "4D454930-0100-1000-8001-%012X" % (node & 0xFFFFFFFFFFFF)
 
 
 def slugify(text: str, fallback: str = "camera") -> str:

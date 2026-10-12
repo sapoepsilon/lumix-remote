@@ -20,7 +20,6 @@ import datetime as dt
 import logging
 import os
 import time
-import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Set
@@ -107,9 +106,9 @@ class Bus:
 
 
 def _client_uuid() -> str:
-    # LUMIX Sync-style id: fixed prefix + 12 hex chars unique to this machine.
-    node = uuid.getnode() & 0xFFFFFFFFFFFF
-    return "4D454930-0100-1000-8001-%012X" % node
+    # LUMIX Sync-style id, the same one the BLE helper writes (see registry).
+    from .registry import default_client_uuid
+    return default_client_uuid()
 
 
 class Camera:
