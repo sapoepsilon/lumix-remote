@@ -59,7 +59,8 @@ log = logging.getLogger("lumix.timelapse")
 ACTIVE = ("scheduled", "running", "paused")
 FINISHING = ("stopping", "importing", "assembling")
 TERMINAL = ("done", "stopped", "failed")
-DEFAULT_DEST = "~/Pictures/Lumix"
+# Import root; LUMIX_IMPORT_DEST overrides it (QA, other disks).
+DEFAULT_DEST = os.environ.get("LUMIX_IMPORT_DEST") or "~/Pictures/Lumix"
 IMPORT_EACH_MIN_S = 30.0       # play-mode round trip per shot needs about this much room
 MIN_INTERVAL_S = 1.0
 MAX_INTERVAL_S = 24 * 3600.0

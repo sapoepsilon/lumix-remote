@@ -44,7 +44,8 @@ log = logging.getLogger("lumix.files")
 
 PAGE = 50                     # Browse page size
 LIST_TTL_S = 30.0             # re-validate the cached listing after this long
-DEFAULT_DEST = "~/Pictures/Lumix"
+# Import root; LUMIX_IMPORT_DEST overrides it (QA, other disks).
+DEFAULT_DEST = os.environ.get("LUMIX_IMPORT_DEST") or "~/Pictures/Lumix"
 CHUNK = 256 * 1024
 
 
