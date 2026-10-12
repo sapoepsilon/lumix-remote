@@ -145,6 +145,7 @@ class SessionManager:
         self.ble_lock = asyncio.Lock()      # one Bluetooth radio for every camera
         self._lock = asyncio.Lock()
         self.migration: Optional[Dict[str, Any]] = None
+        self._target: Optional[str] = None
 
     @classmethod
     def single(cls, cam: Camera) -> "SessionManager":
@@ -180,6 +181,13 @@ class SessionManager:
             store=RegistryStore(self.registry, e["id"]))
 
     def target_id(self) -> Optional[str]:
+        """The camera the command-line overrides (--camera-ip, ports, --model,
+        --lv-port) apply to: --camera, else the camera active at start-up. Fixed
+        once the cameras are loaded, so switching the active camera later never
+        moves the overrides (a restarted session would take the other camera's
+        live-view port)."""
+        if self._target is not None:
+            return self._target
         return self.opts.target or self.active_id
 
     def claimed_ips(self, for_id: str) -> Set[str]:
@@ -210,6 +218,7 @@ class SessionManager:
             # exactly like the single-camera server did.
             self.registry.add("Camera", cam_id="camera")
         self.active_id = self.registry.active_id()
+        self._target = self.opts.target or self.active_id
         for e in self.registry.cameras():
             self.sessions[e["id"]] = CameraSession(self, e)
 

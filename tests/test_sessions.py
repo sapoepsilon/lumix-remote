@@ -123,6 +123,28 @@ class SessionsTest(unittest.TestCase):
 
 
 class CommandLineOverrideTest(unittest.TestCase):
+    def test_overrides_stay_on_the_startup_camera(self):
+        """--lv-port etc. without --camera apply to the camera active at start-up;
+        activating another camera later must not hand it that port (QA 2026-10-12:
+        a restarted session clashed with the first camera's live-view port)."""
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"LUMIX_REMOTE_HOME": d}):
+            loop = asyncio.new_event_loop()
+            try:
+                reg = Registry()
+                reg.add("A", cam_id="a", activate=True, ports={"liveview": 49299})
+                reg.add("B", cam_id="b", ports={"liveview": 49300})
+
+                async def go():
+                    mgr = SessionManager(reg, ServerOptions(lv_port=49299))
+                    mgr.load()
+                    await mgr.set_active("b")
+                    return mgr, mgr.camera_config(reg.get("b")), mgr.camera_config(reg.get("a"))
+                mgr, b, a = loop.run_until_complete(go())
+                self.assertEqual(mgr.target_id(), "a")
+                self.assertEqual((a.lv_port, b.lv_port), (49299, 49300))
+            finally:
+                loop.close()
+
     def test_camera_ip_runs_only_the_target(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"LUMIX_REMOTE_HOME": d}):
             loop = asyncio.new_event_loop()
