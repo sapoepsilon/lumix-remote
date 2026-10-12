@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import urllib.parse
 from typing import Any
 
@@ -98,6 +99,13 @@ async def download(request: web.Request) -> web.StreamResponse:
         for h in ("Content-Length", "Content-Range", "Last-Modified"):
             if h in r.headers:
                 headers[h] = r.headers[h]
+        if "Content-Length" not in headers:
+            # the camera may omit it; we know the size from the DIDL / Content-Range
+            m = re.match(r"bytes (\d+)-(\d+)/", headers.get("Content-Range", ""))
+            if r.status == 206 and m:
+                headers["Content-Length"] = str(int(m.group(2)) - int(m.group(1)) + 1)
+            elif r.status == 200 and res.size:
+                headers["Content-Length"] = str(res.size)
         resp = web.StreamResponse(status=r.status, headers=headers)
         await resp.prepare(request)
         if request.method == "HEAD":

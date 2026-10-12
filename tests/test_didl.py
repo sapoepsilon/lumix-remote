@@ -90,3 +90,35 @@ class SyntheticDidlTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealS5Test(unittest.TestCase):
+    """Browse replies captured from a DC-S5 (fw 2.03) on 2026-10-11."""
+
+    def test_root_groups_and_single_files(self):
+        r = didl.parse_browse_response(_read("s5_cds_root.xml"))
+        self.assertEqual((r.returned, r.total), (12, 12))
+        items, conts = didl.parse_didl(r.didl)
+        self.assertEqual(len(conts), 9)
+        c = conts[0]
+        self.assertEqual((c.object_id, c.title, c.child_count, c.group_type),
+                         ("11024091DIR", "102-4091", 960, "Interval"))
+        self.assertTrue(c.thumb_url.endswith("/DT11024091.JPG"))
+        by = {i.object_id: i for i in items}
+        mp4, mov, jpg = by["11067148"], by["11090030"], by["11090991"]
+        self.assertEqual((mp4.name, mp4.kind, mp4.size), ("P1067148.MP4", "video", 44437838))
+        self.assertEqual((mov.name, mov.kind, mov.date), ("P1090030.MOV", "video", None))
+        self.assertEqual(mov.date_folder(), "undated")
+        self.assertEqual((jpg.name, jpg.kind, jpg.date), ("P1090991.JPG", "photo", "2020-02-25T15:13:25"))
+        self.assertEqual((jpg.thumb.name, jpg.preview.name), ("DT11090991.JPG", "DL11090991.JPG"))
+        self.assertFalse(jpg.to_dict()["has_raw"])
+
+    def test_group_children(self):
+        r = didl.parse_browse_response(_read("s5_cds_interval_group.xml"))
+        self.assertEqual((r.returned, r.total), (2, 960))
+        items, conts = didl.parse_didl(r.didl)
+        self.assertEqual(conts, [])
+        self.assertEqual([(i.id, i.name, i.parent_id, i.size) for i in items],
+                         [("11024091", "P1024091.JPG", "11024091DIR", 6471168),
+                          ("11024092", "P1024092.JPG", "11024091DIR", 7464448)])
+        self.assertEqual(items[0].date_folder(), "2020-02-10")

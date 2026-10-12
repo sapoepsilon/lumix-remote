@@ -35,7 +35,7 @@ from .protocol import CamError, CamTransport, Reply, parse_ddd, parse_state
 log = logging.getLogger("lumix.camera")
 
 CONFIG_DIR = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/lumix-remote"))
-BUSY_OK = {"ok", "err_busy", "err_critical"}  # recmode replies that may still mean "in rec"
+LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
 
 
 class Disconnected(Exception):
@@ -121,6 +121,11 @@ class Camera:
         self.body_busy = False             # camera NOTIFY "busy": someone is operating the body
         # Called once per wedge episode (e.g. a Bluetooth power-cycle hook).
         self.wedge_hooks: List[Any] = []
+        self._lv_running = False           # we sent startstream and have not stopped it
+        self._lv_pending: Optional[str] = None   # live-view start requested by an event
+        self._lv_backoff = 10.0
+        self._busy_ended = False
+        self._last_ok = time.monotonic()
         self._reconnect_req = asyncio.Event()
 
     # ------------------------------------------------------------------ utils
@@ -164,7 +169,9 @@ class Camera:
         if rep.result not in ("err_busy", "err_critical"):
             return
         self.busy_streak += 1
-        if self.busy_streak >= 4 and not self.wedged and not self.body_busy:
+        # cmd() retries err_busy 5 x 1 s, so 10 = two commands that exhausted
+        # LUMIX Sync's whole retry budget while the body is not reported busy
+        if self.busy_streak >= 10 and not self.wedged and not self.body_busy:
             self.wedged, self.wedged_since = True, time.time()
             self.log_event("warn", "camera is stuck answering err_busy to camcmd/startstream "
                                    "(shutter, video, mode switch, live view). Only a camera "
@@ -217,13 +224,21 @@ class Camera:
             self._ssdp_tr.close()
 
     async def _run(self) -> None:
-        try:
-            await self.listener.start()
-            await self.liveview.open()
-        except OSError as e:
-            log.error("cannot open local ports (another instance running?): %s", e)
-            self._set_status("error", "cannot open ports %d/%d: %s" % (
-                self.cfg.event_port, self.cfg.lv_port, e))
+        # A previous instance may still be shutting down: retry the ports for a
+        # while instead of giving up for good.
+        for attempt in range(30):
+            try:
+                await self.listener.start()
+                await self.liveview.open()
+                break
+            except OSError as e:
+                log.error("cannot open local ports (another instance running?): %s", e)
+                self._set_status("error", "cannot open ports %d/%d: %s (retrying)" % (
+                    self.cfg.event_port, self.cfg.lv_port, e))
+                await asyncio.sleep(2)
+        else:
+            self._set_status("error", "ports %d/%d stay in use; stop the other Lumix Remote "
+                             "instance" % (self.cfg.event_port, self.cfg.lv_port))
             return
         self._ssdp_tr = await discovery.start_ssdp_listener(self._on_ssdp)
         failures = 0
@@ -241,6 +256,13 @@ class Camera:
             except (CamError, Disconnected, OSError, asyncio.TimeoutError) as e:
                 failures += 1
                 self.connected_at = None
+                self._lv_running = False
+                # LUMIX Sync: on disconnect stopstream + UNSUBSCRIBE, then full reconnect
+                if self.transport is not None:
+                    with contextlib.suppress(Exception):
+                        await self.transport.cgi("stopstream", timeout=2)
+                with contextlib.suppress(Exception):
+                    await self.listener.unsubscribe()
                 self.listener.sid = None
                 msg = "camera powered off" if self.powered_off else str(e)
                 self._set_status("reconnecting", msg)
@@ -301,19 +323,25 @@ class Camera:
 
     # ------------------------------------------------------------- handshake
     async def _connect(self, ip: str) -> None:
+        """Connect in LUMIX Sync's order (docs/lumix-sync-wifi-flow.md section 4):
+        ddd, req_acc (1 s loop), SUBSCRIBE, 200 ms, raw_img_send, capability,
+        allmenu, curmenu, lens, touch_type, getstate, device_name; then the
+        live-view start (stopstream, recmode, startstream) once."""
         self.powered_off = False
         self._set_status("connecting", "contacting %s" % ip)
         if self.transport is None or self.transport.ip != ip:
             if self.transport is not None:
                 await self.transport.close()
-            self.transport = CamTransport(ip, trace=self._trace)
+            self.transport = CamTransport(ip, user_agent=LUMIX_SYNC_UA, trace=self._trace)
         t = self.transport
         self.liveview.camera_ip = ip
+        self.busy_streak = 0
+        self.wedged, self.wedged_since, self.body_busy = False, None, False
+        self._lv_running = False
         # 1. device description (also proves the camera is there)
         raw = await t.get_raw(60606, discovery.DDD_PATH, timeout=6)
         self.ddd = parse_ddd(raw)
         self._save_state(last_ip=ip)
-        await self._refresh_state()
         # 2. access request; "ok_under_research*" = wait (camera may show a prompt)
         deadline = time.monotonic() + self.cfg.approval_timeout_s
         while True:
@@ -327,23 +355,25 @@ class Camera:
                 self._set_status("connecting", "req_acc -> %s" % r.text)
             if time.monotonic() > deadline:
                 raise CamError("access not granted: %s" % r.text)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
         self.log_event("conn", "access granted: %s" % r.text)
-        await t.cgi("setsetting", "device_name", self.cfg.device_name)
-        # 3. event subscription (moves the S5 off its "Connecting" screen)
-        self.busy_streak = 0
-        self.wedged, self.wedged_since, self.body_busy = False, None, False
+        # 3. event subscription, right after the accept (moves the S5 off "Connecting")
         await self._subscribe_safely(ip)
-        # 4. capabilities, menus, lens
+        await asyncio.sleep(0.2)
+        # 4. read-only setup, as LUMIX Sync does it
+        await t.cgi("setsetting", "raw_img_send", "enable")
         cap = await t.cgi("getinfo", "capability")
         self.capability = _capability_dict(cap)
         await self._load_menu()
         await self.refresh_lens()
         tt = await t.cgi("getsetting", "touch_type")
         self.touch_type = tt.setting_value("touch_type")
-        # 5. record mode + live view
-        await self.ensure_rec()
-        await self._start_stream()
+        await self._refresh_state(strict=True)
+        await t.cgi("setsetting", "device_name", self.cfg.device_name)
+        self._last_ok = time.monotonic()
+        # 5. live view start (the only recmode at connect)
+        if self.liveview_wanted:
+            await self.start_liveview("connect")
         self.connected_at = time.time()
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
 
@@ -355,6 +385,8 @@ class Camera:
         if os.path.exists(cache):
             with open(cache, "rb") as f:
                 raw = f.read()
+            # LUMIX Sync always reads allmenu at connect; cheap enough to keep the order
+            await self.transport.cgi("getinfo", "allmenu", timeout=20)
         if raw is None:
             r = await self.transport.cgi("getinfo", "allmenu", timeout=20)
             if not r.ok:
@@ -384,19 +416,18 @@ class Camera:
         self.lens = exposure.parse_lens(r.csv) if r.csv else {}
 
     async def _subscribe_safely(self, ip: str) -> None:
-        """SUBSCRIBE only while the camera is in play mode, then let it settle.
+        """SUBSCRIBE once per session, only while the camera is in play mode.
 
-        On the S5 a fresh SUBSCRIBE while the camera is in *rec* mode makes it
-        switch itself to play; a recmode sent during that switch answers
-        err_critical and leaves every later camcmd answering err_busy until a
-        power cycle (reproduced 2026-10-11 21:24). After boot the camera is in
-        play mode, so the normal connect is unaffected; this matters for
-        re-subscribing on a running session.
+        On the S5 a SUBSCRIBE while the camera is in *rec* makes it switch
+        itself to play; a recmode sent during that switch answers err_critical
+        and leaves every later camcmd answering err_busy until a power cycle
+        (reproduced 2026-10-11 21:24). A freshly accepted camera sits in play,
+        so normally no playmode is needed here.
         """
         assert self.transport
         await self._refresh_state()
         if self.state.get("cammode") == "rec":
-            r = await self.transport.cgi("camcmd", value="playmode")
+            r = await self.cmd("camcmd", value="playmode")
             for _ in range(10):
                 await asyncio.sleep(0.4)
                 await self._refresh_state()
@@ -404,58 +435,80 @@ class Camera:
                     break
             self.log_event("conn", "playmode before SUBSCRIBE -> %s (cammode=%s)"
                            % (r.result, self.state.get("cammode")))
+        await self.listener.unsubscribe()
         try:
             sub = await self.listener.subscribe(ip)
             self.log_event("conn", "event subscription: %s" % sub)
         except (OSError, asyncio.TimeoutError) as e:
             self.log_event("warn", "event subscription failed: %s" % e)
-            return
-        # Give the camera's own reaction to the subscription time to finish.
-        modes = []
-        for _ in range(6):
-            await asyncio.sleep(0.5)
-            await self._refresh_state()
-            modes.append(self.state.get("cammode"))
-        self.log_event("conn", "after SUBSCRIBE cammode %s" % "/".join(str(m) for m in modes))
 
-    async def _resubscribe(self) -> None:
-        """Subscription lost (renew refused): pause live view, re-subscribe from
-        play mode, then back to rec + live view."""
-        assert self.transport and self.ip
-        async with self.exclusive("resubscribe"):
-            await self.transport.cgi("stopstream", timeout=4)
-            await self._subscribe_safely(self.ip)
-            if self.liveview_wanted:
-                await self.ensure_rec()
-                await self._start_stream()
+    async def cmd(self, mode: str, type: Optional[str] = None, value: Optional[str] = None,
+                  value2: Optional[str] = None, timeout: float = 6.0, tries: int = 5) -> Reply:
+        """LUMIX Sync retry rule: on err_busy wait 1 s and retry, at most 5 tries,
+        then return the last reply. No other command is sent in between."""
+        assert self.transport
+        r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+        n = 1
+        while r.result == "err_busy" and n < tries and not self.wedged:
+            await asyncio.sleep(1.0)
+            r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+            n += 1
+        return r
 
     async def ensure_rec(self) -> bool:
-        """Put the camera in record mode. err_busy can mean 'already in rec'."""
+        """camcmd recmode (5 x 1 s on err_busy); True when getstate says rec."""
         assert self.transport
-        for attempt in range(3):
-            r = await self.transport.cgi("camcmd", value="recmode")
-            await asyncio.sleep(0.3)
+        r = await self.cmd("camcmd", value="recmode")
+        for _ in range(8):
+            await asyncio.sleep(0.4)
             await self._refresh_state()
             if self.state.get("cammode") == "rec":
                 return True
-            if r.result not in BUSY_OK:
-                self.log_event("warn", "recmode -> %s" % r.result)
-            await asyncio.sleep(1)
+        if r.result not in ("ok",):
+            self.log_event("warn", "recmode -> %s" % r.result)
         return False
 
-    async def _start_stream(self) -> None:
+    async def start_liveview(self, reason: str) -> bool:
+        """LUMIX Sync's live-view start, run once per lifecycle event:
+        stopstream -> recmode -> startstream (each 5 x 1 s on err_busy)."""
         assert self.transport
-        r = await self.transport.cgi("startstream", value=str(self.cfg.lv_port))
         self._lv_restart_at = time.monotonic()
-        if not r.ok:
-            self.log_event("warn", "startstream -> %s" % r.result)
+        if self.body_busy or self.wedged:
+            self.log_event("lv", "live view start (%s) skipped: camera %s"
+                           % (reason, "in use" if self.body_busy else "wedged"))
+            return False
+        await self.cmd("stopstream")
+        await self._refresh_state()
+        # recmode only when needed: every recmode makes the camera echo
+        # lens_Atta/mod_Rec, and recmode churn is part of how the S5 wedges
+        if self.state.get("cammode") != "rec" and not await self.ensure_rec():
+            self._lv_running = False
+            self.log_event("warn", "live view start (%s): camera stays in %s"
+                           % (reason, self.state.get("cammode")))
+            return False
+        r = await self.cmd("startstream", value=str(self.cfg.lv_port))
+        self._lv_running = r.ok
+        self.log_event("lv", "live view start (%s): startstream -> %s" % (reason, r.result))
+        return r.ok
+
+    async def stop_liveview(self, reason: str) -> None:
+        if self.transport is None:
+            return
+        self._lv_running = False
+        with contextlib.suppress(CamError):
+            await self.transport.cgi("stopstream", timeout=4)
+        self.log_event("lv", "live view stopped (%s)" % reason)
 
     # ------------------------------------------------------------ supervisor
-    async def _refresh_state(self) -> None:
+    async def _refresh_state(self, strict: bool = False) -> None:
+        """getstate; with strict=True an err_reject raises (camera dropped us)."""
         assert self.transport
         r = await self.transport.cgi("getstate", timeout=4)
+        if r.result == "err_reject" and strict:
+            raise Disconnected("getstate -> err_reject (camera dropped the session)")
         if not r.ok:
             return
+        self._last_ok = time.monotonic()
         new = parse_state(r)
         if new != self.state:
             old = self.state
@@ -488,63 +541,109 @@ class Camera:
             self.bus.publish("exposure", self.exposure_dict())
 
     async def _supervise(self) -> None:
+        """1 Hz getstate. Like LUMIX Sync: err_reject, 3 failed polls in a row or
+        30 s without a good reply = disconnected (full reconnect)."""
         assert self.transport
         fails = 0
         tick = 0
         last_menu = time.monotonic()
+        self._last_ok = time.monotonic()
         while True:
             await asyncio.sleep(self.cfg.keepalive_s)
             tick += 1
             if self._reconnect_req.is_set():
                 raise Disconnected("reconnect requested")
             try:
-                await self._refresh_state()
+                await self._refresh_state(strict=True)
                 fails = 0
             except CamError as e:
                 fails += 1
                 if fails >= 3:
                     raise Disconnected("keepalive failed 3x: %s" % e)
                 continue
+            if time.monotonic() - self._last_ok > 30:
+                raise Disconnected("no good getstate for 30 s")
+            if (self._lv_pending and not self._op_lock.locked()
+                    and time.monotonic() - self._lv_restart_at > 5):
+                reason, self._lv_pending = self._lv_pending, None
+                if self.liveview_wanted:
+                    try:
+                        async with self.exclusive("liveview"):
+                            await self.start_liveview(reason)
+                    except Busy:
+                        self._lv_pending = reason
             try:
-                if self.state.get("cammode") == "rec" and tick % 2 == 0:
+                if (self.state.get("cammode") == "rec" and not self.body_busy
+                        and tick % 3 == 0):
                     await self.refresh_exposure()
                 if self.listener.needs_renew():
                     rr = await self.listener.renew(fallback=False)
                     if rr.get("status") != 200:
-                        self.log_event("warn", "subscription renew refused (%s); re-subscribing" % rr)
-                        await self._resubscribe()
-                if self._menu_dirty.is_set() or time.monotonic() - last_menu > 15:
+                        # LUMIX Sync never re-subscribes a live session: tear down
+                        raise Disconnected("subscription renew refused: %s" % rr)
+                if self._menu_dirty.is_set() or time.monotonic() - last_menu > 60:
                     self._menu_dirty.clear()
                     last_menu = time.monotonic()
-                    if not self._op_lock.locked():
+                    if not self._op_lock.locked() and not self.body_busy:
                         await self.refresh_menu()
                 await self._liveview_watchdog()
             except CamError as e:
                 log.warning("supervisor step failed: %s", e)
 
     async def _liveview_watchdog(self) -> None:
-        if not self.liveview_wanted or self._op_lock.locked():
+        """No periodic recmode/startstream (that fed the err_busy wedge). One
+        restart attempt, with growing back-off, only when the camera is in rec,
+        not in use and not wedged; a camera-side switch to play is respected."""
+        if (not self.liveview_wanted or self._op_lock.locked() or self.body_busy
+                or self.wedged or self.state.get("cammode") != "rec"):
             return
         age = self.liveview.age
-        stale = age is None or age > 3
-        if stale and time.monotonic() - self._lv_restart_at > 5:
-            if self.state.get("cammode") != "rec":
-                await self.ensure_rec()
-            await self._start_stream()
-            self.log_event("lv", "live view (re)started")
+        stale = age is None or age > 5
+        if not stale:
+            self._lv_backoff = 10.0
+            return
+        if time.monotonic() - self._lv_restart_at < self._lv_backoff:
+            return
+        self._lv_backoff = min(self._lv_backoff * 2, 120.0)
+        async with self.exclusive("liveview"):
+            await self.start_liveview("watchdog, no frames for %ss" % (round(age) if age else "?"))
 
     async def _on_notify(self, ev: Dict[str, Any]) -> None:
+        """X_Panasonic_Cam_Sync handling as in LUMIX Sync (flow doc section 6)."""
         for p in ev.get("props", []):
             name, value = p["name"], p["value"]
             if name in ("SourceProtocolInfo", "SinkProtocolInfo"):
                 continue
             self.log_event("notify", "%s=%s" % (name, value), name=name, value=value)
-            if name == "X_Panasonic_Cam_Sync":
-                self._menu_dirty.set()
-                # "busy" = someone operates the camera body; "update"/lens_* when done
-                self.body_busy = value == "busy"
-                if value.startswith("lens") and self.transport:
-                    asyncio.ensure_future(self._safe(self.refresh_lens()))
+            if name != "X_Panasonic_Cam_Sync":
+                continue
+            self._menu_dirty.set()
+            if value in ("busy", "busy_no_msg"):
+                if not self.body_busy:
+                    self.body_busy = True
+                    self.bus.publish("status", self.status_dict())
+                    if self._lv_running:
+                        asyncio.ensure_future(self._safe(self.stop_liveview("camera in use")))
+            elif value == "update":
+                self._busy_ended = self.body_busy
+                self.body_busy = False
+                self.bus.publish("status", self.status_dict())
+            elif value == "lens_Atta":
+                # After a busy window lens_Atta means "camera usable again": restart
+                # live view once. Outside a busy window it is just the camera's echo
+                # of our own recmode; reacting to it would loop recmode -> lens_Atta
+                # -> recmode, which wedged the S5 (2026-10-11 22:01).
+                if self.body_busy or self._busy_ended:
+                    self._busy_ended = False
+                    if self.liveview_wanted:
+                        self._lv_pending = "lens_Atta after camera use"
+                self.body_busy = False
+                self.bus.publish("status", self.status_dict())
+            elif value == "mod_Play":
+                self._lv_pending = None   # never pull the camera back to rec
+            # mod_Play: ignored on purpose (never pull the camera back to rec)
+            if value.startswith("lens") and self.transport:
+                asyncio.ensure_future(self._safe(self.refresh_lens()))
 
     @staticmethod
     async def _safe(coro) -> None:
@@ -569,10 +668,17 @@ class Camera:
             self._op_lock.release()
 
     # ------------------------------------------------------------- commands
+    def _check_usable(self) -> None:
+        if self.body_busy:
+            raise Busy("camera is being operated on the body (waiting for it to finish)")
+        if self.wedged:
+            raise Busy("camera is stuck answering err_busy; power-cycle it")
+
     async def capture(self) -> Dict[str, Any]:
         async with self.exclusive("capture") as t:
             before = self.state.get("remaincapacity")
-            r = await t.cgi("camcmd", value="capture", timeout=15)
+            self._check_usable()
+            r = await self.cmd("camcmd", value="capture", timeout=15)
             self.log_event("cmd", "capture -> %s" % r.result)
             # the camera needs a moment to write; watch remaincapacity / sd_access
             changed = False
@@ -582,14 +688,14 @@ class Camera:
                 if self.state.get("remaincapacity") != before:
                     changed = True
                     break
-            # Some bodies need this to leave the review screen; harmless otherwise.
-            await t.cgi("camcmd", value="autoreviewunlock")
             return {"result": r.result, "remain_before": before,
                     "remain_after": self.state.get("remaincapacity"), "count_changed": changed}
 
     async def video(self, start: bool) -> Dict[str, Any]:
         async with self.exclusive("video") as t:
-            r = await t.cgi("camcmd", value="video_recstart" if start else "video_recstop", timeout=10)
+            if start:
+                self._check_usable()
+            r = await self.cmd("camcmd", value="video_recstart" if start else "video_recstop", timeout=10)
             self.log_event("cmd", "%s -> %s" % ("video_recstart" if start else "video_recstop", r.result))
             await asyncio.sleep(0.5)
             await self._refresh_state()
@@ -603,13 +709,14 @@ class Camera:
             # A second "on" without a release answers err_reject.
             r = await t.cgi("camctrl", "touch", "%d/%d" % (x, y), "on")
             await asyncio.sleep(0.15)
-            r2 = await t.cgi("camctrl", "touch", "%d/%d" % (x, y), "off")
+            r2 = await t.cgi("camctrl", "touch", "0/0", "off")  # LUMIX Sync always releases at 0/0
             self.log_event("cmd", "touch AF %d/%d -> %s, release -> %s" % (x, y, r.result, r2.result))
             return {"result": r.result, "release": r2.result}
 
     async def oneshot_af(self) -> Dict[str, Any]:
         async with self.exclusive("af") as t:
-            r = await t.cgi("camcmd", value="oneshot_af")
+            self._check_usable()
+            r = await self.cmd("camcmd", value="oneshot_af")
             self.log_event("cmd", "oneshot_af -> %s" % r.result)
             return {"result": r.result}
 
@@ -643,7 +750,7 @@ class Camera:
         if value == "poweroff":
             return await self.poweroff()
         async with self.exclusive("camcmd") as t:
-            r = await t.cgi("camcmd", value=value, timeout=15)
+            r = await self.cmd("camcmd", value=value, timeout=15)
             self.log_event("cmd", "camcmd %s -> %s" % (value, r.result))
             await asyncio.sleep(0.3)
             await self._refresh_state()

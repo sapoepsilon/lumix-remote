@@ -34,7 +34,7 @@ NS = {
 
 SOAP_ACTION = '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"'
 CDS_PATH = "/Server0/CDS_control"
-UA = "Panasonic Android/1 DM-CP"
+UA = "Panasonic MIL DLNA CP UPnP/1.0"   # what LUMIX Sync sends on its Java Browse
 
 RAW_EXT = {".rw2", ".raw"}
 VIDEO_EXT = {".mp4", ".mov", ".mts", ".m2ts", ".avi"}
@@ -194,8 +194,13 @@ class FileItem:
             if o is not None and posixpath.splitext(t)[1].lower() != o.ext:
                 return posixpath.splitext(t)[0] + o.ext.upper()
             return t
+        m = re.fullmatch(r"(\d{3})-(\d{4})", t)
+        if m:
+            # S5 titles are "<folder>-<number>"; the card file is P<folder><number>.<EXT>
+            # (folder 102_PANA, file P1024091.JPG)
+            t = "P%s%s" % m.groups()
         if o is not None:
-            base = posixpath.splitext(t)[0] if t else o.name[2:] if o.prefix else posixpath.splitext(o.name)[0]
+            base = t or (o.name[2:] if o.prefix else posixpath.splitext(o.name)[0])
             return base + o.ext.upper()
         return t or self.object_id
 
@@ -224,7 +229,7 @@ class FileItem:
 
     def date_folder(self) -> str:
         d = parse_date(self.date)
-        return (d or dt.datetime.now()).strftime("%Y-%m-%d")
+        return d.strftime("%Y-%m-%d") if d else "undated"   # e.g. S5 .MOV items carry no dc:date
 
     def to_dict(self) -> Dict[str, Any]:
         return {"id": self.id, "name": self.name, "kind": self.kind, "date": self.date,
@@ -233,9 +238,12 @@ class FileItem:
 
 @dataclass
 class Container:
+    """A camera-side group (time lapse, burst, stop motion): one folder of items."""
     object_id: str
     title: str
     child_count: Optional[int]
+    group_type: str = ""          # pana:X_RecGroupType, e.g. "Interval"
+    thumb_url: Optional[str] = None
 
 
 def _int(v: Optional[str]) -> Optional[int]:
@@ -271,7 +279,9 @@ def parse_didl(didl: str) -> Tuple[List[FileItem], List[Container]]:
         if tag == "container":
             conts.append(Container(object_id=el.get("id", ""),
                                    title=el.findtext("dc:title", "", NS),
-                                   child_count=_int(el.get("childCount"))))
+                                   child_count=_int(el.get("childCount")),
+                                   group_type=el.findtext("pana:X_RecGroupType", "", NS) or "",
+                                   thumb_url=el.findtext("pana:X_ThumbURI", None, NS)))
             continue
         if tag != "item":
             continue

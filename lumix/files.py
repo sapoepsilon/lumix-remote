@@ -81,6 +81,28 @@ class _LRU:
         self.size = 0
 
 
+class _Entry:
+    """One top-level card entry: a single file or a group container."""
+
+    def __init__(self, item: Optional[FileItem] = None, cont: Optional[didl.Container] = None):
+        self.item = item
+        self.cont = cont
+        oid = (item.object_id if item is not None else cont.object_id if cont is not None else "")
+        digits = "".join(ch for ch in oid if ch.isdigit())
+        self.number = int(digits) if digits else 0
+
+    @property
+    def count(self) -> int:
+        return 1 if self.item is not None else (self.cont.child_count or 0) if self.cont else 0
+
+    @property
+    def kind(self) -> str:
+        if self.item is not None:
+            return self.item.kind
+        # camera groups (time lapse "Interval", burst, stop motion) hold stills
+        return "photo"
+
+
 class ImportJob:
     def __init__(self, ids: List[str], dest: str, include_raw: bool):
         self.id = uuid.uuid4().hex[:12]
@@ -124,7 +146,8 @@ class FileBrowser:
         self.active = False            # we put the camera in play mode
         self.last_used = 0.0
         self.pins = 0                  # running downloads / jobs
-        self.items: Optional[List[FileItem]] = None   # newest first
+        self.entries: Optional[List[_Entry]] = None   # card root, newest first
+        self.children: Dict[str, Dict[int, FileItem]] = {}   # group id -> index -> item
         self.by_id: Dict[str, FileItem] = {}
         self.total_probe: Optional[int] = None
         self.listed_at = 0.0
@@ -177,7 +200,8 @@ class FileBrowser:
                 "pins": self.pins, "idle_timeout_s": self.idle_timeout_s,
                 "idle_left_s": (max(0.0, round(self.idle_timeout_s - (time.time() - self.last_used), 1))
                                 if self.active else None),
-                "cached_items": len(self.items) if self.items is not None else None,
+                "cached_items": len(self.by_id) if self.entries is not None else None,
+                "card_files": sum(e.count for e in self.entries) if self.entries is not None else None,
                 "listed_at": self.listed_at or None, "last_error": self.last_error,
                 "jobs": [j.id for j in self.jobs.values() if j.state in ("queued", "running")]}
 
@@ -189,7 +213,7 @@ class FileBrowser:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(force_close=True, limit=4),
-                headers={"User-Agent": didl.UA})
+                headers={"User-Agent": "LUMIX Sync"})
         return self._session
 
     # ---------------------------------------------------------------- mode
@@ -199,18 +223,29 @@ class FileBrowser:
         if self.active and self.cam.state.get("cammode") == "play":
             return
         cam = self.cam
-        if getattr(cam, "wedged", False):
+        # camera reconnecting (e.g. a power cycle): wait a little, then fail fast
+        for _ in range(40):
+            if getattr(cam, "status", "ready") == "ready":
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise ModeError("camera not connected (%s)" % cam.status)
+        if getattr(cam, "wedged", False) and cam.state.get("cammode") != "play":
             raise ModeError("camera is stuck answering err_busy to mode switches; "
                             "power-cycle the camera")
+        if getattr(cam, "body_busy", False):
+            raise ModeError("camera is being operated on the body; try again when it is done")
         async with cam.exclusive("files") as t:
             if not self.active:
-                self.items = None   # new browsing session: the card may have changed
-                self.by_id = {}
+                self.entries = None   # new browsing session: the card may have changed
+                self.children = {}    # (by_id is kept: object ids are stable for a card)
             cam.liveview_wanted = False
             self.active = True
-            with contextlib.suppress(Exception):
-                await t.cgi("stopstream", timeout=4)
-            ok, last = await self._switch(t, "playmode", "play")
+            await cam.stop_liveview("file browsing")
+            if cam.state.get("cammode") == "play":
+                ok, last = True, "already in play"
+            else:
+                ok, last = await self._switch(t, "playmode", "play")
             if not ok:
                 cam.liveview_wanted = True
                 self.active = False
@@ -219,25 +254,24 @@ class FileBrowser:
                 raise ModeError("camera refused play mode (%s)" % last)
             self.last_error = None
             cam.log_event("files", "play mode for file browsing (live view paused)")
-            await asyncio.sleep(1.0)  # CDS answers 701 for a moment after the switch
+            ci = await t.cgi("get_content_info")   # as LUMIX Sync does before browsing
+            log.info("get_content_info -> %s %s", ci.result, ci.text[-160:].replace("\n", " "))
+            await asyncio.sleep(0.5)  # CDS answers 701 for a moment after the switch
         self._publish()
 
     async def _switch(self, t: Any, cmd: str, want: str) -> Tuple[bool, str]:
+        """camcmd playmode/recmode with LUMIX Sync's retry rule (5 x 1 s on
+        err_busy), then wait for getstate to agree."""
         cam = self.cam
-        last = ""
-        for attempt in range(4):
-            r = await t.cgi("camcmd", value=cmd, timeout=10)
-            last = r.result or r.text[:40]
-            for _ in range(8):
-                await asyncio.sleep(0.4)
-                with contextlib.suppress(Exception):
-                    await cam._refresh_state()
-                if cam.state.get("cammode") == want:
-                    return True, last
-            if getattr(cam, "wedged", False):
-                break   # camcmd wedge: retrying does not help, only a power cycle
-            await asyncio.sleep(0.8)
-        return cam.state.get("cammode") == want, last
+        r = await cam.cmd("camcmd", value=cmd, timeout=10)
+        last = r.result or r.text[:40]
+        for _ in range(10):
+            await asyncio.sleep(0.4)
+            with contextlib.suppress(Exception):
+                await cam._refresh_state()
+            if cam.state.get("cammode") == want:
+                return True, last
+        return False, last
 
     async def leave(self, force: bool = False) -> Dict[str, Any]:
         """Back to rec mode and resume live view (unless a transfer is running)."""
@@ -246,10 +280,12 @@ class FileBrowser:
         cam = self.cam
         result = "not active"
         if self.active:
-            async with cam.exclusive("files") as t:
-                ok, result = await self._switch(t, "recmode", "rec")
+            async with cam.exclusive("files"):
+                # leaving playback = LUMIX Sync's live-view start (stopstream, recmode, startstream)
                 self.active = False
-                cam.liveview_wanted = True   # the watchdog restarts the stream
+                cam.liveview_wanted = True
+                ok = await cam.start_liveview("files done")
+                result = "ok" if ok else "failed (cammode=%s)" % cam.state.get("cammode")
                 cam.log_event("files", "left file browsing: recmode -> %s, cammode=%s"
                               % (result, cam.state.get("cammode")))
         self._publish()
@@ -269,7 +305,8 @@ class FileBrowser:
     async def _browse(self, object_id: str, start: int, count: int) -> didl.BrowseResult:
         sess = await self._sess()
         url = "http://%s:60606%s" % (self.cam.ip, didl.CDS_PATH)
-        headers = {"SOAPACTION": didl.SOAP_ACTION, "Content-Type": 'text/xml; charset="utf-8"'}
+        headers = {"SOAPACTION": didl.SOAP_ACTION, "Content-Type": 'text/xml; charset="utf-8"',
+                   "User-Agent": didl.UA}
         body = didl.browse_body(object_id, start, count)
         for attempt in range(3):
             try:
@@ -291,55 +328,100 @@ class FileBrowser:
                 raise
         raise ModeError("Browse failed")
 
-    async def _list_all(self) -> List[FileItem]:
-        out: List[FileItem] = []
-        todo = ["0"]
-        seen = set()
-        ids = set()
-        while todo:
-            oid = todo.pop(0)
-            if oid in seen:
-                continue
-            seen.add(oid)
-            start = 0
-            while True:
-                res = await self._browse(oid, start, self.page)
-                items, conts = didl.parse_didl(res.didl)
-                for it in items:
-                    if it.id not in ids:
-                        ids.add(it.id)
-                        out.append(it)
-                todo.extend(c.object_id for c in conts)
-                start += res.returned
-                if oid == "0":
-                    self.total_probe = res.total
-                if res.returned == 0 or start >= res.total:
-                    break
-        out.sort(key=lambda i: i.sort_key(), reverse=True)
-        return out
+    async def _root(self) -> List["_Entry"]:
+        """Top level of the card: single items and group containers, newest first."""
+        entries: List[_Entry] = []
+        start = 0
+        total = 0
+        while True:
+            res = await self._browse("0", start, self.page)
+            items, conts = didl.parse_didl(res.didl)
+            for it in items:
+                entries.append(_Entry(item=it))
+            for c in conts:
+                entries.append(_Entry(cont=c))
+            start += res.returned
+            total = res.total
+            if res.returned == 0 or start >= res.total:
+                break
+        self.total_probe = total
+        # The camera lists in file-number order (= shooting order); newest first.
+        entries.sort(key=lambda e: e.number, reverse=True)
+        return entries
 
-    async def list(self, offset: int = 0, limit: int = 60, kind: str = "all",
-                   refresh: bool = False) -> Dict[str, Any]:
-        if kind not in ("all", "photo", "video"):
-            raise ValueError("kind must be all|photo|video")
-        await self.ensure_play()
+    async def _ensure_root(self, refresh: bool) -> List["_Entry"]:
         async with self._list_lock:
-            if self.items is not None and not refresh and time.time() - self.listed_at > LIST_TTL_S:
+            if self.entries is not None and not refresh and time.time() - self.listed_at > LIST_TTL_S:
                 probe = await self._browse("0", 0, 1)
                 if probe.total != self.total_probe:
                     refresh = True
                 else:
                     self.listed_at = time.time()
-            if self.items is None or refresh:
+            if self.entries is None or refresh:
                 t0 = time.time()
-                self.items = await self._list_all()
-                self.by_id = {i.id: i for i in self.items}
+                self.entries = await self._root()
+                self.children = {}
                 self.listed_at = time.time()
-                log.info("files: listed %d items in %.1fs", len(self.items), time.time() - t0)
-        self.touch()
-        sel = self.items if kind == "all" else [i for i in self.items if i.kind == kind]
+                for e in self.entries:
+                    if e.item is not None:
+                        self.by_id[e.item.id] = e.item
+                log.info("files: card root has %d entries (%d files) in %.1fs", len(self.entries),
+                         sum(e.count for e in self.entries), time.time() - t0)
+            return self.entries
+
+    async def _children(self, c: didl.Container, lo: int, hi: int) -> Dict[int, FileItem]:
+        """Child items with container index lo..hi-1 (cached per container)."""
+        cache = self.children.setdefault(c.object_id, {})
+        missing = [i for i in range(lo, hi) if i not in cache]
+        while missing:
+            a = missing[0]
+            n = min(self.page, hi - a)
+            res = await self._browse(c.object_id, a, n)
+            items, _ = didl.parse_didl(res.didl)
+            for k, it in enumerate(items):
+                cache[a + k] = it
+                self.by_id[it.id] = it
+            if not items:
+                break
+            missing = [i for i in missing if i not in cache]
+        return cache
+
+    async def list(self, offset: int = 0, limit: int = 60, kind: str = "all",
+                   refresh: bool = False) -> Dict[str, Any]:
+        """Newest first. Groups (time lapse etc.) are expanded lazily, so a page
+        costs one Browse per touched group, never a walk of the whole card."""
+        if kind not in ("all", "photo", "video"):
+            raise ValueError("kind must be all|photo|video")
+        await self.ensure_play()
+        entries = await self._ensure_root(refresh)
+        sel = entries if kind == "all" else [e for e in entries if e.kind == kind]
+        total = sum(e.count for e in sel)
         offset, limit = max(0, int(offset)), max(1, min(500, int(limit)))
-        return {"total": len(sel), "items": [self.item_dict(i) for i in sel[offset:offset + limit]]}
+        out: List[FileItem] = []
+        pos = 0
+        for e in sel:
+            if len(out) >= limit:
+                break
+            if pos + e.count <= offset:
+                pos += e.count
+                continue
+            if e.item is not None:
+                out.append(e.item)
+                pos += 1
+                continue
+            c = e.cont
+            assert c is not None
+            # newest first inside the group = highest child index first
+            first = max(0, offset - pos)                  # skip within this group
+            take = min(e.count - first, limit - len(out))
+            hi = e.count - first
+            lo = hi - take
+            kids = await self._children(c, lo, hi)
+            out.extend(kids[i] for i in range(hi - 1, lo - 1, -1) if i in kids)
+            pos += e.count
+            self.touch()
+        self.touch()
+        return {"total": total, "items": [self.item_dict(i) for i in out]}
 
     @staticmethod
     def item_dict(i: FileItem) -> Dict[str, Any]:
@@ -352,9 +434,22 @@ class FileBrowser:
         return d
 
     async def get_item(self, item_id: str) -> FileItem:
-        if item_id not in self.by_id:
-            await self.list(0, 1)
         it = self.by_id.get(item_id)
+        if it is not None:
+            return it
+        await self.ensure_play()
+        entries = await self._ensure_root(False)
+        it = self.by_id.get(item_id)
+        if it is None and item_id.isdigit():
+            # A group's children are numbered upwards from the group's own number
+            # (crossing folder roll-overs, e.g. 109-0992 .. 111-2071), so the
+            # owner is the newest group whose number is <= the id.
+            n = int(item_id)
+            for e in entries:   # newest first
+                if e.cont is not None and e.number <= n:
+                    await self._children(e.cont, 0, e.count)
+                    it = self.by_id.get(item_id)
+                    break
         if it is None:
             raise NotFound(item_id)
         return it
