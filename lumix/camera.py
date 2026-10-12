@@ -348,7 +348,7 @@ class Camera:
                 with contextlib.suppress(Exception):
                     await self.listener.unsubscribe()
                 self.listener.sid = None
-                msg = "camera powered off" if self.powered_off else str(e)
+                msg = "camera powered off" if self.powered_off else _friendly_error(e, self.ip)
                 self._set_status("reconnecting", msg)
                 self.log_event("conn", "connection lost: %s" % msg)
                 if failures >= 3 and not self.ip_fixed:
@@ -435,7 +435,8 @@ class Camera:
         ddd, req_acc (1 s loop), SUBSCRIBE, 200 ms, raw_img_send, capability,
         allmenu, curmenu, lens, touch_type, getstate, device_name; then the
         live-view start (stopstream, recmode, startstream) once."""
-        self.powered_off = False
+        # powered_off stays set until a connect succeeds: every failed attempt
+        # in between still means "the camera is off", not "out of range"
         self._set_status("connecting", "contacting %s" % ip)
         if self.transport is None or self.transport.ip != ip:
             if self.transport is not None:
@@ -517,6 +518,7 @@ class Camera:
         if self.liveview_wanted:
             await self.start_liveview("connect")
         self.connected_at = time.time()
+        self.powered_off = False
         self._probe_at = time.monotonic()
         self._save_state(connected_at=int(self.connected_at), provisional=False)
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
@@ -1059,6 +1061,18 @@ class Camera:
             self.store.save(**kw)
         except Exception:
             log.exception("camera store save failed")
+
+
+def _friendly_error(e: BaseException, ip: Optional[str]) -> str:
+    """A connection error as a sentence (the raw text stays in the server log)."""
+    log.info("connection error: %r", e)
+    text = str(e)
+    if isinstance(e, asyncio.TimeoutError) or "timeout" in type(e).__name__.lower():
+        return "camera at %s does not answer (asleep, off or out of range)" % (ip or "?")
+    if isinstance(e, OSError) and ("Connect call failed" in text or "Cannot connect" in text
+                                   or "refused" in text.lower() or "unreachable" in text.lower()):
+        return "camera at %s is not reachable (off, asleep or on another network)" % (ip or "?")
+    return text or type(e).__name__
 
 
 def _oneline(text: str, limit: int = 400) -> str:
