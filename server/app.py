@@ -294,6 +294,8 @@ def build_app(cam: Camera) -> web.Application:
     ui_api.setup(app)
     from server import files_api  # card files + import jobs (imports this module)
     files_api.setup(app)
+    from server import ble_api  # Bluetooth wake / power-cycle + err_busy watchdog
+    ble_api.setup(app)
     for setup in FEATURES:
         setup(app)
 

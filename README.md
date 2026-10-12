@@ -42,9 +42,8 @@ announces itself when it joins the network, so the scan is the usual fallback.
 
 ### Power
 
-"Power off" sends `camcmd poweroff` after a confirm dialog. **The camera cannot
-be switched back on over Wi-Fi** (Bluetooth wake-up is not implemented), so you
-will need to turn it on by hand.
+"Power off" sends `camcmd poweroff` after a confirm dialog. The camera can't
+be switched back on over Wi-Fi; see "Bluetooth" below for waking it over BLE.
 
 ## Web UI
 
@@ -243,6 +242,57 @@ How it works: `camcmd playmode`, then UPnP ContentDirectory `Browse` on
 `:60606/Server0/CDS_control` (recursive from ObjectID 0, 50 per page, listing
 cached for the browsing session and re-validated by `TotalMatches`); files come
 from `http://<camera>:50001/<DO|DL|DT><n>.<ext>`.
+
+## Bluetooth (wake / Wi-Fi on / power-cycle) — experimental
+
+Bluetooth LE control of the S5, reverse-engineered from LUMIX Sync 2.0.17 and
+tested on the body (details: `docs/bluetooth-research.md`). Works from macOS
+without OS-level pairing: the camera trusts a registered client id, not a bond.
+
+What works: registering this Mac, then on every connection: clock sync, and
+"join the home network" (verified once from Wi-Fi-off, with Wi-Fi back about
+40 s later). Open: with Remote Wakeup ON, the camera accepts the wake
+commands and goes to its "wakeup" state, but hasn't come back on Wi-Fi yet
+(see the research doc, 1d). What doesn't: **a camera stuck in the `err_busy`
+wedge can't be power-cycled by software.** `camcmd poweroff` answers
+`err_reject` while wedged, LUMIX Sync has no BLE power-off, and a BLE Wi-Fi
+restart doesn't clear the wedge. Power-cycle therefore only helps when
+poweroff is accepted.
+
+Setup:
+
+```sh
+/opt/homebrew/bin/python3 -m venv .venv-ble     # bleak needs Python >= 3.10 + pyobjc
+.venv-ble/bin/pip install 'bleak>=1,<4'
+bin/lumix-ble scan                              # bodies + state (normal/pairing/sleep...)
+bin/lumix-ble register                          # once; camera on MENU > Setup > Bluetooth > SET > Pairing
+bin/lumix-ble wake                              # Wi-Fi on, joined to the camera's saved home network
+bin/lumix-ble status | dump | power-cycle
+```
+
+`register` does what LUMIX Sync does: BLE registration, then this Mac's Wi-Fi
+joins the camera's own access point for about 30 s for the `accctrl`
+handshake, then it forgets that AP and rejoins the home network. The camera
+should end on "Pairing completed". The home SSID is read from the camera
+(or `LUMIX_HOME_SSID`) and cached in `~/.config/lumix-remote/ble.json`.
+
+`bin/lumix-ble` prints one JSON object per command. The server's `.venv` stays
+aiohttp-only; it runs `bin/lumix-ble` as a subprocess.
+
+API: `GET /api/ble/status` (`?probe=1` also connects), `POST /api/ble/wake`,
+`POST /api/ble/power-cycle` (rec mode, `camcmd poweroff`, wait for the camera
+to drop off, BLE wake, reconnect), `POST /api/ble/register`,
+`POST /api/ble/watchdog {"enabled": bool}`.
+
+Watchdog (off by default): `LUMIX_BLE_WATCHDOG=1 ./run.sh` tries a power-cycle
+when the camera has been wedged for `LUMIX_BLE_WEDGE_AFTER` s (60), at most
+`LUMIX_BLE_MAX_PER_HOUR` (3) times per hour, with backoff doubling from
+`LUMIX_BLE_BACKOFF` s (120). Because of the wedge finding above, expect it to
+report "camera refused poweroff" on a true wedge. `LUMIX_BLE_NAME` pins the
+camera name. Camera side: Bluetooth ON, Remote Wakeup ON, home network saved,
+LUMIX Sync closed on the phone (one BLE link at a time). Don't use the BLE
+remote-shutter channel (`7be5fd56`): it turns the camera's Wi-Fi off. A process
+started outside Terminal (launchd) needs its own Bluetooth permission.
 
 ## Layout
 

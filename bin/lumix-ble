@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# lumix-ble: Bluetooth helper (scan, pair, status, wake, wifi-on, power-cycle).
+# Runs lumix.blecli with .venv-ble (bleak needs Python >= 3.10 + pyobjc).
+# Create it once: /opt/homebrew/bin/python3 -m venv .venv-ble && .venv-ble/bin/pip install 'bleak>=1,<4'
+set -euo pipefail
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+root="$(cd -P "$(dirname "$src")/.." && pwd)"
+py="${LUMIX_BLE_PYTHON:-$root/.venv-ble/bin/python}"
+if [ ! -x "$py" ]; then
+  echo "lumix-ble: $py missing; create .venv-ble (see header of this script)" >&2
+  exit 2
+fi
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}" PYTHONUNBUFFERED=1 exec "$py" -m lumix.blecli "$@"
