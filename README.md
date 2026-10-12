@@ -134,7 +134,7 @@ modes, so the server and UI can be developed and tested without hardware:
 .venv/bin/python -m emulator          # cam.cgi :8080, upnp :60606, files :50001
 LUMIX_REMOTE_HOME=/tmp/lumix-emu ./run.sh --camera emu --camera-ip 127.0.0.1 \
   --camera-http-port 8080 --camera-upnp-port 60606 --camera-files-port 50001
-.venv/bin/python -m unittest discover -s tests   # 161 tests, no camera needed
+.venv/bin/python -m unittest discover -s tests   # 165 tests, no camera needed
 ```
 
 Details: [docs/emulator.md](docs/emulator.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -335,7 +335,9 @@ home screen (Share > Add to Home Screen; needs `--lan`) and it opens full screen
   (aperture, shutter, ISO, EV, WB, mode, focus, AF area, drive, photo quality
   and size, video quality), focus helpers, and **All settings**, generated from
   the camera's own menu (every setting the body allows remotely), searchable.
-  Also connection details, event log, shortcuts, power off.
+  Also connection details, event log, shortcuts, power off, and **Turn on over
+  Bluetooth** (BLE wake once paired; also offered in the "Camera is off" banner
+  and connect screen, with progress and the result).
 - **Files** (photo button or `G`): iOS-Photos-style grid, filter, tap to preview,
   Select for multi-select, Download, Import to Mac with progress.
 - **Cameras** (Controls > Cameras, or the camera name when there are several):

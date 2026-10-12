@@ -181,8 +181,9 @@ input[type="search"], input:not([type]), .ipform input, #importdest {
 .banner {
   position: absolute; left: 50%; top: calc(var(--safe-t) + 64px); transform: translateX(-50%);
   display: flex; align-items: center; gap: 9px; padding: 8px 10px 8px 14px; border-radius: 20px;
-  font-size: 13px; max-width: calc(100% - 32px); z-index: 4; animation: drop .4s var(--spring);
+  font-size: 13px; width: max-content; max-width: calc(100% - 32px); z-index: 4; animation: drop .4s var(--spring);
 }
+.banner .link { flex: none; white-space: nowrap; }
 .banner span:nth-child(2) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 @keyframes drop { from { transform: translate(-50%, -20px); opacity: 0; } }
 
@@ -560,6 +561,21 @@ kbd {
 .callout.ok b { color: var(--green); }
 .callout.bad { background: rgba(255, 69, 58, .12); box-shadow: inset 0 0 0 1px rgba(255, 69, 58, .3); }
 .callout.bad b { color: var(--red); }
+/* Bluetooth wake: progress / result callout (Controls sheet + connect screen) */
+.wake-state { margin-top: 10px; }
+.wake-state:not(.ok):not(.bad):not(.warn) { background: var(--cell); }
+.connect .wake-state { margin: 0 0 14px; }
+.wake-state .wake-head { display: flex; gap: 12px; align-items: center; }
+.wake-state .wake-head > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wake-state .spinner { flex: none; margin: 0; width: 22px; height: 22px; }
+.wake-state .link { align-self: flex-start; padding: 4px 0 0; }
+.wake-state details { margin-top: 4px; color: var(--text2); font-size: 12px; }
+.wake-state summary { cursor: pointer; }
+.wake-state pre {
+  margin: 6px 0 0; padding: 8px; max-height: 180px; overflow: auto; border-radius: 8px; background: rgba(0, 0, 0, .3);
+  font-size: 11px; white-space: pre-wrap; word-break: break-all; -webkit-user-select: text; user-select: text;
+}
+button.cell:disabled { opacity: .5; }
 .wz-blestate { display: flex; gap: 12px; align-items: center; }
 .wz-blestate .spinner { flex: none; margin: 0; }
 .wz-input {

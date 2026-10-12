@@ -365,7 +365,11 @@ function statusInfo(s) {
     case "connecting": return { title: "Connecting…", msg, cls: "", dot: "wait" };
     case "waiting_approval": return { title: "Approve on the camera", msg: "Your camera is registering this device. If it shows a prompt, press OK on the camera.", cls: "warn", dot: "wait" };
     case "reconnecting":
-      if ((s && s.powered_off) || msg.includes("powered off")) return { title: "Camera is off", msg: "Switch it on and it reconnects by itself (Wi-Fi can't wake it).", cls: "warn", dot: "bad" };
+      if ((s && s.powered_off) || msg.includes("powered off")) {
+        return { title: "Camera is off", cls: "warn", dot: "bad", msg: blePaired()
+          ? "Tap Turn on over Bluetooth, or switch it on by hand. It reconnects by itself."
+          : "Switch it on and it reconnects by itself (Wi-Fi can't wake it; pair Bluetooth in Cameras › Run setup again… to turn it on from here)." };
+      }
       return { title: "Reconnecting…", msg: "The camera dropped off (asleep, off or out of range). Retrying automatically." + (msg ? ` (${msg})` : ""), cls: "warn", dot: "wait" };
     case "error": return { title: "Something's wrong", msg, cls: "warn", dot: "bad" };
     case "offline": return { title: "Server not reachable", msg: "Start it with ./run.sh on your Mac.", cls: "warn", dot: "bad" };
@@ -437,11 +441,13 @@ function renderStatus(s) {
   } else if (busy) {
     banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannertext").textContent = "Camera busy: check its screen";
   } else banner.hidden = true;
+  $("bannerwake").hidden = banner.hidden || !canWake(s) || !(blePaired() || wake.running);
   $("connsub").textContent = ready ? `${cam.friendlyName || ""} · ${s.ip || ""}` : info.title;
   renderConnect(s);
   if (!$("prosheet").hidden && currentPage() === "conn") renderConnInfo();
   if (me && me.status !== s.status && s.status !== "offline") { me.status = s.status; if (currentPage() === "cams") renderCameras(); }
   if (ready && (!prev || prev.status !== "ready")) loadSettings();
+  renderWake();
 }
 function batteryPct(b) {
   const m = String(b).match(/^(\d+)\/(\d+)$/);
@@ -493,6 +499,7 @@ function renderConnect(s) {
   $("btnwizard").textContent = none ? "Add a camera" : "Set up step by step";
   $("btnwizard").classList.toggle("primary", none);
   for (const d of c.querySelectorAll(".cs-more")) d.hidden = none;
+  $("cswake").hidden = !canWake(s) && !wake.running;
   if (ready) {
     if (!c.hidden && !connectHideTimer) {
       connectHideTimer = setTimeout(() => {
@@ -768,6 +775,7 @@ function wireSheet() {
   $("btnreconnect2").addEventListener("click", () => reconnect());
   $("btnsetup").addEventListener("click", () => { closeSheet(); state.skipConnect = false; $("connect").hidden = false; });
   $("btnpower").addEventListener("click", openPowerSheet);
+  $("btnwake").addEventListener("click", bleWake);
   $("powerdlg").addEventListener("close", async () => {
     if ($("powerdlg").returnValue !== "ok") return;
     try {
@@ -1089,6 +1097,7 @@ function renderCameras() {
   }
   if (!cams.length) box.append(el("div", { class: "cell" }, el("div", { class: "cell-text" }, el("b", {}, "No cameras yet"), el("small", {}, "Add one to get started."))));
   if (camDetailId && currentPage() === "cam") renderCamDetail();
+  renderWake();
 }
 
 function resetForCamera() {
@@ -1645,6 +1654,9 @@ async function openPowerSheet() {
   const list = $("powerplan");
   list.replaceChildren(el("li", { class: "plan-empty" }, "Checking what's running…"));
   $("powernote").hidden = true;
+  $("powertext").textContent = blePaired()
+    ? "Turn it back on from here with Turn on over Bluetooth (needs Remote Wakeup on the camera), or switch it on by hand."
+    : "You'll need to switch it on by hand afterwards. Wi-Fi can't wake it; pair Bluetooth (Cameras › Run setup again…) to turn it on from here.";
   $("powerdlg").showModal();
   let plan;
   try { plan = await api("/api/power/plan"); } catch (e) { list.replaceChildren(el("li", { class: "plan-empty" }, e.message)); return; }
@@ -1666,6 +1678,85 @@ function quiesceToast(r) {
   const paused = (r.paused || []).map((x) => x.label), stopped = (r.stopped || []).map((x) => x.label);
   if (!paused.length && !stopped.length) return;
   toast((paused.length ? "Paused " + paused.join(", ") : "") + (stopped.length ? (paused.length ? " · stopped " : "Stopped ") + stopped.join(", ") : ""));
+}
+
+// ---------------------------------------------------------------- Bluetooth wake
+// POST /api/ble/wake: BLE login + "start Wi-Fi via network". Powers the camera up from
+// off when its Remote Wakeup is on, then the server reconnects. Takes 30-90 s.
+const wake = { running: false, camId: null, t0: 0, secs: 0, ok: null, data: null, error: "", needPair: false, timer: null };
+function blePaired() { const c = currentCamera(); return !!(c && c.ble && c.ble.registered); }
+// worth offering: the server is up, a camera is set up, and it isn't connected
+function canWake(s) { return !!s && !["ready", "offline", "no_camera", "paused", "starting"].includes(s.status || "starting"); }
+
+async function bleWake() {
+  if (wake.running) return;
+  haptic();
+  Object.assign(wake, { camId: state.camId, ok: null, data: null, error: "", needPair: !blePaired() });
+  if (wake.needPair) { renderWake(); return; }
+  wake.running = true; wake.t0 = Date.now(); wake.secs = 0;
+  wake.timer = setInterval(() => { wake.secs = Math.round((Date.now() - wake.t0) / 1000); renderWake(); }, 1000);
+  renderWake();
+  try {
+    const r = await fetch(cp("/api/ble/wake"), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    let d = null;
+    try { d = await r.json(); } catch (_) { /* non-JSON */ }
+    wake.data = d;
+    wake.ok = !!(r.ok && d && d.ok);
+    if (!wake.ok) wake.error = (d && d.error) || `server answered ${r.status}`;
+  } catch (e) {
+    wake.ok = false; wake.error = "Lost the server: " + e.message;
+  }
+  clearInterval(wake.timer); wake.timer = null;
+  wake.running = false; wake.secs = Math.round((Date.now() - wake.t0) / 1000);
+  if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); } else toast("Bluetooth wake failed: " + wake.error, true);
+  renderWake();
+}
+
+function openPairing() {
+  const id = state.camId;
+  closeSheet();
+  openWizard({ camId: id, reuse: true, step: "ble" });
+}
+
+function wakeDetails() {
+  if (!wake.data) return null;
+  return el("details", {}, el("summary", {}, "Details"), el("pre", {}, JSON.stringify(wake.data, null, 2)));
+}
+
+function renderWake() {
+  const paired = blePaired();
+  const label = wake.running ? `Turning on… ${wake.secs} s` : "Turn on over Bluetooth";
+  $("wakelabel").textContent = label;
+  $("wakesub").textContent = wake.running ? "Keep the camera near this computer. Takes up to 90 s."
+    : paired ? "Switches the camera on and joins it to Wi-Fi" : "Needs Bluetooth pairing first";
+  $("btnwake").disabled = wake.running;
+  $("cswake").textContent = label;
+  $("cswake").disabled = wake.running;
+  $("bannerwake").textContent = wake.running ? `Turning on… ${wake.secs} s` : "Turn on";
+  $("bannerwake").disabled = wake.running;
+  const show = wake.camId === state.camId && (wake.running || wake.ok !== null || wake.needPair);
+  for (const box of [$("wakestate"), $("cswakestate")]) {
+    box.hidden = !show;
+    if (!show) { box.replaceChildren(); continue; }
+    if (wake.running) {
+      box.className = "wake-state callout";
+      box.replaceChildren(el("div", { class: "wake-head" }, el("span", { class: "spinner" }),
+        el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. ${wake.secs} s so far.`))));
+    } else if (wake.needPair) {
+      box.className = "wake-state callout warn";
+      box.replaceChildren(el("b", {}, "Not paired over Bluetooth"),
+        el("span", {}, "Pair this computer once in Cameras › your camera › Run setup again… (Bluetooth step). To power up from off, the camera also needs Remote Wakeup on."),
+        el("button", { class: "link", onclick: openPairing }, "Run setup again…"));
+    } else if (wake.ok) {
+      box.className = "wake-state callout ok";
+      box.replaceChildren(el("b", {}, "Camera is waking up"),
+        el("span", {}, `Bluetooth wake done in ${wake.secs} s. It reconnects over Wi-Fi by itself.`), wakeDetails());
+    } else {
+      box.className = "wake-state callout bad";
+      box.replaceChildren(el("b", {}, "Couldn't turn it on"),
+        el("span", {}, wake.error.replace(/[.\s]+$/, "") + ". Check that the camera is in range and its Bluetooth (and Remote Wakeup, if it's off) is on."), wakeDetails());
+    }
+  }
 }
 
 // ---------------------------------------------------------------- websocket
@@ -1705,6 +1796,8 @@ function init() {
   });
   $("btnwizard").addEventListener("click", () => openWizard({ camId: state.camId, reuse: true }));
   $("bannerbtn").addEventListener("click", () => reconnect());
+  $("bannerwake").addEventListener("click", bleWake);
+  $("cswake").addEventListener("click", bleWake);
   $("btnreconnect").addEventListener("click", () => reconnect());
   $("btnskip").addEventListener("click", () => { state.skipConnect = true; $("connect").hidden = true; if (state.status) renderStatus(state.status); });
   $("btnforget").addEventListener("click", () => { LS.set("camera", null); reconnect(null, true); });

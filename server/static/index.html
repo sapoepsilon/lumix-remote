@@ -90,6 +90,7 @@
     </section>
     <div class="banner glass" id="banner" hidden>
       <span class="dot" id="bannerdot"></span><span id="bannertext"></span>
+      <button class="link" id="bannerwake" hidden>Turn on</button>
       <button class="link" id="bannerbtn">Reconnect</button>
     </div>
   </section>
@@ -168,8 +169,10 @@
         <button class="cell nav-cell" data-push="keys"><div class="cell-text"><b>Keyboard shortcuts</b></div><svg class="chev"><use href="#i-chev"/></svg></button>
       </div>
       <div class="group">
+        <button class="cell nav-cell" id="btnwake"><div class="cell-text"><b id="wakelabel">Turn on over Bluetooth</b><small id="wakesub">Wakes the camera and joins it to Wi-Fi</small></div></button>
         <button class="cell danger-cell" id="btnpower">Power off camera…</button>
       </div>
+      <div class="wake-state" id="wakestate" hidden></div>
     </section>
 
     <section class="page" data-page="all" hidden>
@@ -285,8 +288,10 @@
     <h1 id="cstitle">Looking for your camera</h1>
     <p class="cs-msg" id="csmsg"></p>
     <div class="cs-remember" id="csremember" hidden></div>
+    <div class="wake-state" id="cswakestate" hidden></div>
     <div class="cs-actions">
       <button class="btn primary" id="btnreconnect">Reconnect</button>
+      <button class="btn" id="cswake" hidden>Turn on over Bluetooth</button>
       <button class="btn" id="btnwizard">Set up step by step</button>
       <button class="link" id="btnskip">Continue without camera</button>
     </div>
@@ -421,7 +426,7 @@
 <dialog id="powerdlg" class="alert power-sheet">
   <form method="dialog">
     <h3>Power off the camera?</h3>
-    <p>You'll need to switch it on by hand afterwards. Wi-Fi can't wake it.</p>
+    <p id="powertext">You'll need to switch it on by hand afterwards. Wi-Fi can't wake it.</p>
     <ul class="plan" id="powerplan" aria-live="polite"><li class="plan-empty">Checking what's running…</li></ul>
     <p class="plan-note" id="powernote" hidden></p>
     <menu>
