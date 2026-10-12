@@ -48,15 +48,53 @@ will need to turn it on by hand.
 
 ## Web UI
 
-- Live view (MJPEG, ~26 fps at 640x360 on the S5), click/tap to focus there.
-- Big shutter button (Space), video record start/stop (R) with a timer.
-- Quick controls: aperture, shutter, exposure mode, ISO, exposure compensation,
-  white balance, focus mode, drive mode, photo quality/size, video quality.
-- "All settings": generated from the camera's own menu description, so it shows
-  whatever your body and firmware expose, with filter.
-- Connection status, battery, card, remaining shots/video, lens, event log.
+Styled after the iPhone Camera app: dark, full-bleed live view, translucent
+controls, works on a desktop browser and at phone width. Add it to the iPhone
+home screen (Share > Add to Home Screen; needs `--lan`) and it opens full screen.
 
-Works at phone width.
+- **Connect screen** on first run: searching / connecting / approve on camera /
+  reconnecting, with the camera-side steps as a tappable checklist, a Reconnect
+  button, "connect to address" and "forget camera". The last camera is
+  remembered (server: `state.json`, browser: localStorage). After a drop the
+  server reconnects on its own; the UI shows a small banner meanwhile, and a
+  "camera busy" banner when live view stalls after `err_busy` answers.
+- **Shooting view:** big round shutter, PHOTO / VIDEO / TIMELAPSE strip (swipe
+  it or the live view, or use the arrow keys), exposure readout, one-shot AF,
+  tap to focus. Timelapse is a placeholder for now.
+- **AUTO** button: one tap applies the Auto preset (below); tap again to get
+  your own settings back.
+- **Controls sheet** (sliders button or `P`): Auto switch, quick controls
+  (aperture, shutter, ISO, EV, WB, mode, focus, AF area, drive, photo quality
+  and size, video quality), focus helpers, and **All settings**, generated from
+  the camera's own menu (every setting the body allows remotely), searchable.
+  Also connection details, event log, shortcuts, power off.
+- **Files** (photo button or `G`): iOS-Photos-style grid, filter, tap to preview,
+  Select for multi-select, Download, Import to Mac with progress.
+
+Keyboard: Space photo, R video, 1/2/3 or arrows mode, P controls, A Auto,
+F one-shot AF, G files, Esc closes.
+
+### Auto preset and MF Assist (DC-S5 findings)
+
+The S5 lets the exposure mode be set remotely (`setsetting recmode ia`) even
+though it has a mode dial; the dial wins again when it's turned. Auto applies:
+Intelligent Auto, single-shot drive (a Time Lapse drive mode turns the shutter
+into "start time lapse"), AF-S for photo / AF-C for video, AF area
+auto-detection (face/eye/body), ISO auto, AWB, EV 0, multi metering. Picture
+and video quality are left alone. If a body rejects iA, it falls back to
+Program AE (photo) or Creative Video P (video).
+
+Before the first apply the current values are read and saved in
+`~/.config/lumix-remote/presets.json` (`getsetting`, except the rec mode which
+the S5 only reports through `curmenu`); Auto off writes them back, rec mode
+first. Switching PHOTO/VIDEO while Auto is on re-tunes it without losing the
+saved values.
+
+The magnified picture-in-picture inset in the live view is the camera's
+**MF Assist**: with focus on MF, a touch on the screen opens it. The S5 does not
+expose MF Assist / its PIP display style in `allmenu`, so it can't be switched
+off remotely. The UI therefore ignores taps while focus is MF (Controls > Tap in
+MF), Auto uses AF, and "Close MF Assist inset" flips focus to AF-S and back.
 
 ## CLI
 
@@ -154,7 +192,11 @@ another operation or not connected, 400 = bad request, 502 = transport error.
 | `POST /api/power/off` `{"confirm": true}` | Power the camera off |
 | `GET /api/liveview.jpg` | Latest live view frame |
 | `GET /api/liveview.mjpg` | MJPEG stream (`multipart/x-mixed-replace`) |
-| `GET /api/ws` | WebSocket push: `status`, `exposure`, `settings` (changed ids), `event`, `events` |
+| `GET /api/ws` | WebSocket push: `status`, `exposure`, `settings` (changed ids), `event`, `events`, `preset` |
+| `GET /api/presets` | Preset state: `{"auto": {on, target, saved, applied, recmode_used, since}}` |
+| `POST /api/presets/auto` `{"on": true, "target": "photo"\|"video"}` | Auto on (saves manual values first) / off (`{"on": false}` restores them). Returns `steps` (each setsetting + result), `before`, `after` |
+| `GET /api/connection` | Status, IP, remembered IP, camera, live view, camera-side setup steps |
+| `POST /api/connection/reconnect` `{"ip"?, "forget"?}` | Drop the session and reconnect now (optionally to `ip`; `forget` clears the remembered camera) |
 
 Live view endpoints take `?source=<name>` (default `wifi`) so other frame
 sources can be added.
@@ -174,7 +216,10 @@ lumix/            camera client library (no web code)
   menu.py         allmenu + curmenu -> generic settings model
   exposure.py     aperture/shutter code tables, lens limits
   discovery.py    SSDP listener, ddd probe, subnet scan
+  presets.py      Auto preset: save manual values, apply, restore
 server/           aiohttp app (API, MJPEG, WebSocket) + static UI
+  ui_api.py       /api/presets, /api/connection routes
+  static/         web UI (index.html, app.js, style.css, manifest, icons)
 lumixcli/         `lumix` command line client (HTTP API only)
 bin/lumix         CLI wrapper (uses .venv)
 tests/            unit tests: real S5 menu dumps, CLI against a fake server

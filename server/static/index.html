@@ -3,71 +3,278 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Lumix">
 <title>Lumix Remote</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" sizes="192x192" href="/static/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header class="topbar">
-  <div class="conn"><span id="dot" class="dot"></span><span id="camname">Lumix Remote</span></div>
-  <div class="meta" id="meta"></div>
-</header>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/><circle cx="16" cy="7" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="10" cy="17" r="2.2" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+  <symbol id="i-photos" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 16l5-5 4 4 3-3 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="16" cy="9" r="1.6" fill="currentColor"/></symbol>
+  <symbol id="i-focus" viewBox="0 0 24 24"><path d="M4 9V5h4M16 5h4v4M20 15v4h-4M8 19H4v-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="2" fill="currentColor"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 48 48"><rect x="5" y="13" width="38" height="26" rx="6" fill="none" stroke="currentColor" stroke-width="2.6"/><path d="M17 13l3-5h8l3 5" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round"/><circle cx="24" cy="26" r="7.5" fill="none" stroke="currentColor" stroke-width="2.6"/></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-mac" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 20h6M12 16v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l11-6.5z" fill="currentColor"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z" fill="currentColor"/></symbol>
+</svg>
 
-<main class="layout">
-  <section class="viewer">
+<div class="app" id="app" data-mode="photo">
+  <!-- ======================================================== viewfinder -->
+  <section class="stage" id="stage">
     <div class="lv" id="lv">
-      <img id="lvimg" alt="Live view" src="/api/liveview.mjpg">
-      <div class="lv-empty" id="lvempty">Waiting for live view…</div>
+      <img id="lvimg" alt="Live view">
+      <div class="lv-empty" id="lvempty"><div class="spinner"></div><span id="lvemptytext">Waiting for live view…</span></div>
       <div class="touchmark" id="touchmark"></div>
-      <div class="rec-badge" id="recbadge" hidden><span class="rec-dot"></span><span id="rectime">00:00</span></div>
-      <div class="lv-stats" id="lvstats"></div>
+      <div class="tl-card glass" id="tlcard" hidden>
+        <div class="tl-icon">⏱</div>
+        <h3>Timelapse</h3>
+        <p>Interval shooting from here is coming soon.</p>
+      </div>
     </div>
-    <div class="actions">
-      <button class="btn-af" id="btnaf" title="One-shot AF">AF</button>
-      <button class="shutter" id="btnshutter" title="Take photo (Space)" aria-label="Take photo"></button>
-      <button class="btn-rec" id="btnrec" title="Start/stop video (R)" aria-label="Record video"><span></span></button>
+    <div class="banner glass" id="banner" hidden>
+      <span class="dot" id="bannerdot"></span><span id="bannertext"></span>
+      <button class="link" id="bannerbtn">Reconnect</button>
     </div>
-    <p class="hint">Tap the live view to focus there. Space = photo, R = video.</p>
   </section>
 
-  <aside class="panel">
-    <section class="card">
-      <h2>Exposure</h2>
-      <div class="quick" id="quick"></div>
-    </section>
+  <!-- ======================================================== top bar -->
+  <header class="top">
+    <button class="pill glass conn" id="btnconn" title="Connection">
+      <span class="dot" id="dot"></span><span id="camname">Lumix</span>
+    </button>
+    <div class="rec-badge" id="recbadge" hidden><span class="rec-dot"></span><span id="rectime">00:00</span></div>
+    <div class="top-right">
+      <button class="pill glass auto" id="btnauto" title="Auto (A)" aria-pressed="false"><svg><use href="#i-bolt"/></svg>AUTO</button>
+      <button class="round glass" id="btnpro" title="Pro controls (P)" aria-label="Pro controls"><svg><use href="#i-sliders"/></svg></button>
+    </div>
+  </header>
 
-    <section class="card">
-      <div class="card-head">
-        <h2>All settings</h2>
-        <input type="search" id="filter" placeholder="Filter…" aria-label="Filter settings">
+  <!-- ======================================================== bottom controls -->
+  <footer class="controls" id="controls">
+    <button class="readout" id="readout" title="Pro controls (P)"></button>
+    <div class="modes" id="modes" role="tablist" aria-label="Capture mode">
+      <div class="modes-track" id="modestrack">
+        <button role="tab" data-mode="photo" class="on">PHOTO</button>
+        <button role="tab" data-mode="video">VIDEO</button>
+        <button role="tab" data-mode="timelapse">TIMELAPSE</button>
       </div>
-      <div id="allsettings" class="allsettings"><p class="muted">Loading…</p></div>
+    </div>
+    <div class="shutter-row">
+      <button class="thumb" id="btnfiles" title="Files (F)" aria-label="Files"><svg><use href="#i-photos"/></svg></button>
+      <button class="shutter" id="btnshutter" title="Shutter (Space = photo, R = video)" aria-label="Shutter"><span class="core"></span></button>
+      <button class="round glass big" id="btnaf" title="One-shot AF" aria-label="Autofocus"><svg><use href="#i-focus"/></svg></button>
+    </div>
+    <div class="stats" id="stats"></div>
+  </footer>
+</div>
+
+<!-- ======================================================== Pro sheet -->
+<div class="scrim" id="proscrim" hidden></div>
+<aside class="sheet glass-strong" id="prosheet" aria-label="Pro controls" aria-hidden="true">
+  <div class="grabber"></div>
+  <div class="nav" id="pronav">
+    <!-- root page -->
+    <section class="page" data-page="root">
+      <header class="sheet-head">
+        <h2>Controls</h2>
+        <button class="round flat" data-close aria-label="Close"><svg><use href="#i-close"/></svg></button>
+      </header>
+      <div class="group">
+        <div class="cell switch-cell">
+          <div class="cell-text">
+            <b>Auto</b>
+            <small id="autosub">Camera picks exposure, focus and white balance. Turning it off restores your settings.</small>
+          </div>
+          <label class="switch"><input type="checkbox" id="autoswitch"><span></span></label>
+        </div>
+      </div>
+      <h3 class="group-title">Quick controls</h3>
+      <div class="qc" id="qc"></div>
+      <h3 class="group-title">Focus helpers</h3>
+      <div class="group">
+        <div class="cell">
+          <div class="cell-text"><b>Tap in MF</b><small>In manual focus a tap opens the camera's magnified MF Assist inset.</small></div>
+          <div class="seg" id="mftap">
+            <button data-v="assist">Magnify</button><button data-v="off">Ignore</button>
+          </div>
+        </div>
+        <button class="cell nav-cell" id="btnexitassist">
+          <div class="cell-text"><b>Close MF Assist inset</b><small>Switches to AF-S and back to clear the magnified view.</small></div>
+        </button>
+      </div>
+      <h3 class="group-title">More</h3>
+      <div class="group">
+        <button class="cell nav-cell" data-push="all"><div class="cell-text"><b>All settings</b><small id="allcount">Every setting the camera allows remotely</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
+        <button class="cell nav-cell" data-push="conn"><div class="cell-text"><b>Connection</b><small id="connsub">-</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
+        <button class="cell nav-cell" data-push="log"><div class="cell-text"><b>Event log</b><small>Commands and camera events</small></div><svg class="chev"><use href="#i-chev"/></svg></button>
+        <button class="cell nav-cell" data-push="keys"><div class="cell-text"><b>Keyboard shortcuts</b></div><svg class="chev"><use href="#i-chev"/></svg></button>
+      </div>
+      <div class="group">
+        <button class="cell danger-cell" id="btnpower">Power off camera…</button>
+      </div>
     </section>
 
-    <section class="card">
-      <div class="card-head"><h2>Events</h2><button class="small" id="clearlog">Clear</button></div>
+    <section class="page" data-page="all" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg>Controls</button>
+        <h2>All settings</h2>
+        <span></span>
+      </header>
+      <input type="search" class="search" id="filter" placeholder="Search settings" aria-label="Search settings">
+      <div id="allsettings"></div>
+    </section>
+
+    <section class="page" data-page="opt" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg><span id="optback">Back</span></button>
+        <h2 id="opttitle">Setting</h2>
+        <span></span>
+      </header>
+      <p class="page-sub" id="optsub"></p>
+      <div class="group" id="optlist"></div>
+    </section>
+
+    <section class="page" data-page="conn" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg>Controls</button>
+        <h2>Connection</h2>
+        <span></span>
+      </header>
+      <div class="group" id="conninfo"></div>
+      <div class="group">
+        <button class="cell nav-cell" id="btnreconnect2"><div class="cell-text"><b>Reconnect</b></div></button>
+        <button class="cell nav-cell" id="btnsetup"><div class="cell-text"><b>Show camera setup steps</b></div></button>
+      </div>
+    </section>
+
+    <section class="page" data-page="log" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg>Controls</button>
+        <h2>Event log</h2>
+        <button class="link" id="clearlog">Clear</button>
+      </header>
       <ol class="log" id="log"></ol>
     </section>
 
-    <section class="card danger-zone">
-      <h2>Power</h2>
-      <p class="muted">The camera can't be switched back on over Wi-Fi.</p>
-      <button class="danger" id="btnpower">Power off camera…</button>
+    <section class="page" data-page="keys" hidden>
+      <header class="sheet-head">
+        <button class="back" data-pop><svg><use href="#i-back"/></svg>Controls</button>
+        <h2>Shortcuts</h2>
+        <span></span>
+      </header>
+      <div class="group keys">
+        <div class="cell"><b>Take photo</b><kbd>Space</kbd></div>
+        <div class="cell"><b>Start / stop video</b><kbd>R</kbd></div>
+        <div class="cell"><b>Photo / Video / Timelapse</b><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd></div>
+        <div class="cell"><b>Previous / next mode</b><kbd>←</kbd><kbd>→</kbd></div>
+        <div class="cell"><b>Pro controls</b><kbd>P</kbd></div>
+        <div class="cell"><b>Toggle Auto</b><kbd>A</kbd></div>
+        <div class="cell"><b>One-shot AF</b><kbd>F</kbd></div>
+        <div class="cell"><b>Files</b><kbd>G</kbd></div>
+        <div class="cell"><b>Close sheet / viewer</b><kbd>Esc</kbd></div>
+      </div>
     </section>
-  </aside>
-</main>
+  </div>
+</aside>
 
-<dialog id="powerdlg">
+<!-- ======================================================== connect screen -->
+<section class="connect" id="connect" hidden>
+  <div class="connect-inner">
+    <div class="radar" id="radar"><span></span><span></span><span></span><svg><use href="#i-camera"/></svg></div>
+    <h1 id="cstitle">Looking for your camera</h1>
+    <p class="cs-msg" id="csmsg"></p>
+    <div class="cs-remember" id="csremember" hidden></div>
+    <div class="cs-actions">
+      <button class="btn primary" id="btnreconnect">Reconnect</button>
+      <button class="btn" id="btnskip">Continue without camera</button>
+    </div>
+    <h3 class="group-title">On the camera</h3>
+    <ol class="checklist" id="checklist"></ol>
+    <details class="cs-more">
+      <summary>Connect to a specific address</summary>
+      <form id="ipform" class="ipform">
+        <input id="ipinput" inputmode="decimal" placeholder="192.168.1.50" aria-label="Camera IP address">
+        <button class="btn">Connect</button>
+      </form>
+      <button class="link" id="btnforget">Forget remembered camera</button>
+    </details>
+  </div>
+</section>
+
+<!-- ======================================================== files -->
+<section class="files" id="files" hidden aria-label="Files">
+  <header class="files-head glass-strong">
+    <button class="back" id="filesclose"><svg><use href="#i-back"/></svg>Camera</button>
+    <h2>Library <small id="filescount"></small></h2>
+    <button class="link" id="filesselect">Select</button>
+  </header>
+  <div class="files-filter">
+    <div class="seg" id="fkind">
+      <button data-v="" class="on">All</button><button data-v="photo">Photos</button><button data-v="video">Videos</button>
+    </div>
+  </div>
+  <div class="grid" id="grid"></div>
+  <div class="files-empty" id="filesempty" hidden></div>
+  <button class="btn more" id="filesmore" hidden>Load more</button>
+  <footer class="files-bar glass-strong" id="filesbar" hidden>
+    <span id="selcount">0 selected</span>
+    <label class="raw-toggle"><input type="checkbox" id="incraw"> RAW too</label>
+    <button class="btn" id="btndl" title="Download"><svg><use href="#i-down"/></svg></button>
+    <button class="btn primary" id="btnimport"><svg><use href="#i-mac"/></svg>Import to Mac</button>
+  </footer>
+  <div class="job glass-strong" id="job" hidden>
+    <div class="job-text"><b id="jobtitle">Importing…</b><small id="jobsub"></small></div>
+    <div class="bar"><span id="jobbar"></span></div>
+  </div>
+</section>
+
+<!-- ======================================================== viewer -->
+<section class="viewer" id="viewer" hidden>
+  <header class="viewer-head">
+    <button class="round glass" id="viewerclose" aria-label="Close"><svg><use href="#i-close"/></svg></button>
+    <div class="viewer-title"><b id="vname"></b><small id="vmeta"></small></div>
+    <a class="round glass" id="vdownload" aria-label="Download" download><svg><use href="#i-down"/></svg></a>
+  </header>
+  <div class="viewer-body" id="vbody"></div>
+</section>
+
+<dialog id="powerdlg" class="alert">
   <form method="dialog">
     <h3>Power off the camera?</h3>
     <p>You'll need to switch it on by hand afterwards. Wi-Fi can't wake it.</p>
     <menu>
       <button value="cancel" autofocus>Cancel</button>
-      <button value="ok" class="danger">Power off</button>
+      <button value="ok" class="destructive">Power Off</button>
     </menu>
   </form>
 </dialog>
 
-<div class="toast" id="toast" hidden></div>
+<dialog id="importdlg" class="alert">
+  <form method="dialog">
+    <h3>Import to Mac</h3>
+    <p id="importtext"></p>
+    <input id="importdest" placeholder="Default folder (server decides)" aria-label="Destination folder">
+    <menu>
+      <button value="cancel">Cancel</button>
+      <button value="ok" class="strong">Import</button>
+    </menu>
+  </form>
+</dialog>
+
+<div class="toast glass-strong" id="toast" role="status" hidden></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

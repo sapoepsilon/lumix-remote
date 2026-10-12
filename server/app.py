@@ -66,6 +66,11 @@ async def index(request: web.Request) -> web.FileResponse:
                             headers={"Cache-Control": "no-cache"})
 
 
+async def manifest(request: web.Request) -> web.FileResponse:
+    return web.FileResponse(os.path.join(STATIC, "manifest.webmanifest"),
+                            headers={"Content-Type": "application/manifest+json"})
+
+
 async def status(request: web.Request) -> web.Response:
     return _json(request.app[CAMERA].status_dict())
 
@@ -262,6 +267,7 @@ def build_app(cam: Camera) -> web.Application:
     app[SOURCES] = {"wifi": cam.liveview}
     r = app.router
     r.add_get("/", index)
+    r.add_get("/manifest.webmanifest", manifest)
     r.add_static("/static", STATIC)
     r.add_get("/api/status", status)
     r.add_get("/api/settings", settings)
@@ -284,6 +290,8 @@ def build_app(cam: Camera) -> web.Application:
     r.add_get("/api/liveview.jpg", frame)
     r.add_get("/api/liveview.mjpg", mjpeg)
     r.add_get("/api/ws", ws)
+    from server import ui_api  # presets + connection (imports this module)
+    ui_api.setup(app)
     for setup in FEATURES:
         setup(app)
 

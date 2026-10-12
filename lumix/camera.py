@@ -114,6 +114,7 @@ class Camera:
         self._log_fh = None
         self.powered_off = False
         self.rec_started_at: Optional[float] = None
+        self._reconnect_req = asyncio.Event()
 
     # ------------------------------------------------------------------ utils
     def _set_status(self, status: str, msg: str = "") -> None:
@@ -196,7 +197,7 @@ class Camera:
             try:
                 ip = await self._discover()
                 if ip is None:
-                    await asyncio.sleep(5)
+                    await self._pause(5)
                     continue
                 await self._connect(ip)
                 failures = 0
@@ -212,11 +213,30 @@ class Camera:
                 self.log_event("conn", "connection lost: %s" % msg)
                 if failures >= 3 and not self.ip_fixed:
                     self.ip = None  # rediscover; DHCP may have moved it
-                await asyncio.sleep(min(2 * failures, 10))
+                await self._pause(min(2 * failures, 10))
             except Exception as e:  # never let the supervisor die
                 log.exception("unexpected error")
                 self._set_status("error", repr(e))
                 await asyncio.sleep(5)
+
+    def request_reconnect(self, ip: Optional[str] = None, forget: bool = False) -> None:
+        """Drop the session and connect again (to ``ip`` if given; ``forget``
+        clears the remembered camera so discovery starts from scratch)."""
+        if forget:
+            self._save_state(last_ip=None)
+            self.ip_fixed = False
+            self.ip = None
+        if ip:
+            self.ip = ip
+        elif not self.ip_fixed and self.status != "ready":
+            self.ip = None
+        self._reconnect_req.set()
+
+    async def _pause(self, seconds: float) -> None:
+        """Sleep, but wake up early on request_reconnect()."""
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._reconnect_req.wait(), seconds)
+        self._reconnect_req.clear()
 
     def _on_ssdp(self, ip: str) -> None:
         if ip != self._ssdp_seen:
@@ -397,6 +417,8 @@ class Camera:
         while True:
             await asyncio.sleep(self.cfg.keepalive_s)
             tick += 1
+            if self._reconnect_req.is_set():
+                raise Disconnected("reconnect requested")
             try:
                 await self._refresh_state()
                 fails = 0
