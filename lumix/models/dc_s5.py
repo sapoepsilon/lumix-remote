@@ -49,6 +49,10 @@ S5 = ModelProfile(
         "touch_af": True, "touch_type": "5", "dual_sd": True, "power_zoom": False, "files": True,
         "mode_dial_writable": True, "kelvin_wb": False, "raw_send": True, "ble_wake": True,
         "ble_poweroff": False, "liveview_size": "640x360",
+        # In-camera interval shooting over Wi-Fi (LUMIX Sync's camctrl interval flow,
+        # docs/lumix-sync-wifi-flow.md section 10). The command set is from the APK
+        # and the emulator; on the body only the menu values were seen so far.
+        "interval_native": True, "interval_max_count": 9999, "interval_min_s": 1,
     },
     liveview=LiveViewRules(header_len_offset=30, header_len_add=32, soi_search_fallback=True,
                            min_datagram=64, mac_bytes=(9, 15), default_quality="vga"),

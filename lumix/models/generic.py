@@ -30,6 +30,7 @@ GENERIC = ModelProfile(
         # unknown until the camera answers getinfo capability; the UI reads the live values
         "touch_af": None, "dual_sd": None, "power_zoom": None, "files": True,
         "mode_dial_writable": None, "kelvin_wb": False, "ble_wake": None,
+        "interval_native": False,      # server-driven timelapse only until verified
     },
     liveview=LiveViewRules(),
     menu_assist=MenuAssist(),
