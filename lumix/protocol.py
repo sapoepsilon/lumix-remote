@@ -11,6 +11,7 @@ we never want two commands in flight at once.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import urllib.parse
@@ -102,13 +103,18 @@ class CamTransport:
     def __init__(self, ip: str, user_agent: str = "LumixRemote/0.1",
                  trace: Optional[Callable[[str, Reply], None]] = None, port: int = 80,
                  guard: Optional[Callable[[str, Optional[str], Optional[str]],
-                                          Awaitable[Optional[str]]]] = None):
+                                          Awaitable[Optional[str]]]] = None,
+                 trace_error: Optional[Callable[[str, str], None]] = None):
         self.ip = ip
         self.port = port            # cam.cgi port (80 on real bodies; emulators may differ)
         self.user_agent = user_agent
         self._session: Optional[aiohttp.ClientSession] = None
         self._lock = asyncio.Lock()
         self.trace = trace
+        # Called with (query, error) when a request got no HTTP reply at all
+        # (timeout, refused): without it a camera that went to sleep leaves no
+        # line in the camera log.
+        self.trace_error = trace_error
         # Pre-send veto: guard(mode, type, value) -> None (send) or a reason
         # (not sent; a local GUARD_RESULT reply comes back instead). The camera
         # uses it to keep mode switches away from a body that is mid-operation.
@@ -161,7 +167,11 @@ class CamTransport:
                     body = await r.read()
                     status = r.status
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-                raise CamError("%s: %s" % (type_name(e), e)) from e
+                err = "%s: %s" % (type_name(e), e)
+                if self.trace_error:
+                    with contextlib.suppress(Exception):
+                        self.trace_error(q, err)
+                raise CamError(err) from e
             rep = parse_reply(q, status, body, time.monotonic() - t0)
         self.last_ok = time.time()
         if self.trace:

@@ -110,6 +110,11 @@ class EmuConfig:
     video_busy_s: float = 2.0        # card write after video_recstop (guess)
     approval: str = "auto"           # auto | prompt | refuse
     approval_delay_s: float = 1.0    # first req_acc -> ok_under_research_no_msg; ok after this
+    # Real DC-S5 woken over Bluetooth with its switch OFF (2026-10-12 14:30): no
+    # mod_Play after a SUBSCRIBE in play, and with no cam.cgi request for ~30 s the
+    # body went back to sleep (left Wi-Fi). 0 = off (switch ON bodies stay awake).
+    post_subscribe_mod_play: bool = True
+    idle_sleep_s: float = 0.0
     session_timeout_s: float = 30.0  # no request for this long = session dropped (guess); 0 = off
     stream_keepalive_s: float = 10.0  # no request from the viewer = stream stops (guess)
     fps: float = 25.0
@@ -400,6 +405,8 @@ class EmuCamera:
         q = "&".join("%s=%s" % (k, params[k]) for k in ("mode", "type", "value", "value2")
                      if k in params)
         self.counters[mode] = self.counters.get(mode, 0) + 1
+        if self.cfg.idle_sleep_s:
+            self._arm_idle_sleep()
         ctype, body, result = self._dispatch(ip, mode, typ, value, value2)
         self.record("cgi", q, result, ip)
         return ctype, body
@@ -407,6 +414,18 @@ class EmuCamera:
     @staticmethod
     def _xml(result: str, extra: str = "") -> Tuple[str, str, str]:
         return "text/xml", XML_HEAD + "<camrply><result>%s</result>%s</camrply>" % (result, extra), result
+
+    def _arm_idle_sleep(self) -> None:
+        """BLE-woken body: asleep again after idle_sleep_s with no cam.cgi request
+        (only once a controller was accepted; before that the wake keeps it up)."""
+        self.last_cgi = stamp = self.now()
+
+        def check() -> None:
+            if (self.powered and getattr(self, "last_cgi", None) == stamp
+                    and any(s.state == "ok" for s in self.sessions.values())):
+                self.power_off("idle %.1fs after a Bluetooth wake: back to sleep"
+                               % self.cfg.idle_sleep_s)
+        self.later(self.cfg.idle_sleep_s, check)
 
     def _session_check(self, ip: str, mode: str) -> Optional[str]:
         """None = allowed, else the error result."""
@@ -906,7 +925,8 @@ class EmuCamera:
             if self.settle_until == until:
                 self.settle_until = None
                 self.set_mode("play")
-                self.emit("X_Panasonic_Cam_Sync", "mod_Play")
+                if self.cfg.post_subscribe_mod_play:
+                    self.emit("X_Panasonic_Cam_Sync", "mod_Play")
         self.later(delay, settled)
         return 200, {"SID": sid, "TIMEOUT": "Second-%d" % secs}
 

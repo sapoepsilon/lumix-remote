@@ -305,6 +305,13 @@ class Camera:
         self._log_fh.write(line)
         self._log_fh.flush()
 
+    def _trace_error(self, q: str, err: str) -> None:
+        if self._log_fh is None:
+            return
+        self._log_fh.write("[%s] GET /cam.cgi?%s -> no reply (%s)\n" % (
+            dt.datetime.now().strftime("%H:%M:%S.%f")[:-3], q, err.rstrip(": ")))
+        self._log_fh.flush()
+
     def _check_reject(self, q: str, rep: Reply) -> None:
         """A camera that rebooted (or dropped us) between two keepalives still
         answers getstate/getinfo before a new req_acc, so the 1 Hz getstate never
@@ -568,14 +575,15 @@ class Camera:
         ddd, req_acc (1 s loop), SUBSCRIBE, 200 ms, raw_img_send, capability,
         allmenu, curmenu, lens, touch_type, getstate, device_name; then the
         live-view start (stopstream, recmode, startstream) once."""
-        # powered_off stays set until a connect succeeds: every failed attempt
-        # in between still means "the camera is off", not "out of range"
+        # powered_off stays set until the camera accepts us again: every failed
+        # attempt before that still means "the camera is off", not "out of range"
         self._set_status("connecting", "contacting %s" % ip)
         if self.transport is None or self.transport.ip != ip:
             if self.transport is not None:
                 await self.transport.close()
             self.transport = CamTransport(ip, user_agent=LUMIX_SYNC_UA, trace=self._trace,
-                                          port=self.cfg.http_port, guard=self._pre_send)
+                                          port=self.cfg.http_port, guard=self._pre_send,
+                                          trace_error=self._trace_error)
         t = self.transport
         self.liveview.camera_ip = ip
         self.busy_streak = 0
@@ -619,6 +627,8 @@ class Camera:
                 raise CamError("access not granted: %s" % r.text)
             await asyncio.sleep(1.0)
         self.log_event("conn", "access granted: %s" % r.text)
+        # it answered req_acc, so it is on: a failure from here on is not "powered off"
+        self.powered_off = False
         # 2b. Read the camera's state before anything can change its mode. A body
         # that is mid-operation (in-camera interval run, video recording) gets a
         # read-only connect: no device_name/raw_img_send, no SUBSCRIBE (in rec it
@@ -668,8 +678,7 @@ class Camera:
         if left > 0 and not self._mod_play.is_set():
             if not deferred:
                 self._set_status("connecting", "finishing the connection (the camera needs 5-30 s)")
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._mod_play.wait(), left)
+            await self._settle_wait(left)
         self.log_event("conn", "camera settled after SUBSCRIBE in %.1fs (%s)" % (
             time.monotonic() - sub_at, (q.settle_event or "settle") if self._mod_play.is_set() else "timeout"))
         await self._refresh_state(strict=True)
@@ -688,6 +697,35 @@ class Camera:
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
         for hook in list(self.ready_hooks):
             self._spawn(hook(self))
+
+    async def _settle_wait(self, left: float) -> None:
+        """Wait up to ``left`` s for the post-SUBSCRIBE mod_Play, polling getstate
+        at the keepalive rate meanwhile: LUMIX Sync starts its 1 Hz CameraWatchLoop
+        right after device_name and never leaves the camera without a request.
+        A camera woken over Bluetooth with its switch OFF waits in a standby (play,
+        lens unpowered) and goes back to sleep when nothing reaches it for ~30 s: on 2026-10-12 14:30:12-14:30:41 we sent nothing
+        while waiting (no mod_Play came; the body was already in play), the getstate
+        after the wait got no reply and the camera was asleep again
+        (tests/fixtures/real-s5-ble-wake-settle-2026-10-12.log). getstate is a read
+        and safe inside the switch window; only camcmd/stopstream wedge there.
+        err_reject or 3 failed polls in a row = disconnected, as in the supervisor."""
+        deadline = time.monotonic() + left
+        fails = 0
+        while not self._mod_play.is_set():
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                return
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._mod_play.wait(), min(rem, self.cfg.keepalive_s))
+            if self._mod_play.is_set() or deadline - time.monotonic() <= 0:
+                return
+            try:
+                await self._refresh_state(strict=True)
+                fails = 0
+            except CamError as e:
+                fails += 1
+                if fails >= 3:
+                    raise Disconnected("keepalive failed 3x while finishing the connection: %s" % e)
 
     async def _readonly_setup(self, t: CamTransport, why: str) -> None:
         """Connect without touching the camera's mode: only reads (capability,

@@ -1,0 +1,60 @@
+# Real DC-S5 (fw 2.03), power switch OFF, Remote Wakeup ON, 2026-10-12 14:28-14:32.
+# Server log (/tmp/lumix-server.log), in-memory event log (/api/events) and the
+# camera traffic log (logs/camera-*.log), merged by time. OK getstates are not
+# written to the camera log (1 Hz noise); a request with no reply was not logged
+# at all before this fix. Scrubbed: camera name -> S5-XXXXXX, camera IP -> <cam>,
+# client id -> <id>, SSID payload -> <ssid>. tests/test_wake_settle.py models it.
+
+## user pressed Power off in the UI
+14:28:42.431 GET stopstream -> ok
+14:28:42.673 GET camcmd poweroff -> ok                      (powered_off = True)
+14:28:44.019 GET getstate -> err_reject                     status "reconnecting camera powered off"
+
+## wake 1 (UI "Turn on over Bluetooth", POST /api/ble/wake)
+14:28:56 ble [ 8.35s] found S5-XXXXXX
+14:29:41 ble [53.36s] connect try 1 failed: timed out
+14:29:48 ble [61.06s] connected; id + name, initial_inform, time
+14:29:49.978 ble write 18345be0 <ssid>
+14:29:50.161 ble write 0d6f1880 03 ; notify 18345be1 00 ; write 0d6f1880 02
+14:29:50.852 ble write e182ec40 03
+14:30:10.147 ble [82.43s] disconnected                      wake -> ok (82 s)
+14:30:10.309 GET accctrl req_acc <id> -> ok_under_research_no_msg,S5-XXXXXX,remote,encrypted
+14:30:11.350 GET accctrl req_acc <id> -> ok,S5-XXXXXX,remote,encrypted
+14:30:11.384 getstate: cammode play (already play: no switch for the SUBSCRIBE to trigger)
+14:30:11.537 SUBSCRIBE -> 200
+14:30:11.586 notify CurrentConnectionIDs=0
+14:30:12.410 GET setsetting raw_img_send -> ok
+14:30:12.505 GET getinfo capability -> ok   (appname LUMIX_Sync)
+14:30:12.596 GET getinfo allmenu -> ok
+14:30:12.645 GET getinfo curmenu -> ok
+14:30:12.666 GET getinfo lens -> ok
+14:30:12.686 GET getsetting touch_type -> ok
+14:30:12.7   GET getstate -> ok (not logged)
+14:30:12.726 GET setsetting device_name -> ok               status "finishing the connection (5-30 s)"
+             ... nothing sent for 28.7 s: waiting for a mod_Play that never comes ...
+14:30:41.383 conn camera settled after SUBSCRIBE in 30.0s (timeout)
+14:30:41.4   GET getstate -> no reply
+14:30:48.386 connection lost: camera powered off            (stale flag; really "no reply")
+14:30:52-58  ddd <cam>:60606 -> timeout                     camera asleep again (BLE-advertising)
+
+## wake 2 (user pressed Turn on again)
+14:30:57.632 ble [ 3.08s] found ; 14:31:05 connected (10.6 s: body asleep, not off)
+14:31:07.223 ble write e182ec40 03
+14:31:20.887 ble [26.34s] disconnected
+14:31:21.027 GET req_acc -> ok_under_research_no_msg ; 14:31:22.272 -> ok
+14:31:22.429 SUBSCRIBE -> 200 ; setup reads ; 14:31:23.850 device_name -> ok
+             ... nothing sent for 28.4 s ...
+14:31:52.296 conn camera settled after SUBSCRIBE in 30.0s (timeout)
+14:31:52.3   GET getstate -> ok (answered, ~1.6 s late)
+14:31:53.919 GET camcmd recmode -> ok
+14:31:54.744 notify lens_Atta, busy, lens_Atta ; cammode play -> rec
+14:31:55.304 GET startstream -> ok                          status "ready" 14:31:55.336
+
+## earlier the same day, wake at 14:17:43: same 29.5 s silence (14:19:03.776 ->
+## 14:19:33.287 recmode ok), also survived: we sat right on the limit every time.
+## After a wake the body sits in a standby: play mode, lens unpowered (getinfo lens
+## has no lens name) until the first recmode (then lens_Atta, full power-up).
+## Control 14:46:20-14:47:36: the same body fully on (rec, lens powered, accepted
+## session) with the server frozen for 75 s stayed on Wi-Fi and kept the session.
+## So the ~30 s sleep is the post-wake standby. LUMIX Sync's CameraWatchLoop sends
+## getstate every 1 s from right after device_name (docs/lumix-sync-wifi-flow.md s5).
