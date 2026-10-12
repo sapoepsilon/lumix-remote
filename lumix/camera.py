@@ -148,6 +148,17 @@ class Camera:
         self._last_ok = time.monotonic()
         self._mod_play = asyncio.Event()   # set by the mod_Play NOTIFY
         self._reconnect_req = asyncio.Event()
+        # Called (ensure_future) every time a connect reaches "ready": resume hooks.
+        self.ready_hooks: List[Callable[["Camera"], Any]] = []
+        # Set while an in-camera interval (time-lapse) run is armed or running:
+        # the body answers err_busy to capture/recmode/playmode then, which is
+        # not the wedge.
+        self.interval_owner: Optional[str] = None
+
+    @property
+    def interval_active(self) -> bool:
+        return (self.interval_owner is not None
+                or self.state.get("interval_status") in ("run", "pause"))
 
     # ------------------------------------------------------------------ utils
     def _set_status(self, status: str, msg: str = "") -> None:
@@ -181,6 +192,8 @@ class Camera:
             return
         if "value=poweroff" in q:
             return
+        if self.interval_active and rep.result != "ok":
+            return      # the body is busy with its own interval run, not wedged
         if rep.result == "ok":
             if self.wedged:
                 self.log_event("conn", "camera accepts commands again (wedge cleared)")
@@ -465,6 +478,8 @@ class Camera:
         self.connected_at = time.time()
         self._save_state(connected_at=int(self.connected_at), provisional=False)
         self._set_status("ready", "%s connected" % self.ddd.get("friendlyName", ip))
+        for hook in list(self.ready_hooks):
+            asyncio.ensure_future(self._safe(hook(self)))
 
     async def _access_values(self, t: CamTransport) -> "tuple[str, str, str]":
         """accctrl type and values for this body: plain req_acc, or LUMIX Sync's
@@ -549,9 +564,12 @@ class Camera:
             self.log_event("warn", "event subscription failed: %s" % e)
 
     async def cmd(self, mode: str, type: Optional[str] = None, value: Optional[str] = None,
-                  value2: Optional[str] = None, timeout: float = 6.0, tries: int = 5) -> Reply:
+                  value2: Optional[str] = None, timeout: float = 6.0, tries: int = 5,
+                  judge_wedge: bool = True) -> Reply:
         """LUMIX Sync retry rule: on err_busy wait 1 s and retry, at most 5 tries,
-        then return the last reply. No other command is sent in between."""
+        then return the last reply. No other command is sent in between.
+        ``judge_wedge=False``: a short budget that runs out is not the wedge
+        (time-lapse shots use fewer tries and skip instead)."""
         assert self.transport
         r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
         n = 1
@@ -562,7 +580,7 @@ class Camera:
         # One camcmd/startstream refused for LUMIX Sync's whole retry budget is the
         # wedge (2026-10-11: capture err_busy x5 never cleared without a power
         # cycle). recmode is judged by ensure_rec(), which also checks cammode.
-        if (n >= tries and r.result in ("err_busy", "err_critical")
+        if (judge_wedge and n >= tries and r.result in ("err_busy", "err_critical")
                 and (mode == "startstream" or (mode == "camcmd" and value not in ("recmode", "poweroff")))
                 and self.profile.connect.busy_budget_exhausted_is_wedge):
             self._mark_wedged("%s %s refused %d times" % (mode, value or "", n))
@@ -727,6 +745,10 @@ class Camera:
         if (not self.liveview_wanted or self._op_lock.locked() or self.body_busy
                 or self.wedged or self.state.get("cammode") != "rec"):
             return
+        if self.interval_active:
+            # the body runs its own interval shooting: recmode/startstream answer
+            # err_busy until it ends, so a restart would only hold the camera lock
+            return
         age = self.liveview.age
         stale = age is None or age > 5
         if not stale:
@@ -806,6 +828,8 @@ class Camera:
             raise Busy("camera is being operated on the body (waiting for it to finish)")
         if self.wedged:
             raise Busy("camera is stuck answering err_busy; power-cycle it")
+        if self.interval_active:
+            raise Busy("an in-camera interval run is in progress (stop the timelapse first)")
 
     async def capture(self) -> Dict[str, Any]:
         async with self.exclusive("capture") as t:
@@ -903,8 +927,42 @@ class Camera:
             r = await t.cgi("camcmd", value=action)
             return {"result": r.result}
 
+    async def stop_recording(self, timeout: float = 20.0) -> Dict[str, Any]:
+        """Stop a running video recording and wait for the card write to finish
+        (getstate rec off and sd_access off). No-op when not recording."""
+        if self.transport is None or self.state.get("rec") != "on":
+            return {"stopped": False, "reason": "not recording"}
+        async with self.exclusive("quiesce-video", timeout=timeout):
+            r = await self.cmd("camcmd", value="video_recstop", timeout=10)
+            self.log_event("cmd", "video_recstop (quiesce) -> %s" % r.result)
+            deadline = time.monotonic() + timeout
+            written = False
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.4)
+                with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                    await self._refresh_state()
+                if self.state.get("rec") != "on" and self.state.get("sd_access") != "on":
+                    written = True
+                    break
+            return {"stopped": r.ok, "result": r.result, "card_written": written}
+
+    async def unsubscribe_events(self) -> bool:
+        """UNSUBSCRIBE the GENA subscription (before power-off / shutdown). The
+        session keeps working for cam.cgi, but without events; LUMIX Sync never
+        re-subscribes a live session, so only a reconnect brings them back."""
+        had = bool(self.listener.sid)
+        with contextlib.suppress(Exception):
+            await self.listener.unsubscribe()
+        if had:
+            self.log_event("conn", "event subscription cancelled (UNSUBSCRIBE)")
+        return had
+
     async def poweroff(self) -> Dict[str, Any]:
         async with self.exclusive("poweroff") as t:
+            if (self.profile.connect.poweroff_needs_rec and self.state.get("cammode") == "play"
+                    and not self.wedged):
+                # the S5 answers err_reject to poweroff in play mode
+                await self.ensure_rec()
             r = await t.cgi("camcmd", value="poweroff")
             self.log_event("cmd", "poweroff -> %s" % r.result)
             if r.ok:
