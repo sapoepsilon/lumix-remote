@@ -360,7 +360,9 @@ function statusInfo(s) {
     case "discovering": return { title: "Looking for your camera", msg: msg || "Scanning the network…", cls: "", dot: "wait" };
     case "connecting": return { title: "Connecting…", msg, cls: "", dot: "wait" };
     case "waiting_approval": return { title: "Approve on the camera", msg: "Your camera is registering this device. If it shows a prompt, press OK on the camera.", cls: "warn", dot: "wait" };
-    case "reconnecting": return { title: "Reconnecting…", msg: msg.includes("powered off") ? "The camera is off. Switch it on and it will reconnect." : "The camera dropped off (asleep or out of range). Retrying automatically.", cls: "warn", dot: "wait" };
+    case "reconnecting":
+      if ((s && s.powered_off) || msg.includes("powered off")) return { title: "Camera is off", msg: "Switch it on and it reconnects by itself (Wi-Fi can't wake it).", cls: "warn", dot: "bad" };
+      return { title: "Reconnecting…", msg: "The camera dropped off (asleep, off or out of range). Retrying automatically." + (msg ? ` (${msg})` : ""), cls: "warn", dot: "wait" };
     case "error": return { title: "Something's wrong", msg, cls: "warn", dot: "bad" };
     case "offline": return { title: "Server not reachable", msg: "Start it with ./run.sh on your Mac.", cls: "warn", dot: "bad" };
     case "no_camera": return { title: "No camera yet", msg: "Add a camera to get started.", cls: "", dot: "" };
@@ -772,7 +774,16 @@ function openFiles() {
   haptic();
   files.items = []; files.total = 0; files.sel.clear();
   renderFiles();
-  loadFiles(0);
+  loadFiles(0).then(watchRunningImport);
+}
+// An import paused when you left Files continues on the next visit: show its progress.
+async function watchRunningImport() {
+  if (files.job) return;
+  try {
+    const jobs = await api("/api/jobs");
+    const j = (jobs || []).find((x) => ["queued", "running"].includes(x.state));
+    if (j) pollJob(j.id, j.files_total || (j.ids || []).length);
+  } catch (_) { /* older server */ }
 }
 async function closeFiles() {
   const f = $("files");
@@ -890,6 +901,9 @@ function askImport() {
   $("importtext").textContent = `Copy ${n} item${n === 1 ? "" : "s"}${$("incraw").checked ? " (with RAW files)" : ""} from the camera to this Mac.`;
   $("importdest").value = LS.get("importdest", "");
   $("importdlg").showModal();
+  api("/api/files/status").then((st) => {
+    if (st && st.default_dest) $("importdest").placeholder = st.default_dest.replace(/^\/Users\/[^/]+/, "~") + " (default)";
+  }).catch(() => {});
 }
 async function startImport() {
   const ids = [...files.sel];
@@ -909,6 +923,11 @@ async function startImport() {
   }
 }
 async function pollJob(id, n) {
+  if (files.job === id) return;
+  files.job = id;
+  try { await pollJobLoop(id, n); } finally { if (files.job === id) files.job = null; }
+}
+async function pollJobLoop(id, n) {
   const box = $("job");
   box.hidden = false;
   $("jobtitle").textContent = `Importing ${n} item${n === 1 ? "" : "s"}…`;
@@ -925,7 +944,7 @@ async function pollJob(id, n) {
     $("jobbar").style.width = Math.max(2, Math.round(p * 100)) + "%";
     const bytes = j.bytes_done ? ` · ${fmtSize(j.bytes_done)}${j.bytes_total ? " of " + fmtSize(j.bytes_total) : ""}` : "";
     const skipped = j.files_skipped ? ` · ${j.files_skipped} already there` : "";
-    $("jobsub").textContent = (done !== null ? `${done} / ${total}` : `${Math.round(p * 100)}%`) + bytes + skipped;
+    $("jobsub").textContent = (done !== null ? `${done + (j.files_skipped || 0)} / ${total}` : `${Math.round(p * 100)}%`) + bytes + skipped;
     if (j.current) $("jobtitle").textContent = `Importing ${j.current}`;
     const st = String(j.state || j.status || "").toLowerCase();
     if (st === "paused") {
@@ -937,7 +956,14 @@ async function pollJob(id, n) {
       const failed = j.files_failed || 0;
       $("jobtitle").textContent = failed ? `Imported with ${failed} error${failed === 1 ? "" : "s"}` : "Imported";
       $("jobbar").style.width = "100%";
-      toast(`Imported ${done !== null ? done : n} of ${total}${j.dest ? " to " + j.dest : ""}${failed ? `, ${failed} failed` : ""}`, failed > 0);
+      const got = done !== null ? done : n, skip = j.files_skipped || 0;
+      const where = j.dest ? " in " + j.dest.replace(/^\/Users\/[^/]+/, "~") : "";
+      if (!got && skip && !failed) {
+        $("jobtitle").textContent = "Already imported";
+        toast(`Already on this Mac: ${skip} file${skip === 1 ? "" : "s"}${where}`);
+      } else {
+        toast(`Imported ${got} file${got === 1 ? "" : "s"}${where}${skip ? ` (${skip} already there)` : ""}${failed ? `, ${failed} failed` : ""}`, failed > 0);
+      }
       haptic([8, 30, 8]);
       break;
     }
@@ -1476,7 +1502,7 @@ function renderTlSetup() {
   const run = (shots - 1) * c.interval;
   const clip = shots / 24;
   $("tlsum").replaceChildren(el("b", {}, `${shots} shots`), ` · ${fmtDur(run)} · `, el("b", {}, `${clip < 10 ? clip.toFixed(1) : Math.round(clip)} s`), " clip at 24 fps",
-    c.import || c.video ? ` · ${c.video ? "MP4" : "frames"} in ~/Pictures/Lumix` : "",
+    c.import || c.video ? ` · ${c.video ? "MP4" : "frames"} in ${(caps.default_dest || "~/Pictures/Lumix").replace(/^\/Users\/[^/]+/, "~")}` : "",
     caps.ffmpeg === false && c.video ? " (ffmpeg missing)" : "");
 }
 function renderTlLast() {
@@ -1586,7 +1612,8 @@ async function openPowerSheet() {
   $("powerdlg").showModal();
   let plan;
   try { plan = await api("/api/power/plan"); } catch (e) { list.replaceChildren(el("li", { class: "plan-empty" }, e.message)); return; }
-  const items = plan.items || [];
+  // live view and the event subscription always end cleanly: not worth a line each
+  const items = (plan.items || []).filter((it) => !["liveview", "events"].includes(it.kind));
   const verb = { pause: "Pauses", stop: "Stops", unsubscribe: "Ends" };
   list.replaceChildren(...(items.length ? items.map((it) => el("li", { class: it.action === "pause" ? "pause" : it.kind === "recording" ? "stop" : "quiet" },
     el("span", { class: "plan-ico" }, PLAN_ICON[it.kind] || "•"),
@@ -1651,7 +1678,13 @@ function init() {
   wireSheet();
   wireFiles();
   document.addEventListener("keydown", (e) => {
-    if (e.target.matches("input, select, textarea") || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.target.matches("input, select, textarea")) {
+      // Esc in a field: first clears it (search fields do that natively), then leaves it
+      // and closes like anywhere else
+      if (e.key !== "Escape" || e.target.closest("dialog") || e.target.value) return;
+      e.target.blur();
+    }
     if (document.querySelector("dialog[open]")) return;
     const k = e.key;
     if (k === "Escape") {

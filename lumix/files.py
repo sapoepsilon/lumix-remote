@@ -250,7 +250,8 @@ class FileBrowser:
                 "cached_items": len(self.by_id) if self.entries is not None else None,
                 "card_files": sum(e.count for e in self.entries) if self.entries is not None else None,
                 "listed_at": self.listed_at or None, "last_error": self.last_error,
-                "jobs": [j.id for j in self.jobs.values() if j.state in ("queued", "running")]}
+                "jobs": [j.id for j in self.jobs.values() if j.state in ("queued", "running")],
+                "default_dest": os.path.abspath(os.path.expanduser(DEFAULT_DEST))}
 
     def _publish(self) -> None:
         with contextlib.suppress(Exception):

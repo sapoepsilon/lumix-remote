@@ -318,7 +318,8 @@ class TimelapseEngine:
                 "native_max_count": caps.get("interval_max_count"),
                 "native_min_interval_s": caps.get("interval_min_s"),
                 "ffmpeg": shutil.which("ffmpeg") is not None,
-                "import_each_min_s": IMPORT_EACH_MIN_S}
+                "import_each_min_s": IMPORT_EACH_MIN_S,
+                "default_dest": os.path.abspath(os.path.expanduser(DEFAULT_DEST))}
 
     def status(self) -> Dict[str, Any]:
         j = self.job
