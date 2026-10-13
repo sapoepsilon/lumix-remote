@@ -12,7 +12,15 @@
     * ``err_busy`` (card write still running): at most two quick retries (1 s
       apart) inside the slot, then skip; never counted as the wedge;
     * camera reconnecting: the job waits, missed slots are counted, shooting
-      resumes on the grid when the camera is back (AE lock re-applied).
+      resumes on the grid when the camera is back (AE lock re-applied);
+    * camera left rec mode on its own (``Camera.auto_rec``): slots are skipped
+      while it is given time to come back by itself (reads only), then one
+      recmode, at most two per 5 min; when that does not hold the job PAUSES
+      (``paused_by="camera"``, ``job.message`` says why) instead of fighting
+      the camera, which wedged the real S5 on 2026-10-12 16:52;
+    * a capture the camera answers ok but then reports as failed
+      (``X_Panasonic_Cam_PRec`` err_rec, no photo written) is not counted as a
+      shot; two in a row pause the job the same way.
 
     ``count`` is the number of photos taken (skipped slots extend the run);
     ``duration`` caps the run on the slot grid (pauses do not count).
@@ -82,7 +90,9 @@ IMPORT_EACH_MIN_S = 30.0       # play-mode round trip per shot needs about this 
 MIN_INTERVAL_S = 1.0
 MAX_INTERVAL_S = 24 * 3600.0
 MAX_COUNT = 99999
-REC_RETRY_S = 60.0             # at most one live-view (recmode) restart per minute
+REC_RETRY_S = 60.0             # cameras without Camera.auto_rec: one live-view restart per minute
+# Photo recording errors (X_Panasonic_Cam_PRec err_*) in a row that pause the job
+PHOTO_ERROR_PAUSE = 2
 # Quiesce reasons whose pauses resume when the camera is back (resume_on_reconnect)
 RECONNECT_RESUMABLE = ("poweroff", "server-stop", "reconnect")
 
@@ -304,6 +314,7 @@ class TimelapseEngine:
         self._shot_lock_: Optional[asyncio.Lock] = None
         self._epoch: Optional[float] = None       # cam.connected_at the job prepared for
         self._last_rec_try = 0.0
+        self._photo_err_streak = 0
         self._last_pub = 0.0
         self.load()
 
@@ -532,6 +543,10 @@ class TimelapseEngine:
                 raise TimelapseError("no paused timelapse to resume")
             return self.status()
         was = j.paused_by
+        reset = getattr(self.cam, "reset_auto_rec", None)
+        if reset is not None and was == "camera":
+            reset()             # the user checked the camera: a fresh recmode budget
+        self._photo_err_streak = 0
         if j.engine == "native":
             # an explicit resume (user, or the power-off resume): restart a run paused
             # on the camera / re-arm a lost one; a server restart only adopts
@@ -668,6 +683,8 @@ class TimelapseEngine:
                 self._skip(j, "camera not reachable (%s)" % type(e).__name__)
             j.slot += 1
             self._changed()
+            if j.state != "running":
+                return          # paused by _camera_pause (camera trouble)
         j.next_shot_at = None
         j.state = "importing" if j.auto_import else "assembling" if j.video else j.state
         await self._finish(j, "done")
@@ -750,6 +767,27 @@ class TimelapseEngine:
         except Busy as e:
             j.errors.append("drive mode: %s" % e)
 
+    def _camera_pause(self, j: TimelapseJob, why: str) -> None:
+        """Pause from inside the runner because the camera itself is in trouble.
+        Not resumed on reconnect (``paused_by="camera"``): the user checks the
+        camera and presses Resume."""
+        j.state, j.paused_by, j.paused_at, j.waiting = "paused", "camera", time.time(), None
+        j.next_shot_at = None
+        j.message = "paused to protect the camera: %s. Check the camera (its screen, card, lens, " \
+                    "battery), then Resume" % why
+        j.errors.append("paused: %s" % why)
+        self.cam.log_event("warn", "timelapse %s paused after %d shot(s): %s" % (j.name, j.shots, why))
+        self._changed()
+
+    async def _rec_ready(self, j: TimelapseJob) -> "tuple[str, str]":
+        """("ready" | "wait" | "give_up", reason): Camera.auto_rec's policy (never
+        fight a camera that left rec on its own), else the old live-view restart."""
+        auto = getattr(self.cam, "auto_rec", None)
+        if auto is not None:
+            return await auto("timelapse %s" % j.name)
+        ok = await self._ensure_rec(j)
+        return ("ready", "") if ok else ("wait", "camera not in rec mode (%s)" % self.cam.state.get("cammode"))
+
     async def _ensure_rec(self, j: TimelapseJob) -> bool:
         cam = self.cam
         if cam.state.get("cammode") == "rec":
@@ -782,8 +820,14 @@ class TimelapseEngine:
                 await asyncio.sleep(0.25)       # nothing is sent while the body is in use
             if cam.body_busy:
                 reason = "camera busy (in use on the body)"
-        if reason is None and not await self._ensure_rec(j):
-            reason = "camera not in rec mode (%s)" % cam.state.get("cammode")
+        if reason is None:
+            st, why = await self._rec_ready(j)
+            if st == "give_up":
+                self._skip(j, why)
+                self._camera_pause(j, why)
+                return
+            if st != "ready":
+                reason = why
         if reason is None and j.native.get("oneshot"):
             # a capture now would land on a run that is still finishing
             deadline = time.monotonic() + tol
@@ -801,21 +845,36 @@ class TimelapseEngine:
             async with self._shot_lock:
                 async with cam.exclusive("timelapse", timeout=tol):
                     before = cam.state.get("remaincapacity")
+                    t_cap = time.monotonic()
                     r = await cam.cmd("camcmd", value="capture", timeout=15, tries=tries,
                                       judge_wedge=False)
                     j.last_result = r.result
                     if r.ok:
-                        ok = True
-                        j.shots += 1
-                        j.last_shot_at = time.time()
-                        # let the card write settle (bounded, so the grid holds)
-                        end = time.monotonic() + min(4.0, j.interval_s * 0.6)
+                        # let the card write settle (bounded, so the grid holds); the
+                        # real S5 reported err_rec ~3.7 s after a capture that wrote nothing
+                        end = time.monotonic() + min(5.0, j.interval_s * 0.6)
+                        written = False
                         while time.monotonic() < end:
                             await asyncio.sleep(0.4)
                             with contextlib.suppress(Exception):
                                 await cam._refresh_state()
-                            if cam.state.get("remaincapacity") != before:
+                            if cam.state.get("remaincapacity") not in (before, None):
+                                written = True
                                 break
+                            if self._photo_error_since(t_cap):
+                                break
+                        perr = None if written else self._photo_error_since(t_cap)
+                        if perr:
+                            j.failed += 1
+                            j.last_result = perr
+                            j.errors.append("shot %d: camera reported %s (no photo written)"
+                                            % (j.slot + 1, perr))
+                            self._photo_err_streak += 1
+                        else:
+                            ok = True
+                            self._photo_err_streak = 0
+                            j.shots += 1
+                            j.last_shot_at = time.time()
                     elif r.result == "err_busy":
                         self._skip(j, "camera answered err_busy %dx" % tries)
                     else:
@@ -825,10 +884,19 @@ class TimelapseEngine:
         except Busy as e:
             self._skip(j, str(e))
             return
+        if self._photo_err_streak >= PHOTO_ERROR_PAUSE:
+            self._photo_err_streak = 0
+            self._camera_pause(j, "the camera failed to record %d photos in a row (%s) and dropped "
+                                  "to playback" % (PHOTO_ERROR_PAUSE, j.last_result))
+            return
         if ok:
             self._grab_frame(j)
             if j.auto_import and j.import_mode == "each":
                 await self._import_frames(j, back_to_rec=True)
+
+    def _photo_error_since(self, t: float) -> Optional[str]:
+        pe = getattr(self.cam, "photo_error", None)
+        return pe[1] if pe and pe[0] >= t else None
 
     def _grab_frame(self, j: TimelapseJob) -> None:
         frame = getattr(getattr(self.cam, "liveview", None), "frame", None)

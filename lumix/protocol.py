@@ -95,6 +95,51 @@ def build_query(mode: str, type: Optional[str] = None, value: Optional[str] = No
 
 # Result of a request the camera guard refused to send (never sent on the wire).
 GUARD_RESULT = "err_local_mid_operation"
+# Result of a mode switch the transport's rate limiter refused (never sent).
+RATE_LIMITED = "err_local_rate_limited"
+MODE_SWITCHES = ("recmode", "playmode", "pictmode")
+
+
+class ModeSwitchLimiter:
+    """Hard cap on ``camcmd recmode/playmode/pictmode`` for one camera, whoever
+    sends them (connect, live view, files, time-lapse, UI, retries).
+
+    Every confirmed S5 wedge had mode switches close together or into a switch
+    the camera was making on its own: recmode churn (2026-10-11 22:01, the 4th
+    recmode in 20 s), recmode during the post-SUBSCRIBE switch (21:24, 22:45),
+    and 2026-10-12 16:46-16:52 (logs/camera-2026-10-12.log lines 9462-9558):
+    four recmodes in 4 min answering the camera's own drops to playback, then
+    err_busy/err_critical for good. ``min_gap_s`` between two switches and at
+    most ``max_n`` per ``window_s``; the counts are of switches sent."""
+
+    def __init__(self, min_gap_s: float = 10.0, max_n: int = 3, window_s: float = 60.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self.min_gap_s, self.max_n, self.window_s = min_gap_s, max_n, window_s
+        self.clock = clock
+        self.sent: List[float] = []
+
+    def wait_s(self) -> float:
+        """Seconds until a switch would be allowed (0 = now)."""
+        now = self.clock()
+        self.sent = [t for t in self.sent if now - t < max(self.window_s, self.min_gap_s)]
+        wait = 0.0
+        if self.sent:
+            wait = max(wait, self.sent[-1] + self.min_gap_s - now)
+        recent = [t for t in self.sent if now - t < self.window_s]
+        if len(recent) >= self.max_n:
+            wait = max(wait, recent[-self.max_n] + self.window_s - now)
+        return max(0.0, wait)
+
+    def check(self) -> Optional[str]:
+        """None = allowed now, else why not."""
+        wait = self.wait_s()
+        if wait <= 0:
+            return None
+        return ("mode-switch rate limit (max 1 per %.0f s, %d per %.0f s): next allowed in %.1f s"
+                % (self.min_gap_s, self.max_n, self.window_s, wait))
+
+    def note(self) -> None:
+        self.sent.append(self.clock())
 
 
 class CamTransport:
@@ -104,7 +149,9 @@ class CamTransport:
                  trace: Optional[Callable[[str, Reply], None]] = None, port: int = 80,
                  guard: Optional[Callable[[str, Optional[str], Optional[str]],
                                           Awaitable[Optional[str]]]] = None,
-                 trace_error: Optional[Callable[[str, str], None]] = None):
+                 trace_error: Optional[Callable[[str, str], None]] = None,
+                 limiter: Optional[ModeSwitchLimiter] = None,
+                 refused: Optional[Callable[[str, str], None]] = None):
         self.ip = ip
         self.port = port            # cam.cgi port (80 on real bodies; emulators may differ)
         self.user_agent = user_agent
@@ -119,6 +166,11 @@ class CamTransport:
         # (not sent; a local GUARD_RESULT reply comes back instead). The camera
         # uses it to keep mode switches away from a body that is mid-operation.
         self.guard = guard
+        # Mode-switch rate limit, enforced here for every caller; refused
+        # requests answer RATE_LIMITED locally. ``refused(query, reason)`` is
+        # told about every request that was not sent (guard or limiter).
+        self.limiter = limiter if limiter is not None else ModeSwitchLimiter()
+        self.refused = refused
         self.last_ok = 0.0
 
     async def _sess(self) -> aiohttp.ClientSession:
@@ -154,10 +206,14 @@ class CamTransport:
         if self.guard is not None:
             why = await self.guard(mode, type, value)
             if why:
-                log.warning("not sent (%s): %s", why, q)
-                return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>"
-                                   % GUARD_RESULT.encode(), 0.0)
+                return self._local(q, why, GUARD_RESULT)
+        switch = mode == "camcmd" and value in MODE_SWITCHES
         async with self._lock:
+            if switch:
+                why = self.limiter.check()
+                if why:
+                    return self._local(q, why, RATE_LIMITED)
+                self.limiter.note()
             t0 = time.monotonic()
             sess = await self._sess()
             host = self.ip if self.port == 80 else "%s:%d" % (self.ip, self.port)
@@ -180,6 +236,13 @@ class CamTransport:
             except Exception:  # pragma: no cover - tracing must never break control
                 log.exception("trace hook failed")
         return rep
+
+    def _local(self, q: str, why: str, result: str) -> Reply:
+        log.warning("not sent (%s): %s", why, q)
+        if self.refused:
+            with contextlib.suppress(Exception):
+                self.refused(q, why)
+        return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>" % result.encode(), 0.0)
 
 
 def type_name(e: BaseException) -> str:

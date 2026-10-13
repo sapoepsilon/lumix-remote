@@ -712,8 +712,14 @@ request carries `User-Agent: LUMIX Sync` and only one is in flight at a time.
    by SID only; a refused renewal also means full reconnect.
 
 Every command retries `err_busy` 5 times, 1 s apart, then reports it (`recmode`
-3 times; no caller can send more than 3 `recmode` in 20 s, the 4th is withheld
-as `err_local_recmode_guard`, because recmode churn wedges the S5). An
+twice). Mode switches (`recmode`/`playmode`/`pictmode`) are capped in the
+transport for every caller: at most 1 per 10 s and 3 per 60 s; a switch waits up
+to 15 s for a slot, anything beyond is withheld as `err_local_rate_limited`,
+because mode-switch churn wedges the S5. `startstream` only goes out once the
+camera has been in rec for 2 s with no mode/lens event. A camera that drops to
+playback on its own during a time-lapse gets 20 s to come back by itself, then
+one `recmode` (at most 2 per 5 min); if that does not hold, or two photos in a
+row fail (`X_Panasonic_Cam_PRec` `err_rec`), the job pauses with the reason. An
 unexpected `err_reject` (and, every 15 s while frames are missing / 60 s
 otherwise, a `getsetting touch_type`) checks that the camera still knows the
 session: a body that restarted between two keepalives still answers `getstate`

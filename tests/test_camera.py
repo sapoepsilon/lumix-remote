@@ -5,7 +5,8 @@ import unittest
 from unittest import mock
 
 from lumix.camera import Camera, CameraConfig
-from lumix.protocol import parse_reply
+from lumix.protocol import (MODE_SWITCHES, RATE_LIMITED, CamError, CamTransport, ModeSwitchLimiter,
+                            parse_reply)
 
 STATE = ('<?xml version="1.0"?><camrply><result>ok</result><state>'
          '<cammode>%s</cammode></state></camrply>')
@@ -125,36 +126,98 @@ class WedgeTest(unittest.TestCase):
         self.run_fast(cam2.cmd("camcmd", value="capture"))
         self.assertFalse(cam2.wedged)
 
-    def test_recmode_churn_guard_waits_for_a_slot(self):
+    def _limited(self, cam):
+        """FakeTransport with the real ModeSwitchLimiter on a fake clock."""
+        clock = [1000.0]
+        lim = ModeSwitchLimiter(Camera.MODE_SWITCH_MIN_GAP_S, Camera.MODE_SWITCH_MAX,
+                                Camera.MODE_SWITCH_WINDOW_S, clock=lambda: clock[0])
+        tr = cam.transport
+        tr.limiter = lim
+        real = tr.cgi
+
+        async def cgi(mode, type=None, value=None, value2=None, timeout=6.0):
+            if mode == "camcmd" and value in MODE_SWITCHES:
+                if lim.check():
+                    tr.sent.append("NOT SENT %s" % value)
+                    return parse_reply("q", 200, (RESULT % RATE_LIMITED).encode(), 0.0)
+                lim.note()
+            return await real(mode, type, value, value2, timeout)
+        tr.cgi = cgi
+        return clock
+
+    def test_mode_switch_limiter_caps(self):
+        t = [0.0]
+        lim = ModeSwitchLimiter(10.0, 3, 60.0, clock=lambda: t[0])
+        self.assertIsNone(lim.check())
+        lim.note()                                   # t=0
+        t[0] = 5.0
+        self.assertIn("next allowed in 5.0 s", lim.check())   # 1 per 10 s
+        t[0] = 10.0
+        self.assertIsNone(lim.check())
+        lim.note()
+        t[0] = 20.0
+        lim.note()
+        t[0] = 30.0                                  # 3 in the last 60 s
+        self.assertAlmostEqual(lim.wait_s(), 30.0)
+        t[0] = 60.0
+        self.assertIsNone(lim.check())
+
+    def test_transport_refuses_excess_switches_locally(self):
+        t = [0.0]
+        refused = []
+        lim = ModeSwitchLimiter(10.0, 3, 60.0, clock=lambda: t[0])
+        tr = CamTransport("127.0.0.1", port=9, limiter=lim, refused=lambda q, why: refused.append(q))
+        lim.note()
+        r = self.loop.run_until_complete(tr.cgi("camcmd", value="recmode"))
+        self.assertEqual(r.result, RATE_LIMITED)
+        r = self.loop.run_until_complete(tr.cgi("camcmd", value="playmode"))
+        self.assertEqual(r.result, RATE_LIMITED)
+        self.assertEqual(refused, ["mode=camcmd&value=recmode", "mode=camcmd&value=playmode"])
+        # anything else is not rate limited (goes to the wire: nothing listens on :9)
+        with self.assertRaises(CamError):
+            self.loop.run_until_complete(tr.cgi("camcmd", value="capture", timeout=2))
+        self.loop.run_until_complete(tr.close())
+
+    def test_cmd_waits_for_a_slot_then_refuses(self):
         cam = self.make(cammode="play", answer="ok")
+        clock = self._limited(cam)
         waits = []
         real_sleep = asyncio.sleep
 
         async def fake_sleep(s, *a, **k):
             waits.append(s)
-            for i in range(len(cam._recmode_sent)):          # time passes
-                cam._recmode_sent[i] -= s
+            clock[0] += s                            # time passes
             await real_sleep(0)
 
         with mock.patch("lumix.camera.asyncio.sleep", fake_sleep):
-            for _ in range(4):
-                self.loop.run_until_complete(cam.cmd("camcmd", value="recmode"))
-        self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 4)
-        self.assertEqual(len(waits), 1)                      # only the 4th waited
-        self.assertGreater(waits[0], 19)                     # ~20 s after the first one
-        now = __import__("time").monotonic()
-        self.assertLessEqual(sum(now - t < Camera.RECMODE_WINDOW_S for t in cam._recmode_sent), 3)
-
-    def test_recmode_guard_refuses_when_it_may_not_wait(self):
-        cam = self.make(cammode="play", answer="ok")
-        cam.RECMODE_MAX_WAIT_S = 0
-        for _ in range(4):
-            r = self.run_fast(cam.cmd("camcmd", value="recmode"))
-        self.assertEqual(r.result, "err_local_recmode_guard")
+            for _ in range(3):
+                r = self.loop.run_until_complete(cam.cmd("camcmd", value="recmode"))
+                self.assertEqual(r.result, "ok")
+            # 3 sent at t, t+10, t+20; the 4th would have to wait ~40 s > MODE_SWITCH_MAX_WAIT_S
+            r = self.loop.run_until_complete(cam.cmd("camcmd", value="playmode"))
+        self.assertEqual(r.result, RATE_LIMITED)
+        self.assertEqual([round(w) for w in waits], [10, 10])
         self.assertEqual(sum(q == "mode=camcmd&value=recmode" for q in cam.transport.sent), 3)
+        self.assertEqual(cam.transport.sent[-1], "NOT SENT playmode")
         cam.transport.answer = "err_busy"
         self.assertFalse(self.run_fast(cam.ensure_rec()))
         self.assertFalse(cam.wedged)                         # withheld, not refused
+
+    def test_startstream_needs_a_settled_rec(self):
+        cam = self.make(cammode="rec", answer="ok")
+        cam.state = {"cammode": "rec"}
+        cam._unsettled_at = __import__("time").monotonic()
+        self.assertIn("changed mode", cam.stream_blocked())
+        cam._unsettled_at -= Camera.STABLE_S
+        self.assertIsNone(cam.stream_blocked())
+        cam.body_busy = True
+        self.assertIn("busy", cam.stream_blocked())
+        cam.body_busy = False
+        cam.state = {"cammode": "play"}
+        cam.transport.cammode = "play"
+        self.assertIn("play", cam.stream_blocked())
+        why = self.loop.run_until_complete(cam._pre_send("startstream", None, "49199"))
+        self.assertIn("play", why)
 
     def test_no_recmode_passthrough_in_rec_and_no_stray_recstop(self):
         cam = self.make(cammode="rec", answer="ok")

@@ -46,6 +46,8 @@ S5 = ModelProfile(
             "BLE remote-shutter characteristic 7be5fd56 (turns the camera's Wi-Fi off)",
             "camcmd playmode/recmode while an in-camera interval run is going (paused: playmode ok, "
             "then recmode err_critical, 2026-10-12 11:55); also setsetting into it",
+            "recmode + startstream answering the camera's own drops to playback (4 recmodes in "
+            "4 min, startstream err_busy into its switches; 2026-10-12 16:46-16:52)",
         ],
     ),
     capabilities={

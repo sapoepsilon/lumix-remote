@@ -1,0 +1,106 @@
+# Real DC-S5 fw 2.03, 2026-10-12 16:45-16:52: server-engine time-lapse (job 20261012-1146, 30 s, single
+# drive: getsetting drivemode=normal at 16:36:24, interval_status off) until the camera wedged.
+# Sources: lumix-remote camera log (lines marked Lnnnn = logs/camera-2026-10-12.log line numbers; focal/
+# shtrspeed/touch_type polls removed, getinfo bodies cut) merged with the server's event list (EVENT lines:
+# GENA NOTIFYs and job/live-view messages; the camera log had no NOTIFY lines then). Scrubbed: camera name,
+# client id. getstate ok replies are not logged, only 'state change' diffs.
+# 16:36:24-16:46:24: 21 captures, each remaincapacity -1, no mode change (not included).
+L9445 [16:46:18.888] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+L9450 [16:46:24.611] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+L9451 [16:46:25.569] state change {'remaincapacity': '1849', 'sd2_access': 'on'}
+L9452 [16:46:27.009] state change {'sd2_access': 'off'}
+[16:46:37.826] EVENT notify: X_Panasonic_Cam_Sync=mod_Play
+L9459 [16:46:38.033] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+L9460 [16:46:39.313] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+L9462 [16:46:55.865] GET /cam.cgi?mode=camcmd&value=recmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:46:56.061] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+L9463 [16:46:56.853] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+L9464 [16:46:56.886] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1849', 'burst_interval_status': 'off', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'off', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+L9465 [16:46:58.204] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[16:46:58.317] EVENT notify: X_Panasonic_Cam_Sync=mod_Play
+L9466 [16:46:58.330] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9467 [16:46:59.838] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:46:59.838] EVENT lv: live view start (timelapse): startstream -> ok
+[16:46:59.838] EVENT timelapse: timelapse 20261012-1146: skipped slot 31 (camera not in rec mode (play))
+[16:46:59.909] EVENT notify: X_Panasonic_Cam_Sync=mod_Rec
+L9468 [16:47:01.293] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1849', 'burst_interval_status': 'off', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'off', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+L9469 [16:47:01.373] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+L9473 [16:47:06.407] GET /cam.cgi?mode=stopstream -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+L9474 [16:47:06.638] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:47:06.638] EVENT lv: live view start (watchdog, no frames for 29s): startstream -> ok
+L9484 [16:47:24.598] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:47:25.635] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+[16:47:27.024] EVENT notify: X_Panasonic_Cam_PRec=err_rec
+L9485 [16:47:27.178] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[16:47:27.265] EVENT notify: X_Panasonic_Cam_Sync=mod_Play
+L9486 [16:47:27.352] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+L9487 [16:47:28.607] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+[16:47:54.570] EVENT timelapse: timelapse 20261012-1146: skipped slot 33 (camera not in rec mode (play))
+L9492 [16:48:25.629] GET /cam.cgi?mode=camcmd&value=recmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:48:25.743] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+L9493 [16:48:25.916] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1849', 'burst_interval_status': 'off', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'off', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+L9494 [16:48:25.966] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+L9495 [16:48:26.074] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9496 [16:48:28.369] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:48:28.369] EVENT lv: live view start (timelapse): startstream -> ok
+[16:48:28.476] EVENT notify: X_Panasonic_Cam_Sync=mod_Rec
+[16:48:28.709] EVENT notify: X_Panasonic_Cam_Sync=mod_Rec
+L9497 [16:48:28.873] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:48:29.900] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+L9500 [16:48:30.137] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+L9501 [16:48:32.519] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[16:48:32.581] EVENT notify: X_Panasonic_Cam_PRec=err_rec
+[16:48:32.823] EVENT notify: X_Panasonic_Cam_Sync=mod_Play
+L9502 [16:48:32.975] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+[16:48:54.570] EVENT timelapse: timelapse 20261012-1146: skipped slot 35 (camera not in rec mode (play))
+[16:49:24.570] EVENT timelapse: timelapse 20261012-1146: skipped slot 36 (camera not in rec mode (play))
+L9507 [16:49:34.213] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+L9509 [16:49:55.795] GET /cam.cgi?mode=camcmd&value=recmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:49:55.892] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+L9510 [16:49:55.999] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1849', 'burst_interval_status': 'off', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'off', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+L9511 [16:49:56.048] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+L9514 [16:49:57.178] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9515 [16:49:58.650] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:49:58.651] EVENT lv: live view start (timelapse): startstream -> ok
+[16:49:58.729] EVENT notify: X_Panasonic_Cam_Sync=mod_Rec
+[16:49:59.037] EVENT notify: X_Panasonic_Cam_Sync=mod_Rec
+L9516 [16:49:59.139] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:49:59.998] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+L9517 [16:50:00.255] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+[16:50:02.858] EVENT notify: X_Panasonic_Cam_PRec=err_rec
+L9520 [16:50:02.939] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[16:50:03.040] EVENT notify: X_Panasonic_Cam_Sync=mod_Play
+L9521 [16:50:03.248] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+[16:50:24.570] EVENT timelapse: timelapse 20261012-1146: skipped slot 38 (camera not in rec mode (play))
+L9525 [16:50:55.129] GET /cam.cgi?mode=camcmd&value=recmode -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:50:56.003] EVENT notify: X_Panasonic_Cam_Sync=lens_Atta
+L9526 [16:50:56.196] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1849', 'burst_interval_status': 'off', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'off', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+L9527 [16:50:57.258] state change {'cammode': 'play', 'play': 'stop', 'add_location_data': 'off'}
+[16:50:57.370] EVENT notify: X_Panasonic_Cam_Sync=mod_Play
+L9528 [16:50:57.556] GET /cam.cgi?mode=getinfo&type=lens -> 200 ok,2304/256,939/256,3328/256,-1536/256,0,off,60,20,on,128/1024,on,off,l,LUMIX S 20-60/F3.5-5.6,Panasonic,1653,256
+L9529 [16:50:57.579] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9530 [16:50:58.951] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:50:58.951] EVENT lv: live view start (timelapse): startstream -> ok
+[16:50:58.952] EVENT timelapse: timelapse 20261012-1146: skipped slot 39 (camera not in rec mode (play))
+[16:50:59.018] EVENT notify: X_Panasonic_Cam_Sync=mod_Rec
+L9531 [16:51:00.212] state change {'rec': 'off', 'cammode': 'rec', 'video_remaincapacity': '1800', 'remaincapacity': '1849', 'burst_interval_status': 'off', 'rem_disp_typ': 'num', 'progress_time': '0', 'operate': 'enable/enable', 'stop_motion_num': '0', 'stop_motion': 'off', 'interval_status': 'off', 'sdi_state': 'none', 'backupmode': 'off', 'warn_disp': 'no_disp', 'cinelike': 'off', 'slotfunc': 'relay2_1', 'sd_usage_rate': '0', 'mf_guide': 'feet', 'interval_remain_num': '0', 'interval_end_time': '0/0/0/0/00', 'video_priority_disp': 'off', 'lc_state': 'off', 'lc_expo_time': '1', 'lc_shoot_num': '0', 'lc_elapsed_sec': '0', 'hrs_num': '0/0', 'hrs_state': 'off'}
+L9533 [16:51:00.298] GET /cam.cgi?mode=getinfo&type=curmenu -> 200 <?xml version="1.0" encoding="utf-8"?> <camrply> <result>ok</result> <menuinfo ...(body cut)
+L9543 [16:51:16.387] GET /cam.cgi?mode=stopstream -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+L9544 [16:51:16.657] GET /cam.cgi?mode=startstream&value=49199 -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+[16:51:16.657] EVENT lv: live view start (watchdog, no frames for 73s): startstream -> ok
+L9547 [16:51:24.831] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>ok</result></camrply>
+L9549 [16:51:31.439] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9550 [16:51:34.160] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9551 [16:51:38.284] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9552 [16:51:42.348] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9554 [16:51:50.534] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9555 [16:51:54.630] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9556 [16:51:57.365] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9557 [16:52:00.141] GET /cam.cgi?mode=getstate -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_busy</result></camrply>
+L9558 [16:52:05.559] GET /cam.cgi?mode=camcmd&value=capture -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_critical</result></camrply>
+[16:52:05.560] EVENT warn: timelapse 20261012-1146: capture -> err_critical
+L9559 [16:52:07.564] GET /cam.cgi?mode=stopstream -> no reply (TimeoutError)
+[16:52:07.609] EVENT conn: connection lost: no good getstate for 30 s
+[16:52:09.912] EVENT conn: DC-S5 S5-XXXXXX (fw 2.03): model profile dc_s5
+L9560 [16:52:15.126] GET /cam.cgi?mode=accctrl&type=req_acc&value=4D454930-0100-1000-8001-000000000000&value2=LumixRemote -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_critical</result></camrply>
+L9561 [16:52:21.950] GET /cam.cgi?mode=accctrl&type=req_acc&value=4D454930-0100-1000-8001-000000000000&value2=LumixRemote -> 200 <?xml version="1.0" encoding="UTF-8"?> <camrply><result>err_critical</result></camrply>

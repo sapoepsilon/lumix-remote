@@ -128,6 +128,38 @@ class EmuConfig:
     # setsetting drivemode answers ok but the body keeps Time Lapse (seen on the real
     # S5 on 2026-10-12, curmenu drivemode enable="no"; worked the evening before)
     drive_locked: bool = False
+    # Real S5 2026-10-12 16:46-16:52 "photo fault" (logs/camera-2026-10-12.log
+    # lines 9450-9560 + the server's NOTIFY list; tests/fixtures/
+    # real-s5-photo-fault-wedge-2026-10-12.log). Single drive, interval_status off,
+    # 21 good shots @ 30 s, then: mod_Play + play with nothing but reads sent,
+    # 13.2 s after the last good capture (16:46:24.6 -> 16:46:37.8, line 9460);
+    # from then on every capture answers ok, lens_Atta ~1 s later, then
+    # X_Panasonic_Cam_PRec=err_rec + play + mod_Play ~3.7 s after the capture
+    # and no photo (remaincapacity stays 1849; 16:48:28.9 -> 16:48:32.5, lines
+    # 9497-9501; 16:49:59.1 -> 16:50:02.9, 9516-9520). A recmode then answers
+    # ok and the body goes to rec; after the 1st and 4th recmode it dropped back
+    # to play 1.3 s later and came back to rec ~3 s after that (16:46:56.9 ->
+    # 58.2 -> 16:47:01.3, lines 9464-9468; 16:50:56.2 -> 57.3 -> 16:51:00.2,
+    # 9526-9531; both returns came 70 ms after an ok startstream, so the
+    # startstream may have pulled it back; modelled as on its own). startstream
+    # within 2 s of a switch answered err_busy (0.15 s and 1.2 s after rec:
+    # lines 9495, 9514; 0.1 s and 0.3 s into the bounce: 9466, 9529), ok 2.45 s
+    # / 2.65 s after (9496, 9515). After the 4th recmode within 4 min (16:46:55,
+    # 16:48:25, 16:49:55, 16:50:55) the next capture (16:51:24.8, ok) was the end:
+    # getstate err_busy from 16:51:31.4, capture err_critical 16:52:05, req_acc
+    # err_critical for good (lines 9549-9560): only a power cycle helps. That
+    # the recmodes caused the final wedge is our reading, not proven.
+    photo_fault_after: int = 0         # good captures before the fault (0 = never)
+    fault_play_after_s: float = 13.2
+    fault_lens_s: float = 1.0
+    fault_err_rec_s: float = 3.7
+    fault_bounce_play_s: float = 1.3
+    fault_bounce_back_s: float = 3.0
+    fault_bounce_every: int = 3        # recmode #1, #4, #7, ... in the fault bounce
+    fault_stream_settle_s: float = 2.0
+    fault_wedge_recmodes: int = 4      # this many recmodes in the fault within the window ...
+    fault_wedge_window_s: float = 300.0
+    fault_wedge_after_s: float = 6.6   # ... and the next capture: hard wedge this long after it
     browse_max: int = 100            # max items per Browse page (guess)
     dl_range: bool = True            # honour Range on :50001 (unverified on the S5)
     dl_rate: float = 0.0             # :50001 throughput cap in bytes/s (0 = unlimited; for QA)
@@ -235,6 +267,12 @@ class EmuCamera:
         self.interval_mode_switched = False
         self.settings_wedged = False        # setsetting answers err_critical
         self.getsetting_wedged = False      # set by the first such setsetting
+        # 2026-10-12 16:46 photo fault (EmuConfig.photo_fault_after)
+        self.good_captures = 0
+        self.faulted = False
+        self.fault_recmodes: List[float] = []
+        self.mode_changed = self.now()
+        self.hard_wedged = False            # getstate err_busy, camcmd/req_acc err_critical
         if not hasattr(self, "card"):
             # non-volatile: menu settings and the card survive a power cycle
             self.settings: Dict[str, Tuple[str, str]] = dict(GETSETTING_DEFAULTS)
@@ -303,6 +341,7 @@ class EmuCamera:
         def apply() -> None:
             if self.cammode != mode:
                 self.cammode = mode
+                self.mode_changed = self.now()
                 if mode == "play":
                     self.play_since = self.now()
                     self.stream_alive = False      # the camera stops the stream on its own
@@ -459,6 +498,12 @@ class EmuCamera:
 
     def _dispatch(self, ip: str, mode: str, typ: Optional[str], value: Optional[str],
                   value2: Optional[str]) -> Tuple[str, str, str]:
+        if self.hard_wedged:
+            # 16:51:31 onward: getstate err_busy, capture err_critical, stopstream no
+            # reply (modelled as err_critical), req_acc err_critical until power off
+            if mode == "getstate" or mode in ("getsetting", "getinfo", "setsetting"):
+                return self._xml("err_busy")
+            return self._xml("err_critical")
         if mode == "accctrl":
             return self._accctrl(ip, typ, value, value2)
         err = self._session_check(ip, mode)
@@ -689,7 +734,12 @@ class EmuCamera:
                 # S5: in Time Lapse drive the shutter starts the run (no "set" needed)
                 self._interval_start()
                 return self._xml("ok")
+            if self.faulted and realism:
+                return self._fault_capture()
             self.card.add_photo(now=True)
+            self.good_captures += 1
+            if self.cfg.photo_fault_after and self.good_captures >= self.cfg.photo_fault_after:
+                self._enter_fault()
             if realism:
                 self.busy_until = self.now() + self.cfg.capture_busy_s
             return self._xml("ok")
@@ -718,7 +768,52 @@ class EmuCamera:
             self.touch_on = False
         return self._xml("ok")
 
+    # ------------------------------------------------- 2026-10-12 photo fault
+    def _enter_fault(self) -> None:
+        """The body starts failing photos and drops to playback on its own."""
+        def go() -> None:
+            if self.powered and not self.faulted:
+                self.faulted = True
+                self.record("fault", "photo fault: camera drops to play on its own", "fault")
+                self.set_mode("play")
+                self.emit("X_Panasonic_Cam_Sync", "mod_Play", 0.0)
+        self.later(self.cfg.fault_play_after_s, go)
+
+    def _fault_capture(self) -> Tuple[str, str, str]:
+        """ok, no photo; lens_Atta, then PRec err_rec + play (16:47:24-16:50:03)."""
+        now = self.now()
+        recent = [t for t in self.fault_recmodes if now - t <= self.cfg.fault_wedge_window_s]
+        if len(recent) >= self.cfg.fault_wedge_recmodes:
+            def hard() -> None:
+                if self.powered:
+                    self.hard_wedged = True
+                    self.wedge("photo fault + %d recmodes in %.0fs: getstate err_busy, "
+                               "camcmd/req_acc err_critical" % (len(recent), now - recent[0]))
+            self.later(self.cfg.fault_wedge_after_s, hard)
+            return self._xml("ok")
+        self.emit("X_Panasonic_Cam_Sync", "lens_Atta", self.cfg.fault_lens_s)
+        self.emit("X_Panasonic_Cam_PRec", "err_rec", self.cfg.fault_err_rec_s)
+        self.set_mode("play", self.cfg.fault_err_rec_s + 0.1)
+        self.emit("X_Panasonic_Cam_Sync", "mod_Play", self.cfg.fault_err_rec_s + 0.2)
+        return self._xml("ok")
+
+    def _fault_recmode(self) -> Tuple[str, str, str]:
+        now = self.now()
+        n = len(self.fault_recmodes)
+        self.fault_recmodes.append(now)
+        self.set_mode("rec", self.cfg.rec_switch_s)
+        self.emit("X_Panasonic_Cam_Sync", "lens_Atta", self.cfg.rec_switch_s * 0.5)
+        if self.cfg.fault_bounce_every and n % self.cfg.fault_bounce_every == 0:
+            t_play = self.cfg.rec_switch_s + self.cfg.fault_bounce_play_s
+            self.set_mode("play", t_play)
+            self.emit("X_Panasonic_Cam_Sync", "mod_Play", t_play + 0.1)
+            self.set_mode("rec", t_play + self.cfg.fault_bounce_back_s)
+            self.emit("X_Panasonic_Cam_Sync", "mod_Rec", t_play + self.cfg.fault_bounce_back_s)
+        return self._xml("ok")
+
     def _recmode(self) -> Tuple[str, str, str]:
+        if self.faulted and self.cfg.wedge_realism:
+            return self._fault_recmode()
         if self.cammode == "rec" and self.stream_alive:
             return self._xml("err_busy")                # "already rec" (FINDINGS 20:42)
         now = self.now()
@@ -845,6 +940,9 @@ class EmuCamera:
             return self._xml("ok")
         if self.cfg.wedge_realism and self.is_busy():
             return self._xml("err_busy")
+        if (self.cfg.wedge_realism and self.faulted
+                and self.now() - self.mode_changed < self.cfg.fault_stream_settle_s):
+            return self._xml("err_busy")                # 16:46:58.3, 16:48:26.1, 16:49:57.2, 16:50:57.6
         if self.cammode != "rec":
             return self._xml("err_reject")              # guess: no stream outside rec
         self.stream_open = True
@@ -1001,6 +1099,14 @@ class EmuCamera:
         elif action == "update":
             self.body_busy = False
             self.emit(ev, "update", 0.05)
+        elif action == "self_play":
+            # the body drops to playback on its own and comes back by itself
+            # ~3 s later (16:46:58.2 play -> 16:47:01.3 rec, lines 9465-9468)
+            self.set_mode("play")
+            self.emit(ev, "mod_Play", 0.05)
+            back = self.cfg.fault_bounce_back_s
+            self.set_mode("rec", back)
+            self.emit(ev, "mod_Rec", back)
         elif action == "lens_detach":
             self.emit(ev, "lens_Deta", 0.05)
         elif action == "lens_attach":
@@ -1017,6 +1123,7 @@ class EmuCamera:
             "ports": {"http": self.http_port, "upnp": self.upnp_port, "dl": self.dl_port},
             "powered": self.powered, "cammode": self.cammode, "wedged": self.wedged,
             "wedge_reason": self.wedge_reason, "subscribed": self.subscribed,
+            "faulted": self.faulted, "hard_wedged": self.hard_wedged,
             "settling": self.in_settle(),
             "settle_left": round((self.settle_until or 0) - self.now(), 2) if self.in_settle() else 0,
             "busy": self.is_busy(), "body_busy": self.body_busy, "recording": self.recording,

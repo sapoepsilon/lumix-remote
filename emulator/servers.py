@@ -332,6 +332,7 @@ class EmulatorNode:
         async def unwedge(req: web.Request) -> web.Response:
             assert self.cam is not None
             self.cam.wedged, self.cam.wedge_reason = False, ""
+            self.cam.hard_wedged = self.cam.faulted = False
             return ok(self.cam.snapshot())
 
         async def drop(req: web.Request) -> web.Response:

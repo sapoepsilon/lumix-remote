@@ -30,8 +30,9 @@ from .events import EventListener
 from .liveview import LiveViewReceiver
 from .menu import MenuModel
 from .models import ModelProfile
-from .protocol import (GUARD_RESULT, CamError, CamTransport, Reply, encrypt_acc, parse_ddd, parse_nonce,
-                       parse_reply, parse_state)
+from .protocol import (GUARD_RESULT, MODE_SWITCHES, RATE_LIMITED, CamError, CamTransport,
+                       ModeSwitchLimiter, Reply, encrypt_acc, parse_ddd, parse_nonce,
+                       parse_state)
 from .registry import JsonStore
 
 log = logging.getLogger("lumix.camera")
@@ -40,13 +41,11 @@ CONFIG_DIR = os.path.expanduser(os.environ.get("LUMIX_REMOTE_HOME", "~/.config/l
 SUBSCRIBE_SETTLE_S = 30.0      # default max wait for the post-SUBSCRIBE mod_Play (see models)
 LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi request
 SESSION_PROBE = "mode=getsetting&type=touch_type"   # needs an accepted session
-RECMODE_GUARD = "err_local_recmode_guard"            # recmode withheld by the churn guard
 MID_OPERATION = GUARD_RESULT                         # request withheld by the mid-operation guard
 # getstate interval_status while an in-camera interval run is going. Real DC-S5
 # fw 2.03: rec (running) and pause (tests/fixtures/real-s5-interval-2026-10-12.log);
 # "run" is LUMIX Sync's name for other bodies (docs/lumix-sync-wifi-flow.md s10).
 INTERVAL_RUNNING = ("run", "rec", "pause")
-MODE_SWITCHES = ("recmode", "playmode", "pictmode")
 # A read-only connect completes (SUBSCRIBE, live view) once the camera has been
 # idle this long (interval_status not rec/pause/off, not recording, not busy).
 READONLY_CLEAR_S = 10.0
@@ -123,11 +122,27 @@ class Camera:
     PROBE_STALE_S = 15.0
     PROBE_EVERY_S = 60.0
     PROBE_FRAME_AGE_S = 10.0       # live view counts as missing after this
-    # recmode churn guard: the 4th recmode within 20 s wedged the S5 (FINDINGS 22:01)
-    RECMODE_MAX = 3
-    RECMODE_WINDOW_S = 20.0
-    RECMODE_TRIES = 3              # err_busy retries for recmode (stays inside the guard)
-    RECMODE_MAX_WAIT_S = 20.0      # a guarded recmode waits for a slot at most this long
+    # Mode-switch rate limit (recmode/playmode/pictmode), enforced in CamTransport
+    # for every caller: the 4th recmode within 20 s wedged the S5 (FINDINGS 22:01),
+    # four in 4 min while it kept dropping to playback did too (2026-10-12 16:52).
+    MODE_SWITCH_MIN_GAP_S = 10.0
+    MODE_SWITCH_MAX = 3
+    MODE_SWITCH_WINDOW_S = 60.0
+    MODE_SWITCH_MAX_WAIT_S = 15.0  # cmd() waits this long at most for a free slot
+    RECMODE_TRIES = 2              # recmode err_busy retry (the retry waits for the limiter)
+    # startstream only once the camera has been in rec, with no mode/lens event,
+    # for this long: real S5 2026-10-12 startstream 0.15 s / 1.2 s after its switch
+    # to rec -> err_busy, 2.45 s / 2.65 s after -> ok (camera log lines 9495-9496,
+    # 9514-9515); 16:46:58 / 16:50:57 it was sent into the camera's own bounce
+    # back to play (lines 9465-9466, 9527-9529).
+    STABLE_S = 2.0
+    STABLE_WAIT_S = 8.0            # start_liveview waits this long for a settled rec
+    # Automatic return to rec (time-lapse) when the camera left rec on its own:
+    # wait (reads only) this long for it to come back by itself, then one recmode;
+    # at most AUTO_REC_MAX such recmodes per AUTO_REC_WINDOW_S, then give up.
+    AUTO_REC_WAIT_S = 20.0
+    AUTO_REC_MAX = 2
+    AUTO_REC_WINDOW_S = 300.0
     LV_QUALITY_GAP_S = 2.0         # pause between setsetting liveviewsize and the stream restart
 
     def __init__(self, cfg: CameraConfig):
@@ -197,7 +212,13 @@ class Camera:
         # can cancel and await them instead of leaving pending tasks behind.
         self._bg: Set[asyncio.Task] = set()
         self._probe_at = 0.0               # last periodic session probe (supervisor)
-        self._recmode_sent: Deque[float] = deque(maxlen=8)
+        # last cammode change (getstate) and last mode/lens event (NOTIFY or getstate)
+        self._mode_changed_at = float("-inf")
+        self._unsettled_at = float("-inf")
+        self._auto_recmodes: Deque[float] = deque(maxlen=8)   # auto_rec() recmodes (monotonic)
+        self._auto_rec_sent_at: Optional[float] = None         # auto_rec()'s recmode in this episode
+        # last X_Panasonic_Cam_PRec error NOTIFY: (monotonic, value), e.g. err_rec
+        self.photo_error: Optional[tuple] = None
         self._reject_probe_at = float("-inf")  # last session probe after an err_reject (monotonic may start near 0)
         self._state_at = float("-inf")     # monotonic time of the last good getstate
         # Set (to the reason) when the connect found the camera mid-operation (an
@@ -267,6 +288,26 @@ class Camera:
         await self.fresh_state(0.0 if self.interval_running else 1.5)
         return self.mid_operation() if self.interval_running else None
 
+    def rec_settled_in(self) -> Optional[float]:
+        """Seconds until the camera counts as settled in rec (0 = now), None = not in rec."""
+        if self.state.get("cammode") != "rec":
+            return None
+        return max(0.0, self.STABLE_S - (time.monotonic() - self._unsettled_at))
+
+    def stream_blocked(self) -> Optional[str]:
+        """Why startstream must not go out now (None = fine): the camera is not in
+        rec, changed mode / sent a mode or lens event less than STABLE_S ago, or
+        reports busy."""
+        if self.body_busy:
+            return "the camera reports busy"
+        left = self.rec_settled_in()
+        if left is None:
+            return "the camera is in %s, not rec" % (self.state.get("cammode") or "an unknown mode")
+        if left > 0:
+            return "the camera changed mode %.1f s ago (startstream needs %.0f s in rec)" % (
+                time.monotonic() - self._unsettled_at, self.STABLE_S)
+        return None
+
     async def _pre_send(self, mode: str, typ: Optional[str], value: Optional[str]) -> Optional[str]:
         """CamTransport guard: veto requests that could wedge a busy body.
 
@@ -278,12 +319,16 @@ class Camera:
           a mode switch answered err_critical (11:56:33). Not verified on the body:
           whether setsetting/startstream alone (no mode switch) harm a running run;
           they are withheld anyway.
+        * startstream: only in a settled rec (``stream_blocked``).
         getstate/getinfo/getsetting/accctrl/stopstream/camctrl (interval
-        pause|restart|stop, touch) always pass."""
+        pause|restart|stop, touch) always pass. The mode-switch rate limit
+        sits in CamTransport itself (``ModeSwitchLimiter``)."""
         if mode == "camcmd" and value in MODE_SWITCHES:
             why = await self.mode_switch_blocked()
         elif (mode == "camcmd" and value != "poweroff") or mode in ("setsetting", "startstream"):
             why = await self.interval_blocked()
+            if why is None and mode == "startstream":
+                why = self.stream_blocked()
         else:
             return None
         if why:
@@ -315,6 +360,21 @@ class Camera:
             dt.datetime.now().strftime("%H:%M:%S.%f")[:-3], q, rep.status,
             _oneline(rep.text))
         self._log_fh.write(line)
+        self._log_fh.flush()
+
+    def _trace_refused(self, q: str, why: str) -> None:
+        """A request the guard or the rate limiter kept back: one line in the
+        camera log (it never reached the camera)."""
+        if self._log_fh is None:
+            return
+        self._log_fh.write("[%s] NOT SENT /cam.cgi?%s (%s)\n" % (
+            dt.datetime.now().strftime("%H:%M:%S.%f")[:-3], q, why))
+        self._log_fh.flush()
+
+    def _trace_note(self, text: str) -> None:
+        if self._log_fh is None:
+            return
+        self._log_fh.write("[%s] %s\n" % (dt.datetime.now().strftime("%H:%M:%S.%f")[:-3], text))
         self._log_fh.flush()
 
     def _trace_error(self, q: str, err: str) -> None:
@@ -594,9 +654,11 @@ class Camera:
         if self.transport is None or self.transport.ip != ip:
             if self.transport is not None:
                 await self.transport.close()
-            self.transport = CamTransport(ip, user_agent=LUMIX_SYNC_UA, trace=self._trace,
-                                          port=self.cfg.http_port, guard=self._pre_send,
-                                          trace_error=self._trace_error)
+            self.transport = CamTransport(
+                ip, user_agent=LUMIX_SYNC_UA, trace=self._trace, port=self.cfg.http_port,
+                guard=self._pre_send, trace_error=self._trace_error, refused=self._trace_refused,
+                limiter=ModeSwitchLimiter(self.MODE_SWITCH_MIN_GAP_S, self.MODE_SWITCH_MAX,
+                                          self.MODE_SWITCH_WINDOW_S))
         t = self.transport
         self.liveview.camera_ip = ip
         self.busy_streak = 0
@@ -880,6 +942,9 @@ class Camera:
                     break
             self.log_event("conn", "playmode before SUBSCRIBE -> %s (cammode=%s)"
                            % (r.result, self.state.get("cammode")))
+            if r.result == RATE_LIMITED and self.state.get("cammode") == "rec":
+                # never SUBSCRIBE in rec (the 21:24 trigger); connect again later
+                raise Disconnected("playmode before SUBSCRIBE withheld by the mode-switch rate limit")
         await self.listener.unsubscribe()
         try:
             sub = await self.listener.subscribe(ip)
@@ -912,31 +977,27 @@ class Camera:
 
     async def _send(self, mode: str, type: Optional[str], value: Optional[str],
                     value2: Optional[str], timeout: float) -> Reply:
-        """One request; recmode goes through the churn guard (never more than
-        RECMODE_MAX in RECMODE_WINDOW_S, whoever asks: retries, watchdog, UI)."""
+        """One request. A mode switch waits (at most MODE_SWITCH_MAX_WAIT_S) for
+        the transport's rate limiter instead of failing at once (a recmode that
+        never comes leaves the camera in playback); beyond that the transport
+        refuses it locally (RATE_LIMITED)."""
         assert self.transport
-        if mode == "camcmd" and value == "recmode":
-            now = time.monotonic()
-            recent = sorted(t for t in self._recmode_sent if now - t < self.RECMODE_WINDOW_S)
-            if len(recent) >= self.RECMODE_MAX:
-                # wait for a slot instead of failing (a recmode that never comes leaves
-                # the camera in playback), but never longer than the guard window
-                wait = recent[-self.RECMODE_MAX] + self.RECMODE_WINDOW_S - now
-                if wait > self.RECMODE_MAX_WAIT_S:
-                    self.log_event("warn", "recmode not sent: %d already in the last %.0f s (wedge guard)"
-                                   % (len(recent), self.RECMODE_WINDOW_S))
-                    q = "mode=camcmd&value=recmode"
-                    return parse_reply(q, 200, b"<camrply><result>%s</result></camrply>"
-                                       % RECMODE_GUARD.encode(), 0.0)
-                self.log_event("lv", "recmode in %.0f s: %d already in the last %.0f s (wedge guard)"
-                               % (wait, len(recent), self.RECMODE_WINDOW_S))
+        lim = getattr(self.transport, "limiter", None)
+        if mode == "camcmd" and value in MODE_SWITCHES and lim is not None:
+            wait = lim.wait_s()
+            if 0 < wait <= self.MODE_SWITCH_MAX_WAIT_S:
+                self.log_event("lv", "%s in %.0f s (mode-switch rate limit)" % (value, wait))
                 await asyncio.sleep(wait)
-                now = time.monotonic()
-            self._recmode_sent.append(now)
-        return await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+        r = await self.transport.cgi(mode, type, value, value2, timeout=timeout)
+        if r.result == RATE_LIMITED:
+            self.log_event("warn", "camcmd %s not sent: mode-switch rate limit (max 1 per %.0f s, "
+                                   "%d per %.0f s)" % (value, self.MODE_SWITCH_MIN_GAP_S,
+                                                       self.MODE_SWITCH_MAX, self.MODE_SWITCH_WINDOW_S))
+        return r
 
     async def ensure_rec(self) -> bool:
-        """camcmd recmode (3 x 1 s on err_busy); True when getstate says rec."""
+        """camcmd recmode (RECMODE_TRIES on err_busy, the retry waits for the rate limit);
+        True when getstate says rec."""
         assert self.transport
         r = await self.cmd("camcmd", value="recmode", tries=self.RECMODE_TRIES)
         for _ in range(8):
@@ -955,6 +1016,72 @@ class Camera:
                 and self.state.get("cammode") == "play"):
             self._mark_wedged("recmode from play")
         return False
+
+    def reset_auto_rec(self) -> None:
+        """Forget auto_rec()'s recmode budget (an explicit user Resume)."""
+        self._auto_recmodes.clear()
+        self._auto_rec_sent_at = None
+
+    async def auto_rec(self, who: str = "timelapse") -> "tuple[str, str]":
+        """Automatic way back to a usable rec mode, for unattended jobs: never
+        fight the camera. Returns ("ready" | "wait" | "give_up", reason).
+
+        Real S5, 2026-10-12 16:46-16:52 (logs/camera-2026-10-12.log 9450-9560,
+        NOTIFYs from the server's event list): the body dropped to playback on its
+        own (mod_Play 16:46:37, 13 s after a good shot, nothing sent but reads),
+        bounced rec -> play -> rec around our recmodes, and every capture after
+        that ended in X_Panasonic_Cam_PRec=err_rec + mod_Play with no photo. The
+        old time-lapse answered each drop with recmode + startstream (four
+        recmodes in 4 min, four startstream err_busy) and the camera wedged for
+        good at 16:51:31 (getstate err_busy, capture/req_acc err_critical).
+
+        * in rec: "ready" once settled (STABLE_S with no mode/lens event).
+        * left rec: reads only (the supervisor's 1 Hz getstate) for
+          AUTO_REC_WAIT_S, in case it comes back by itself; then ONE recmode for
+          this episode, at most AUTO_REC_MAX per AUTO_REC_WINDOW_S.
+        * still not in rec AUTO_REC_WAIT_S after that recmode, or the budget is
+          used up: "give_up" (the caller pauses its job with the reason)."""
+        await self.fresh_state(1.0)
+        now = time.monotonic()
+        mode = self.state.get("cammode")
+        if mode == "rec":
+            left = self.rec_settled_in() or 0.0
+            if self.body_busy:
+                return "wait", "camera busy (in use on the body)"
+            if left > 0:
+                return "wait", "camera just switched to rec (settling, %.1f s)" % left
+            return "ready", ""
+        if self.wedged:
+            return "give_up", "camera stuck answering err_busy (power-cycle it)"
+        since = now - self._mode_changed_at
+        sent = self._auto_rec_sent_at
+        if sent is not None and sent >= self._mode_changed_at:
+            # our one recmode for this episode did not bring it back
+            if now - sent >= self.AUTO_REC_WAIT_S:
+                return "give_up", ("the camera stays in %s mode %.0f s after one recmode; not "
+                                   "sending more (mode switches into a struggling S5 wedge it)"
+                                   % (mode, now - sent))
+            return "wait", "camera in %s after one recmode %.0f s ago (waiting, nothing sent)" % (
+                mode, now - sent)
+        if since < self.AUTO_REC_WAIT_S:
+            return "wait", ("camera switched to %s mode on its own %.0f s ago; waiting for it "
+                            "to come back (nothing sent)" % (mode, since))
+        recent = [t for t in self._auto_recmodes if now - t < self.AUTO_REC_WINDOW_S]
+        if len(recent) >= self.AUTO_REC_MAX:
+            return "give_up", ("the camera keeps leaving rec mode on its own (%d recmodes in "
+                               "the last %.0f min did not hold); not sending more"
+                               % (len(recent), self.AUTO_REC_WINDOW_S / 60))
+        why = self.mid_operation()
+        if why:
+            return "wait", why
+        self._auto_recmodes.append(now)
+        self._auto_rec_sent_at = now
+        self.log_event("lv", "%s: camera in %s for %.0f s; sending one recmode (%d/%d in %.0f min)"
+                       % (who, mode, since, len(recent) + 1, self.AUTO_REC_MAX,
+                          self.AUTO_REC_WINDOW_S / 60))
+        r = await self.cmd("camcmd", value="recmode", tries=1)
+        await self._refresh_state()
+        return "wait", "sent one recmode (%s); waiting for rec to settle" % r.result
 
     async def start_liveview(self, reason: str) -> bool:
         """LUMIX Sync's live-view start, run once per lifecycle event:
@@ -984,10 +1111,30 @@ class Camera:
             self.log_event("warn", "live view start (%s): camera stays in %s"
                            % (reason, self.state.get("cammode")))
             return False
+        why = await self._wait_rec_settled()
+        if why:
+            self._lv_running = False
+            self.log_event("lv", "live view start (%s): no startstream, %s" % (reason, why))
+            return False
         r = await self.cmd("startstream", value=str(self.cfg.lv_port))
         self._lv_running = r.ok
         self.log_event("lv", "live view start (%s): startstream -> %s" % (reason, r.result))
         return r.ok
+
+    async def _wait_rec_settled(self) -> Optional[str]:
+        """Poll getstate (reads only, ~2 Hz) until the camera has been in rec with
+        no mode/lens event for STABLE_S; the reason when it does not (left rec,
+        busy, or still moving after STABLE_WAIT_S)."""
+        deadline = time.monotonic() + self.STABLE_WAIT_S
+        while True:
+            why = self.stream_blocked()
+            if why is None:
+                return None
+            if self.state.get("cammode") != "rec" or self.body_busy or time.monotonic() >= deadline:
+                return why
+            await asyncio.sleep(min(0.5, max(0.05, self.rec_settled_in() or 0.5)))
+            with contextlib.suppress(CamError, OSError, asyncio.TimeoutError):
+                await self._refresh_state()
 
     # ------------------------------------------------------ live view quality
     def lv_quality_wanted(self) -> str:
@@ -1080,8 +1227,10 @@ class Camera:
             if old and old.get("remaincapacity") != new.get("remaincapacity"):
                 self.log_event("state", "remaining shots %s -> %s" % (old.get("remaincapacity"),
                                                                        new.get("remaincapacity")))
-            if old and old.get("cammode") != new.get("cammode"):
-                self.log_event("state", "camera mode %s -> %s" % (old.get("cammode"), new.get("cammode")))
+            if old.get("cammode") != new.get("cammode"):
+                self._mode_changed_at = self._unsettled_at = time.monotonic()
+                if old:
+                    self.log_event("state", "camera mode %s -> %s" % (old.get("cammode"), new.get("cammode")))
             self.bus.publish("status", self.status_dict())
 
     async def refresh_exposure(self) -> None:
@@ -1189,8 +1338,18 @@ class Camera:
             if name in ("SourceProtocolInfo", "SinkProtocolInfo"):
                 continue
             self.log_event("notify", "%s=%s" % (name, value), name=name, value=value)
+            self._trace_note("NOTIFY %s=%s" % (name, value))
+            if name == "X_Panasonic_Cam_PRec" and value.startswith("err"):
+                # photo recording failed on the body. Real S5 2026-10-12 16:47:27,
+                # 16:48:32, 16:50:02: capture -> ok, err_rec ~3.7 s later, no photo
+                # written (remaincapacity unchanged), the body drops to playback
+                self.photo_error = (time.monotonic(), value)
+                self.log_event("warn", "camera reports a photo recording error (%s): no photo "
+                                       "was written" % value)
             if name != "X_Panasonic_Cam_Sync":
                 continue
+            if value in ("mod_Play", "mod_Rec", "lens_Atta", "lens_Deta", "busy", "busy_no_msg"):
+                self._unsettled_at = time.monotonic()
             self._menu_dirty.set()
             if value in ("busy", "busy_no_msg"):
                 if not self.body_busy:

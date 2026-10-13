@@ -25,7 +25,7 @@ import os
 import time
 import unittest
 
-from lumix.protocol import CamTransport
+from lumix.protocol import CamTransport, ModeSwitchLimiter
 from test_timelapse_emu import EmuTestCase, emu_cfg
 
 MODE_SWITCH = ("value=recmode", "value=playmode", "value=pictmode")
@@ -268,7 +268,9 @@ class GuardTest(EmuTestCase):
             st, d = await r.call("POST", "/api/timelapse/start",
                                  {"interval": 2, "count": 20, "native": True, "name": "inc"})
             await r.wait(lambda: r.emu.interval["state"] == "rec", 10, "camera run")
-            raw = CamTransport("127.0.0.1", port=r.node.ports["http"])
+            # no guard and no mode-switch rate limit, like the old connect
+            raw = CamTransport("127.0.0.1", port=r.node.ports["http"],
+                               limiter=ModeSwitchLimiter(min_gap_s=0, max_n=99, window_s=1))
             try:
                 self.assertTrue((await raw.cgi("camctrl", "interval", "pause")).ok)
                 await asyncio.sleep(1.0)                    # no shot in flight (body busy)

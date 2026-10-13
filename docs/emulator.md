@@ -67,6 +67,7 @@ Each camera gets a fake identity: MAC `02:4C:58:E0:00:0N` (locally administered)
 | any camcmd or `stopstream` during the post-SUBSCRIBE settle window | `err_critical` and the camera is **wedged**. For `recmode` the queued NOTIFYs `lens_Atta`, `mod_Play`, `mod_Rec` follow and it ends in rec (FINDINGS 21:24 A/B, 22:45). |
 | `recmode` churn: the 4th recmode within 20 s | `err_critical`, the camera switches itself to play (`mod_Play`), wedged (FINDINGS 22:01). |
 | `stopstream` with no stream started | `err_critical` (no wedge outside the settle window). |
+| Photo fault, off by default (`EmuConfig.photo_fault_*`; real S5 2026-10-12 16:46-16:52, `tests/fixtures/real-s5-photo-fault-wedge-2026-10-12.log`) | After N good captures the body drops to play on its own 13.2 s later (`mod_Play`, nothing sent). Every later capture: ok, `lens_Atta`, then `X_Panasonic_Cam_PRec=err_rec` + play + `mod_Play` 3.7 s later and no photo. `recmode` -> ok and rec; the 1st/4th/7th... bounce back to play 1.3 s later and return to rec 3 s after that. `startstream` within 2 s of a mode change -> `err_busy`. After 4 recmodes in the fault within 300 s the next capture hard-wedges it 6.6 s later: getstate/getsetting `err_busy`, camcmd/stopstream/`req_acc` `err_critical` (real: stopstream got no reply) until a power cycle. |
 | card write after `capture` (1.2 s) / `video_recstop` (2 s), body busy (`/emu/body/busy`) | camcmd -> `err_busy`; `sd_access on`. |
 | `poweroff` in play | `err_reject` (as logged); in rec -> ok, ports close 0.5 s later. |
 | session dropped | every command -> `err_reject`. |
@@ -85,7 +86,7 @@ While wedged: every valid camcmd -> `err_busy`, unknown camcmd -> `err_param`, `
 | `POST /emu/wedge?reason=...`, `/emu/unwedge` | Force / clear the wedge. |
 | `POST /emu/drop-session[?ip=...]` | Camera drops the session (`err_reject` until req_acc). |
 | `POST /emu/approve` | Approve a pending `--approval prompt` request. |
-| `POST /emu/body/{play,rec,busy,update,lens_detach,lens_attach}` | Someone uses the body: play -> `mod_Play`; busy -> `busy` (camcmd err_busy, live view stops); rec -> `update` (if busy), `lens_Atta`, `mod_Rec`. |
+| `POST /emu/body/{play,rec,busy,update,lens_detach,lens_attach,self_play}` | Someone uses the body: play -> `mod_Play`; busy -> `busy` (camcmd err_busy, live view stops); rec -> `update` (if busy), `lens_Atta`, `mod_Rec`; self_play -> play + `mod_Play`, back to rec + `mod_Rec` by itself `fault_bounce_back_s` (3 s) later (real 16:46:58-16:47:01). |
 | `POST /emu/config` (JSON body or query) | Change any `EmuConfig` field live, e.g. `{"settle_min": 1, "settle_max": 2, "session_timeout_s": 0}`. |
 
 ## Fidelity gaps (not observed on the real S5, so guessed or missing)
@@ -96,7 +97,7 @@ While wedged: every valid camcmd -> `err_busy`, unknown camcmd -> `err_param`, `
 - The real camera sometimes answered `err_reject` for a few seconds and then recovered without a new req_acc (server log 20:57:11, 21:09:15). Not modelled; use `/emu/drop-session` + reconnect.
 - `startstream` in play -> `err_reject`, `get_content_info` in rec -> `err_reject`, :50001 in rec -> 404: guesses.
 - poweroff in rec mode was never tried on the real body.
-- No `X_Panasonic_Cam_VRec` / `Cam_PictBrst` / `Cam_Transfer` events; no `busy`/`update` around captures (only via `/emu/body/*`).
+- No `X_Panasonic_Cam_VRec` / `Cam_PictBrst` / `Cam_Transfer` events (`Cam_PRec` only in the photo fault); no `busy`/`update` around captures (only via `/emu/body/*`).
 - getstate `interval_status` values (`rec`/`pause`/`off`/`enable`) and `interval set` -> `err_reject` once armed are from the real S5 (2026-10-12); `playmode`/`recmode` into a *running* (not paused) run is not verified.
 - The RAW `<res>` protocolInfo (`CAM_RAW_JPG`) is a guess; RW2/MP4/MOV bodies are a valid magic/box header plus filler, not playable media. JPEGs are real but blocky (8x8 flat blocks, no AC coefficients).
 - Live-view header bytes other than length/MAC are the recorded frame 1 for every frame (the real header carries changing exposure data).

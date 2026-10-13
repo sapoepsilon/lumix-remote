@@ -133,10 +133,25 @@ class Rig:
         return [e for e in self.emu.log if e["kind"] == "cgi" and "value=capture" in e["q"]]
 
 
+# Camera timing for emulator tests, scaled down like emu_cfg() scales the camera's
+# (real: mode switches 1 per 10 s / 3 per 60 s, startstream 2 s after a switch).
+# The limiter and the settle rule have their own tests (test_camera.py,
+# test_self_play_recovery.py) with real or explicitly scaled values.
+FAST_CAMERA = dict(MODE_SWITCH_MIN_GAP_S=0.5, MODE_SWITCH_WINDOW_S=3.0, MODE_SWITCH_MAX_WAIT_S=2.0,
+                   STABLE_S=0.3)
+
+
 class EmuTestCase(unittest.TestCase):
     cfg = None
+    camera_timing = FAST_CAMERA
 
     def setUp(self):
+        from unittest import mock
+        from lumix.camera import Camera
+        if self.camera_timing:
+            p = mock.patch.multiple(Camera, create=True, **self.camera_timing)
+            p.start()
+            self.addCleanup(p.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.dest = os.path.join(self.tmp.name, "Pictures")
         self.loop = asyncio.new_event_loop()

@@ -83,6 +83,7 @@ What the app does with Cam_Sync (LUMIX-class cameras only):
 - `mod_Rec` (202): on the home screen it auto-opens remote live view; on the live-view screen it only closes menus.
 - `lens_Update` (207): firmware-update prompt for the lens. `fan_alert_on/off`: overheat fan dialog.
 - `transfer_Start`/`transfer_Stop`: camera-initiated image transfer (app shows receive UI, answers `notify&type=transfer&value=ok|ng|cancel`).
+- Real DC-S5, 2026-10-12 16:46-16:52 (probe-results/FINDINGS.md): `X_Panasonic_Cam_PRec=err_rec` came 2.4-3.7 s after a `capture` that answered ok but wrote no photo, followed by `mod_Play`; the body had dropped to playback on its own before that. No `Cam_Transfer` event, with `raw_img_send=enable` sent at connect: that setting is not what pushes the camera into playback. Lumix Remote waits for such a camera (reads only), sends at most one recmode per drop and two per 5 min, then pauses its time-lapse.
 
 ## 7. Live view
 
