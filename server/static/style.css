@@ -83,6 +83,9 @@ input[type="search"], input:not([type]), .ipform input, #importdest {
   -webkit-user-drag: none; pointer-events: none;
   transition: filter .35s, transform .35s var(--spring);
 }
+/* live view stopped: no frozen last frame behind the message (QA F20) */
+.lv img { transition: filter .35s, opacity .35s, transform .35s var(--spring); }
+.lv.stale img { opacity: .2; filter: blur(10px) grayscale(.7); }
 .lv-empty {
   position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 12px;
   color: var(--text2); font-size: 14px; pointer-events: none; text-align: center; padding: 24px;
@@ -155,7 +158,7 @@ input[type="search"], input:not([type]), .ipform input, #importdest {
 .tl-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-variant-numeric: tabular-nums; }
 .tl-info b { font-size: 15px; }
 .tl-info span { font-size: 13px; }
-.tl-info small { font-size: 12px; color: var(--text2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tl-info small { font-size: 12px; color: var(--text2); overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .tl-frame { width: 76px; height: 76px; border-radius: 12px; object-fit: cover; flex: none; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .25); background: rgba(255, 255, 255, .08); }
 .tl-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
 .tl-btn { height: 36px; border-radius: 12px; background: rgba(118, 118, 128, .3); font-weight: 600; transition: transform .25s var(--bounce); }
@@ -184,7 +187,11 @@ input[type="search"], input:not([type]), .ipform input, #importdest {
   font-size: 13px; width: max-content; max-width: calc(100% - 32px); z-index: 4; animation: drop .4s var(--spring);
 }
 .banner .link { flex: none; white-space: nowrap; }
-.banner span:nth-child(2) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* wraps instead of "In-camera timelapse running: 1…" (QA F12) */
+.banner span:nth-child(2) { min-width: 0; overflow-wrap: anywhere; line-height: 1.3; }
+.importpill { top: calc(var(--safe-t) + 64px + var(--banner-h, 0px)); z-index: 4; }
+.importpill .ipx { color: var(--text2); display: grid; place-items: center; }
+.importpill .ipx svg { width: 16px; height: 16px; }
 @keyframes drop { from { transform: translate(-50%, -20px); opacity: 0; } }
 
 /* ------------------------------------------------------------ top bar */
@@ -240,6 +247,12 @@ input[type="search"], input:not([type]), .ipform input, #importdest {
   transition: color .25s, background .25s;
 }
 .modes-track button.on { color: var(--yellow); background: rgba(255, 255, 255, .1); }
+/* every mode label visible on a phone (QA F19): the track is centred as a whole when it fits */
+.modes.fits { -webkit-mask-image: none; mask-image: none; }
+@media (max-width: 420px) {
+  .modes-track { gap: 2px; }
+  .modes-track button { padding: 7px 9px; font-size: 12.5px; letter-spacing: .05em; }
+}
 .shutter-row {
   width: 100%; max-width: 420px; display: grid; grid-template-columns: 1fr auto 1fr;
   align-items: center; justify-items: center; padding: 4px 0;
@@ -326,13 +339,15 @@ input[type="search"], input:not([type]), .ipform input, #importdest {
 }
 .sheet-head {
   position: sticky; top: 0; z-index: 2; margin: 0 -16px 6px; padding: 12px 16px 10px;
-  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 8px;
+  /* the title shrinks (ellipsis), never runs over the back link (QA F14) */
+  display: grid; grid-template-columns: minmax(max-content, 1fr) minmax(0, max-content) minmax(max-content, 1fr); align-items: center; gap: 8px;
   background: linear-gradient(rgba(28, 28, 30, .95) 70%, rgba(28, 28, 30, 0));
 }
-.sheet-head h2 { margin: 0; font-size: 17px; font-weight: 600; text-align: center; grid-column: 2; }
+.sheet-head h2 { margin: 0; font-size: 17px; font-weight: 600; text-align: center; grid-column: 2; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sheet-head > :first-child:not(h2) { justify-self: start; }
 .sheet-head > :last-child { justify-self: end; }
 .page[data-page="root"] .sheet-head { grid-template-columns: 1fr auto; }
+.page[data-page="root"] .sheet-head h2 { white-space: normal; }
 .page[data-page="root"] .sheet-head h2 { grid-column: 1; text-align: left; font-size: 22px; font-weight: 700; }
 .back { display: inline-flex; align-items: center; gap: 2px; color: var(--yellow); font-size: 16px; margin-left: -6px; max-width: 120px; white-space: nowrap; overflow: hidden; }
 .back svg { width: 20px; height: 20px; }
@@ -380,9 +395,9 @@ button.cell:active, .nav-cell:active { background: var(--cell-hi); }
 .seg button.on { background: rgba(99, 99, 102, .9); box-shadow: 0 3px 8px rgba(0, 0, 0, .2); }
 
 /* quick controls */
-.qc { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.qc { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .tile {
-  min-height: 62px; padding: 9px 10px; border-radius: 14px; background: var(--cell);
+  min-height: 62px; min-width: 0; padding: 9px 10px; border-radius: 14px; background: var(--cell);
   display: flex; flex-direction: column; justify-content: space-between; text-align: left;
   transition: transform .2s var(--bounce), background .2s, box-shadow .2s;
 }
@@ -664,13 +679,19 @@ button.cell:disabled { opacity: .5; }
 .viewer-note { position: absolute; bottom: calc(var(--safe-b) + 24px); left: 50%; transform: translateX(-50%); padding: 8px 14px; border-radius: 16px; font-size: 13px; color: var(--text2); }
 
 /* ------------------------------------------------------------ toast & alerts */
+/* under the top bar (pill, AUTO, rec timer stay visible) and any banner (QA F11) */
 .toast {
-  position: fixed; left: 50%; top: calc(var(--safe-t) + 12px); z-index: 30; transform: translateX(-50%);
+  position: fixed; left: 50%; top: calc(var(--safe-t) + 64px + var(--notices-h, 0px)); z-index: 30; transform: translateX(-50%);
   max-width: min(92vw, 460px); padding: 11px 16px; border-radius: 20px; font-size: 14px; font-weight: 500;
   animation: toastin .5s var(--bounce); display: flex; gap: 10px; align-items: flex-start;
 }
 .toast::before { content: ""; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%; background: var(--green); flex: none; }
 .toast.err::before { background: var(--orange); }
+.toast { flex-wrap: wrap; }
+.toast-msg { flex: 1 1 0; min-width: 0; }
+/* one-tap fix under the message, right-aligned */
+.toast-act { flex: none; margin-left: auto; padding: 6px 12px; border-radius: 14px; background: var(--yellow); color: #000; font-weight: 600; font-size: 13px; white-space: nowrap; }
+.toast:has(.toast-act) .toast-msg { flex-basis: calc(100% - 18px); }
 .toast.leaving { animation: toastout .3s forwards; }
 @keyframes toastin { from { transform: translate(-50%, -40px) scale(.9); opacity: 0; } }
 @keyframes toastout { to { transform: translate(-50%, -30px) scale(.95); opacity: 0; } }

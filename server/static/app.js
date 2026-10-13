@@ -15,7 +15,7 @@ const state = {
 const MODES = ["photo", "video", "timelapse"];
 
 // ---------------------------------------------------------------- helpers
-class HttpError extends Error { constructor(msg, status) { super(msg); this.status = status; } }
+class HttpError extends Error { constructor(msg, status, code) { super(msg); this.status = status; this.code = code || null; } }
 
 // Camera routes go to /api/cameras/<id>/... for the camera this tab shows;
 // /api/cameras and /api/models are global.
@@ -33,7 +33,7 @@ async function api(path, body, method) {
   const r = await fetch(cp(path), opt);
   let data = null;
   try { data = await r.json(); } catch (_) { /* non-JSON */ }
-  if (!r.ok) throw new HttpError(friendlyHttp(r.status, data && data.error), r.status);
+  if (!r.ok) throw new HttpError(friendlyHttp(r.status, data && data.error), r.status, data && data.code);
   return data;
 }
 
@@ -66,17 +66,24 @@ function explain(result) {
 }
 
 let toastTimer = null;
-function toast(msg, err) {
+// action: { label, run } adds a button (one-tap fix); such toasts stay up longer
+function toast(msg, err, action) {
   const t = $("toast");
-  t.textContent = msg;
+  t.replaceChildren(el("span", { class: "toast-msg" }, msg));
+  if (action) {
+    t.append(el("button", { class: "toast-act", onclick: () => { hideToast(); action.run(); } }, action.label));
+  }
   t.className = "toast glass-strong" + (err ? " err" : "");
   t.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    t.classList.add("leaving");
-    setTimeout(() => { t.hidden = true; }, 300);
-  }, err ? 4500 : 2200);
+  toastTimer = setTimeout(hideToast, action ? 9000 : err ? 4500 : 2200);
   if (err) haptic([10, 40, 10]);
+}
+function hideToast() {
+  const t = $("toast");
+  clearTimeout(toastTimer);
+  t.classList.add("leaving");
+  setTimeout(() => { if (t.classList.contains("leaving")) t.hidden = true; }, 300);
 }
 
 function haptic(p) { try { if (navigator.vibrate) navigator.vibrate(p || 8); } catch (_) { /* unsupported */ } }
@@ -113,13 +120,27 @@ function fmtSize(b) {
   return (i ? b.toFixed(1) : b) + " " + u[i];
 }
 
-async function cameraCall(path, body, okMsg) {
+async function cameraCall(path, body, okMsg, onError) {
   try {
     const r = await api(path, body);
     const hint = explain(r && r.result);
     if (hint) toast(hint, true); else if (okMsg) toast(typeof okMsg === "function" ? okMsg(r) : okMsg);
     return r;
-  } catch (e) { toast(e.message, true); return null; }
+  } catch (e) {
+    if (!(onError && onError(e))) toast(e.message, true);
+    return null;
+  }
+}
+
+// Shooting commands answer at once from known state instead of waiting on the
+// server (QA F5: 8 s of silence wedged, 20 s in playback). Returns false = don't send.
+function shootPreflight() {
+  const s = state.status;
+  if (!s || s.status !== "ready") { toast(s ? statusInfo(s).title.replace("…", "") + ": the camera isn't connected." : "Camera isn't connected yet.", true); return false; }
+  if (s.wedged) { toast(WEDGED_TEXT, true); return false; }
+  if (s.body_busy) { toast("Someone is using the camera (menu or playback on the body). Try again when it's done.", true); return false; }
+  if (s.cammode === "play" && $("files").hidden) toast("Camera is in playback: switching back to shooting…");
+  return true;
 }
 
 // ---------------------------------------------------------------- settings model
@@ -303,7 +324,8 @@ function renderOptions() {
       class: "cell nav-cell" + (o.enabled && !param ? "" : " disabled"), disabled: (!o.enabled && !cur) || param || !s.enabled,
       onclick: async () => {
         haptic();
-        await cameraCall(`/api/settings/${encodeURIComponent(s.id)}`, { option: o.id }, (r) => `${r.setting.title}: ${r.setting.current_title}`);
+        await cameraCall(`/api/settings/${encodeURIComponent(s.id)}`, { option: o.id },
+          (r) => `${(r.setting && r.setting.title) || s.title}: ${(r.setting && r.setting.current_title) || o.title || o.value}`);
         loadSettings();
       },
     }, el("div", { class: "cell-text" }, el("b", {}, o.title || o.value), param ? el("small", {}, "Needs a value; set it on the camera") : null),
@@ -390,22 +412,23 @@ function statusInfo(s) {
   const st = s ? s.status : "offline";
   const msg = (s && s.message) || "";
   switch (st) {
-    case "ready": return { title: "Connected", msg, cls: "ok", dot: "ready" };
-    case "discovering": return { title: "Looking for your camera", msg: msg || "Scanning the network…", cls: "", dot: "wait" };
-    case "connecting": return { title: "Connecting…", msg, cls: "", dot: "wait" };
-    case "waiting_approval": return { title: "Approve on the camera", msg: "Your camera is registering this device. If it shows a prompt, press OK on the camera.", cls: "warn", dot: "wait" };
+    // short: the top-left pill (narrow); hint: the banner under it (never the same words)
+    case "ready": return { title: "Connected", short: "Connected", msg, cls: "ok", dot: "ready" };
+    case "discovering": return { title: "Looking for your camera", short: "Searching", hint: "Looking for the camera on your Wi-Fi", msg: msg || "Scanning the network…", cls: "", dot: "wait" };
+    case "connecting": return { title: "Connecting…", short: "Connecting", hint: "Connecting to the camera", msg, cls: "", dot: "wait" };
+    case "waiting_approval": return { title: "Approve on the camera", short: "Approve", hint: "Press OK on the camera if it asks", msg: "Your camera is registering this device. If it shows a prompt, press OK on the camera.", cls: "warn", dot: "wait" };
     case "reconnecting":
       if ((s && s.powered_off) || msg.includes("powered off")) {
-        return { title: "Camera is off", cls: "warn", dot: "bad", msg: blePaired()
+        return { title: "Camera is off", short: "Camera off", hint: "Reconnects when it's switched on", cls: "warn", dot: "bad", off: true, msg: blePaired()
           ? "Tap Turn on over Bluetooth, or switch it on by hand. It reconnects by itself."
           : "Switch it on and it reconnects by itself (Wi-Fi can't wake it; pair Bluetooth in Cameras › Run setup again… to turn it on from here)." };
       }
-      return { title: "Reconnecting…", msg: "The camera dropped off (asleep, off or out of range). Retrying automatically." + (msg ? ` (${msg})` : ""), cls: "warn", dot: "wait" };
-    case "error": return { title: "Something's wrong", msg, cls: "warn", dot: "bad" };
-    case "offline": return { title: "Server not reachable", msg: "Start it with ./run.sh on your Mac.", cls: "warn", dot: "bad" };
-    case "no_camera": return { title: "No camera yet", msg: "Add a camera to get started.", cls: "", dot: "" };
-    case "paused": return { title: "Not connecting", msg: "This camera is switched off in Cameras (Connect automatically).", cls: "", dot: "" };
-    default: return { title: "Starting…", msg, cls: "", dot: "wait" };
+      return { title: "Reconnecting…", short: "Reconnecting", hint: "Camera dropped off; retrying", msg: "The camera dropped off (asleep, off or out of range). Retrying automatically." + (msg ? ` (${msg})` : ""), cls: "warn", dot: "wait" };
+    case "error": return { title: "Something's wrong", short: "Error", hint: msg || "Connection error", msg, cls: "warn", dot: "bad" };
+    case "offline": return { title: "Server not reachable", short: "No server", hint: "Start it with ./run.sh on your Mac", msg: "Start it with ./run.sh on your Mac.", cls: "warn", dot: "bad" };
+    case "no_camera": return { title: "No camera yet", short: "No camera", hint: "Add a camera to get started", msg: "Add a camera to get started.", cls: "", dot: "" };
+    case "paused": return { title: "Not connecting", short: "Paused", hint: "Connect automatically is off", msg: "This camera is switched off in Cameras (Connect automatically).", cls: "", dot: "" };
+    default: return { title: "Starting…", short: "Starting", hint: "Starting…", msg, cls: "", dot: "wait" };
   }
 }
 
@@ -419,12 +442,14 @@ function renderStatus(s) {
   const me = currentCamera();
   const nick = me && me.nickname && !me.provisional ? me.nickname : null;
   $("camname").textContent = ready ? (nick || cam.modelNumber || cam.friendlyName || "Camera")
-    : (state.cameras.length > 1 && nick ? `${nick} · ${info.title.replace("…", "")}` : info.title.replace("…", ""));
+    : (state.cameras.length > 1 && nick ? `${nick} · ${info.short}` : info.short);
   if (s.status === "no_camera" && !wz.open && !state.skipConnect) openWizard({});
   if (ready && cam.friendlyName) {
     LS.set("camera", { name: cam.friendlyName, model: cam.modelNumber, ip: s.ip, ts: Date.now() });
     state.everReady = true;
   }
+  // QA F15: a finished Bluetooth wake's card goes once the camera is back
+  if (ready && !wake.running && (wake.ok !== null || wake.needPair)) { wake.ok = null; wake.needPair = false; wake.data = null; }
   // stats
   const stats = $("stats");
   stats.replaceChildren();
@@ -446,6 +471,7 @@ function renderStatus(s) {
   const live = lv.age !== null && lv.age !== undefined && lv.age < 3;
   paintLvQuality(s);
   $("lvempty").hidden = live;
+  $("lv").classList.toggle("stale", !live);   // no frozen last frame behind "Live view stopped"
   // in-camera interval run (from getstate, so it shows after a server restart too)
   const iv = ready && s.interval && s.interval.running ? s.interval : null;
   const ivText = iv ? `In-camera timelapse ${iv.status === "pause" ? "paused" : "running"}`
@@ -471,7 +497,8 @@ function renderStatus(s) {
   const handshaking = HANDSHAKING.includes(s.status);
   $("bannerbtn").hidden = handshaking;
   if (!ready && (state.everReady || state.skipConnect)) {
-    banner.hidden = false; $("bannerdot").className = "dot " + info.dot; $("bannertext").textContent = info.title;
+    // the pill already says what (Camera off, Reconnecting); the banner says what happens next
+    banner.hidden = false; $("bannerdot").className = "dot " + info.dot; $("bannertext").textContent = info.hint || info.title;
   } else if (ready && s.wedged) {
     // only a power cycle clears it; reconnecting would not help
     banner.hidden = false; $("bannerdot").className = "dot bad"; $("bannerbtn").hidden = true;
@@ -486,6 +513,7 @@ function renderStatus(s) {
   } else if (busy) {
     banner.hidden = false; $("bannerdot").className = "dot wait"; $("bannertext").textContent = "Camera busy: check its screen";
   } else banner.hidden = true;
+  layoutNotices();
   $("bannerwake").hidden = banner.hidden || !canWake(s) || !(blePaired() || wake.running);
   $("connsub").textContent = ready ? `${cam.friendlyName || ""} · ${s.ip || ""}` : info.title;
   renderConnect(s);
@@ -500,6 +528,12 @@ function batteryPct(b) {
 }
 
 // ---------------------------------------------------------------- connect screen
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+function badIp(ip) {
+  if (IPV4.test(ip)) return false;
+  toast(`"${ip}" isn't an IP address. Use four numbers 0-255, like 192.168.1.20 (shown on the camera's Wi-Fi screen).`, true);
+  return true;
+}
 const DEFAULT_STEPS = [
   "Menu → Setup (wrench) → Wi-Fi", "Wi-Fi Function → New Connection", "Remote Shooting & View",
   "Press DISP to switch to \"Via Network\"", "Pick your home Wi-Fi (same network as this computer)",
@@ -540,13 +574,20 @@ function renderConnect(s) {
     remBox.textContent = `Last camera: ${rem.model || ""} ${rem.name}${rem.ip ? " · " + rem.ip : ""}`;
   } else remBox.hidden = true;
   const none = s.status === "no_camera";
-  $("btnreconnect").hidden = none || HANDSHAKING.includes(s.status);
+  // camera off and paired: turning it on is the one thing that helps (QA F15)
+  const wakeFirst = !ready && !!info.off && blePaired();
+  $("btnreconnect").classList.toggle("primary", !wakeFirst);
+  $("cswake").classList.toggle("primary", wakeFirst);
+  $("btnreconnect").hidden = none || HANDSHAKING.includes(s.status) || ready;
+  $("btnskip").textContent = ready ? "Done" : "Continue without camera";
   $("btnwizard").textContent = none ? "Add a camera" : "Set up step by step";
   $("btnwizard").classList.toggle("primary", none);
   for (const d of c.querySelectorAll(".cs-more")) d.hidden = none;
   $("cswake").hidden = !canWake(s) && !wake.running;
   if (ready) {
-    if (!c.hidden && !connectHideTimer) {
+    if (state.connectPinned) {
+      // opened on purpose (Connection › Show camera setup steps): stays until closed
+    } else if (!c.hidden && !connectHideTimer) {
       connectHideTimer = setTimeout(() => {
         c.classList.add("leaving");
         setTimeout(() => { c.hidden = true; c.classList.remove("leaving"); connectHideTimer = null; }, 450);
@@ -596,18 +637,35 @@ function renderConnInfo() {
 async function shoot() {
   const b = $("btnshutter");
   if (b.classList.contains("busy")) return;
+  if (!shootPreflight()) return;
   b.classList.add("busy");
   haptic(12);
   $("stage").classList.remove("flash"); void $("stage").offsetWidth; $("stage").classList.add("flash");
-  const r = await cameraCall("/api/capture", {}, (x) => x.count_changed ? `Photo saved · ${x.remain_after} left` : "Shutter released");
+  const r = await cameraCall("/api/capture", {}, (x) => x.count_changed ? `Photo saved · ${x.remain_after} left` : "Shutter released", (e) => {
+    if (e.code !== "drive_timelapse") return false;
+    // QA F4: the photo shutter would have started the camera's own interval run
+    toast("Drive is Time Lapse — use the Timelapse tab or switch drive to Single.", true, { label: "Switch to Single", run: driveToSingle });
+    return true;
+  });
   b.classList.remove("busy");
   return r;
+}
+async function driveToSingle() {
+  haptic();
+  const r = await cameraCall("/api/setting", { type: "drivemode", value: "normal" });
+  loadSettings();
+  if (r && r.result === "ok") toast("Drive: Single. Press the shutter again to take a photo.");
 }
 
 async function toggleRec() {
   const rec = state.status && state.status.recording;
+  if (!rec && !shootPreflight()) return;
   haptic(rec ? 8 : [8, 30, 8]);
   await cameraCall(rec ? "/api/video/stop" : "/api/video/start", {}, rec ? "Recording stopped" : "Recording");
+}
+function oneshotAf() {
+  if (!shootPreflight()) return;
+  haptic(); cameraCall("/api/af", {});
 }
 
 function shutterPressed() {
@@ -646,6 +704,10 @@ function positionModes() {
   const on = track.querySelector(".on");
   if (!on) return;
   const vertical = matchMedia("(min-width: 760px) and (min-aspect-ratio: 5/4)").matches;
+  // phone: all labels fit -> centre the whole strip, nothing clipped at the edges
+  const fits = !vertical && track.scrollWidth + 8 <= $("modes").clientWidth;
+  $("modes").classList.toggle("fits", fits);
+  if (fits) { track.style.transform = "translateX(-50%)"; return; }
   track.style.transform = vertical
     ? `translateY(${-(on.offsetTop + on.offsetHeight / 2)}px)`
     : `translateX(${-(on.offsetLeft + on.offsetWidth / 2)}px)`;
@@ -703,6 +765,7 @@ function lvPoint(ev) {
 async function touchFocus(ev) {
   const p = lvPoint(ev);
   if (!p) return;
+  if (state.status && (state.status.wedged || state.status.body_busy)) { shootPreflight(); return; }
   const fm = byType("focusmode");
   if (fm && fm.current === "mf" && state.mftap === "off") {
     toast("Manual focus: tap does nothing. Turn on Auto or pick AF-S in Controls.");
@@ -823,7 +886,12 @@ function wireSheet() {
     haptic(); setLvQuality(b.dataset.v);
   });
   $("btnreconnect2").addEventListener("click", () => reconnect());
-  $("btnsetup").addEventListener("click", () => { closeSheet(); state.skipConnect = false; $("connect").hidden = false; });
+  $("btnsetup").addEventListener("click", () => {
+    closeSheet(); state.skipConnect = false; state.connectPinned = true;
+    clearTimeout(connectHideTimer); connectHideTimer = null;
+    $("connect").hidden = false; $("connect").classList.remove("leaving");
+    if (state.status) renderConnect(state.status);
+  });
   $("btnpower").addEventListener("click", openPowerSheet);
   $("btnwake").addEventListener("click", bleWake);
   $("powerdlg").addEventListener("close", async () => {
@@ -856,6 +924,14 @@ function openFiles() {
   haptic();
   files.items = []; files.total = 0; files.sel.clear();
   renderFiles();
+  importPill.hide();          // its progress shows in Files again
+  const s = state.status;
+  if (s && s.status !== "ready") {
+    // QA F7: no camera -> say so now instead of 20 s of placeholder tiles
+    $("grid").replaceChildren();
+    showFilesEmpty("Camera not connected", statusInfo(s).title.replace("…", "") + ". Files appear once the camera is connected.");
+    return;
+  }
   loadFiles(0).then(watchRunningImport);
 }
 // An import paused when you left Files continues on the next visit: show its progress.
@@ -873,7 +949,19 @@ async function closeFiles() {
   f.classList.add("leaving");
   setTimeout(() => { f.hidden = true; f.classList.remove("leaving"); }, 340);
   setSelecting(false);
-  if (files.available) { try { await api("/api/files/done", {}); } catch (_) { /* not there yet */ } }
+  if (!files.available) return;
+  // keep_imports: running imports go on (camera stays in playback until they end,
+  // QA F6). A close during the switch to playback is queued by the server (F1).
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await api("/api/files/done", { keep_imports: true });
+      if (r && r.importing && r.importing.length) importPill.watch(r.importing[0]);
+      return;
+    } catch (e) {
+      if (e.status && e.status !== 502) return;   // server answered: nothing to retry
+      await sleep(1500);                          // network blip: once more
+    }
+  }
 }
 
 async function loadFiles(offset) {
@@ -890,7 +978,9 @@ async function loadFiles(offset) {
     files.items = offset ? files.items.concat(r.items || []) : (r.items || []);
   } catch (e) {
     files.items = [];
-    if (e.status === 404 && /^No camera|isn't registered/.test(e.message)) {
+    if (e.status === 409 && /isn't connected|not connected/i.test(e.message)) {
+      showFilesEmpty("Camera not connected", "Files appear once the camera is connected.");
+    } else if (e.status === 404 && /^No camera|isn't registered/.test(e.message)) {
       showFilesEmpty("No camera yet", "Add a camera to browse its card.");
     } else if (e.status === 404 || e.status === 405) {
       files.available = false;
@@ -970,13 +1060,25 @@ function openViewer(it) {
 }
 function closeViewer() { $("viewer").hidden = true; $("vbody").replaceChildren(); }
 
-function downloadSelected() {
+async function downloadSelected() {
   const items = files.items.filter((x) => files.sel.has(x.id) && x.download_url);
+  if (!items.length) { toast("Nothing to download in this selection.", true); return; }
+  // check the camera serves the first one before claiming anything (QA F20)
+  try {
+    const ctl = new AbortController();
+    const r = await fetch(cp(items[0].download_url), { headers: { Range: "bytes=0-0" }, signal: ctl.signal });
+    if (!r.ok) {
+      let msg = ""; try { msg = (await r.json()).error || ""; } catch (_) { /* not JSON */ }
+      toast("Couldn't download: " + friendlyHttp(r.status, msg || null), true);
+      return;
+    }
+    ctl.abort();   // headers are enough
+  } catch (e) { toast("Lost the server: " + e.message, true); return; }
   items.forEach((it, i) => setTimeout(() => {
     const a = el("a", { href: cp(it.download_url), download: it.name || "" });
     document.body.append(a); a.click(); a.remove();
   }, i * 400));
-  toast(`Downloading ${items.length} file${items.length === 1 ? "" : "s"}`);
+  toast(items.length === 1 ? `Downloading ${items[0].name}` : `Downloading ${items.length} files (allow multiple downloads if the browser asks)`);
 }
 
 function askImport() {
@@ -1063,8 +1165,63 @@ async function pollJobLoop(id, n) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Files closed while an import runs (QA F6): the import goes on in playback and
+// this pill shows it on the camera screen, with Stop (pause, resumable); a paused
+// import shows Resume. The camera goes back to shooting when the import ends.
+const PILL_PAUSED_BY = ["shooting", "server-stop", "poweroff", "user"];
+const importPill = {
+  id: null, timer: null, last: null,
+  watch(id) { if (this.id === id) return; this.id = id; this.last = null; this.tick(); },
+  hide() { this.id = null; clearTimeout(this.timer); $("importpill").hidden = true; layoutNotices(); },
+  paint(dot, text, act) {
+    $("ipdot").className = "dot " + dot;
+    $("iptext").textContent = text;
+    const b = $("ipact");
+    b.hidden = !act; b.disabled = false;
+    if (act) { b.textContent = act.label; b.onclick = async () => { b.disabled = true; haptic(); await act.run(); this.tick(); }; }
+    $("importpill").hidden = false;
+    layoutNotices();
+  },
+  async tick() {
+    clearTimeout(this.timer);
+    const id = this.id;
+    if (!id) return;
+    let j;
+    try { j = await api(`/api/jobs/${enc(id)}`); } catch (e) {
+      if (e.status === 404) { this.hide(); return; }
+      this.timer = setTimeout(() => this.tick(), 3000); return;
+    }
+    if (this.id !== id) return;
+    const total = j.files_total || j.items || 0, done = (j.files_done || 0) + (j.files_skipped || 0);
+    const count = total ? ` ${Math.min(done, total)}/${total}` : "";
+    if (["queued", "running"].includes(j.state)) {
+      this.paint("wait", `Importing${count}… (camera in playback)`, { label: "Stop", run: () => api(`/api/jobs/${enc(id)}/pause`, {}).catch((e) => toast(e.message, true)) });
+      this.timer = setTimeout(() => this.tick(), 1500);
+    } else if (j.state === "paused") {
+      this.paint("", `Import paused${count ? " ·" + count + " saved" : ""}`, { label: "Resume", run: async () => {
+        try { await api(`/api/jobs/${enc(id)}/resume`, {}); await api("/api/files/done", { keep_imports: true }); }
+        catch (e) { toast(e.message, true); }
+      } });
+      this.timer = setTimeout(() => this.tick(), 5000);
+    } else {
+      this.hide();
+      const got = j.files_done || 0, failed = j.files_failed || 0;
+      if (j.state.startsWith("done")) toast(`Imported ${got} file${got === 1 ? "" : "s"}${failed ? `, ${failed} failed` : ""}`, failed > 0);
+      else if (j.state !== "cancelled") toast("Import " + j.state, true);
+    }
+  },
+};
+// Stack the notices under the top bar: banner, import pill, then the toast (QA F11).
+function layoutNotices() {
+  const b = $("banner"), p = $("importpill");
+  const bh = b.hidden ? 0 : b.offsetHeight + 8, ph = p.hidden ? 0 : p.offsetHeight + 8;
+  document.body.style.setProperty("--banner-h", bh + "px");
+  document.body.style.setProperty("--notices-h", bh + ph + "px");
+}
+
 function wireFiles() {
   $("btnfiles").addEventListener("click", openFiles);
+  $("ipclose").addEventListener("click", () => importPill.hide());
   $("filesclose").addEventListener("click", closeFiles);
   $("filesselect").addEventListener("click", () => { haptic(); setSelecting(!files.selecting); });
   $("filesmore").addEventListener("click", () => loadFiles(files.items.length));
@@ -1167,9 +1324,16 @@ function resetForCamera() {
 // the card (shown in Files, where its progress lives) and a Bluetooth wake. The
 // timelapse re-attaches in renderTimelapse, the recording timer comes with status.
 async function reattachJobs() {
+  importPill.hide();
   try {
     const jobs = await api("/api/jobs");
-    if ((jobs || []).some((x) => ["queued", "running"].includes(x.state)) && $("files").hidden) openFiles();
+    const run = (jobs || []).find((x) => ["queued", "running"].includes(x.state));
+    const paused = (jobs || []).find((x) => x.state === "paused" && PILL_PAUSED_BY.includes(x.paused_by));
+    if (run && $("files").hidden) {
+      // Files was closed on purpose while it ran: the pill, not the Files screen
+      const st = await api("/api/files/status").catch(() => ({}));
+      if (st.leave_after_jobs) importPill.watch(run.id); else openFiles();
+    } else if (paused && $("files").hidden) importPill.watch(paused.id);
   } catch (_) { /* older server / no camera */ }
   try {
     const r = await fetch(cp("/api/ble/status"));
@@ -1216,7 +1380,7 @@ function renderCamDetail() {
     ...state.models.map((m) => el("option", { value: m.id }, m.name + (m.verified ? "" : " (untested)"))));
   sel.value = c.model || "auto";
   const cam = c.camera || {};
-  const ports = c.ports || {};
+  const ports = c.effective_ports || c.ports || {};   // what the server really uses (--lv-port)
   const rows = [
     ["Status", statusInfo({ status: c.status }).title], ["Detected", [cam.modelNumber, cam.X_FirmVersion ? "fw " + cam.X_FirmVersion : null].filter(Boolean).join(" · ") || "not yet"],
     ["Profile", c.profile ? c.profile.name + (c.profile.verified ? "" : " (untested)") : "–"],
@@ -1272,7 +1436,7 @@ async function patchCamera(id, body, okMsg) {
 }
 
 function wireCameras() {
-  const add = () => { closeSheet(); openWizard({}); };
+  const add = () => { closeSheet(); openWizard({ add: true }); };   // always a new camera (QA F8)
   $("btnaddcam").addEventListener("click", add);
   $("btnaddcam2").addEventListener("click", add);
   const saveNick = () => {
@@ -1309,7 +1473,7 @@ function wireCameras() {
 
 // ---------------------------------------------------------------- add-camera wizard
 const WZ = ["model", "wifi", "ble", "name", "done"];
-const wz = { open: false, step: "model", camId: null, model: "auto", created: false, poll: null, profiles: {}, ble: "idle", bleMsg: "", status: null, reuse: false };
+const wz = { open: false, step: "model", camId: null, model: "auto", created: false, poll: null, profiles: {}, ble: "idle", bleMsg: "", status: null, reuse: false, add: false };
 
 async function profileFor(id) {
   if (!wz.profiles[id]) {
@@ -1327,7 +1491,7 @@ async function wzProfile() {
 
 async function openWizard(opts) {
   if (wz.open && !opts.step) return;
-  Object.assign(wz, { open: true, camId: opts.camId || null, model: "auto", created: false, ble: "idle", bleMsg: "", status: null, reuse: !!opts.reuse });
+  Object.assign(wz, { open: true, camId: opts.camId || null, model: "auto", created: false, ble: "idle", bleMsg: "", status: null, reuse: !!opts.reuse, add: !!opts.add });
   if (!state.models.length) await loadCameras();
   const c = state.cameras.find((x) => x.id === wz.camId);
   if (c) wz.model = c.model || "auto";
@@ -1364,6 +1528,9 @@ async function wzGo(step, back) {
     sec.classList.toggle("back", !!back);
     if (on) { sec.style.animation = "none"; void sec.offsetWidth; sec.style.animation = ""; }
   }
+  // a reload comes back to this step (QA F17)
+  const h = "#wizard=" + step + (wz.camId ? "&cam=" + enc(wz.camId) : "") + (wz.add ? "&add=1" : "");
+  if (location.hash !== h) history.replaceState(null, "", location.pathname + location.search + h);
   const i = WZ.indexOf(step);
   [...$("wzdots").children].forEach((d, k) => { d.className = k === i ? "on" : k < i ? "done" : ""; });
   $("wzback").hidden = i === 0 || step === "done";
@@ -1388,8 +1555,9 @@ function renderWzModels() {
 
 async function wzEnsureCamera() {
   // Zero-friction path: the camera the server made on first run (provisional, never
-  // connected) is the one we set up, instead of adding a second entry.
-  if (!wz.camId && !wz.reuse) {
+  // connected) is the one we set up, instead of adding a second entry. "Add camera…"
+  // (wz.add) always adds one.
+  if (!wz.camId && !wz.reuse && !wz.add) {
     const prov = state.cameras.find((c) => c.provisional && !c.udn_bound && c.status !== "ready");
     if (prov) wz.camId = prov.id;
   }
@@ -1553,7 +1721,7 @@ function wireWizard() {
   $("wzipform").addEventListener("submit", async (e) => {
     e.preventDefault();
     const ip = $("wzip").value.trim();
-    if (!ip || !wz.camId) return;
+    if (!ip || !wz.camId || badIp(ip)) return;
     try { await api(`/api/cameras/${enc(wz.camId)}/connection/reconnect`, { ip }); toast(`Connecting to ${ip}…`); }
     catch (err) { toast(err.message, true); }
   });
@@ -1575,7 +1743,7 @@ function wireWizard() {
   });
   $("wzanother").addEventListener("click", async () => {
     await closeWizard(false);
-    setTimeout(() => openWizard({}), 420);
+    setTimeout(() => openWizard({ add: true }), 420);
   });
 }
 
@@ -1731,6 +1899,8 @@ async function tlCall(path, body, okMsg) {
   finally { tl.busy = false; }
 }
 function tlStart() {
+  // QA F3: no Mac-engine run on a camera known to be stuck (the server refuses too)
+  if (state.status && state.status.wedged) { toast(WEDGED_TEXT, true); return; }
   const c = tl.cfg;
   const body = { interval: c.interval, native: c.engine === "native", ae_lock: c.engine !== "native" && c.ae_lock,
     import: c.import || c.video, video: c.video };
@@ -1923,21 +2093,21 @@ function connectWs() {
 // ---------------------------------------------------------------- wiring
 function init() {
   $("btnshutter").addEventListener("click", shutterPressed);
-  $("btnaf").addEventListener("click", () => { haptic(); cameraCall("/api/af", {}); });
+  $("btnaf").addEventListener("click", oneshotAf);
   $("btnauto").addEventListener("click", () => setAuto(!state.auto.on));
   $("btnconn").addEventListener("click", () => {
     if (state.cameras.length > 1) openSheet("cams");
     else if (state.status && state.status.status === "ready") openSheet("conn");
-    else { $("connect").hidden = false; state.skipConnect = false; }
+    else { $("connect").hidden = false; state.skipConnect = false; state.connectPinned = true; }
   });
   $("btnwizard").addEventListener("click", () => openWizard({ camId: state.camId, reuse: true }));
   $("bannerbtn").addEventListener("click", () => reconnect());
   $("bannerwake").addEventListener("click", bleWake);
   $("cswake").addEventListener("click", bleWake);
   $("btnreconnect").addEventListener("click", () => reconnect());
-  $("btnskip").addEventListener("click", () => { state.skipConnect = true; $("connect").hidden = true; if (state.status) renderStatus(state.status); });
+  $("btnskip").addEventListener("click", () => { state.skipConnect = true; state.connectPinned = false; $("connect").hidden = true; if (state.status) renderStatus(state.status); });
   $("btnforget").addEventListener("click", () => { LS.set("camera", null); reconnect(null, true); });
-  $("ipform").addEventListener("submit", (e) => { e.preventDefault(); const ip = $("ipinput").value.trim(); if (ip) reconnect(ip); });
+  $("ipform").addEventListener("submit", (e) => { e.preventDefault(); const ip = $("ipinput").value.trim(); if (ip && !badIp(ip)) reconnect(ip); });
   for (const b of $("modestrack").children) b.addEventListener("click", (e) => e.preventDefault());
   wireGestures();
   wireSheet();
@@ -1964,7 +2134,7 @@ function init() {
     else if (k === "r" || k === "R") toggleRec();
     else if (k === "p" || k === "P") (sheetOpen() ? closeSheet() : openSheet());
     else if (k === "a" || k === "A") setAuto(!state.auto.on);
-    else if (k === "f" || k === "F") { haptic(); cameraCall("/api/af", {}); }
+    else if (k === "f" || k === "F") oneshotAf();
     else if (k === "g" || k === "G") openFiles();
     else if (k === "1" || k === "2" || k === "3") setMode(MODES[+k - 1]);
     else if (k === "ArrowLeft") stepMode(-1);
@@ -2000,8 +2170,15 @@ function loadPresets() {
 }
 // Deep links: #wizard[=model|wifi|ble|name|done], #cameras
 function hashRoute() {
-  const h = decodeURIComponent(location.hash.slice(1));
-  if (h.startsWith("wizard")) openWizard({ camId: state.camId, reuse: true, step: h.split("=")[1] || "model" });
-  else if (h === "cameras") openSheet("cams");
+  const h = location.hash.slice(1);
+  if (h.startsWith("wizard")) {
+    // #wizard[=step][&cam=<id>][&add=1]
+    const q = new URLSearchParams(h.replace(/^wizard=?/, "step=").replace(/^step=$/, ""));
+    const cam = q.get("cam");
+    const known = cam && state.cameras.some((c) => c.id === cam);
+    if (wz.open && wz.step === q.get("step")) return;   // our own replaceState
+    openWizard({ camId: known ? cam : (q.get("add") ? null : state.camId), reuse: !q.get("add") || !!known,
+      add: !!q.get("add"), step: (known || !q.get("add")) ? q.get("step") || "model" : "model" });
+  } else if (decodeURIComponent(h) === "cameras") openSheet("cams");
 }
 init();
