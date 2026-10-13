@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import datetime as _dt
 import logging
+import os
 import re
 import struct
 import time
@@ -81,10 +82,21 @@ WIFI_SOFTAP, WIFI_STA, WIFI_STA_SSID_SET = 1, 2, 3
 # CH_WIFI_START purpose LUMIX Sync uses for "Remote shooting" (5 = SoftAP variant
 # for the *_fast sleep states). Proven on the S5 with Remote Wakeup, 2026-10-12.
 PURPOSE_REMOTE = 3
+PURPOSE_SOFTAP = 5     # with connect type 01; HomeActivity.java:4736, I5/g.java:936-967
+
+# Advertised states (docs/ble-power-protocol.md section 2). In a sleep state LUMIX
+# Sync wakes the body with one connection and runs the Wi-Fi request on a second
+# one once the camera advertises "wakeup" (HomeActivity.java:1230-1259).
+SLEEP_STATES = frozenset({1, 4, 5, 6, 7, 8, 9, 10})
+FAST_STATES = frozenset({6, 7, 9, 10})       # X0/Y0, P5/b.java:819-823
+AWAKE_STATES = frozenset({0, 2})             # normal, wakeup
 
 # Connecting to a camera that sleeps with the switch OFF takes longer: 24-27 s
 # for CoreBluetooth to bring the link up on the S5 (bleak's old 20 s cut it off).
 CONNECT_TIMEOUT = 45.0
+# How long to wait for e182ec41 (Wi-Fi start result) after the start write. The
+# app has no fixed wait (it reacts whenever the notify comes); 10 s is ours.
+START_ACK_WAIT = 10.0
 
 
 class BleStepError(RuntimeError):
@@ -95,6 +107,30 @@ class BleStepError(RuntimeError):
         super().__init__("%s: %s" % (step, message))
         self.step = step
         self.need_pair = need_pair
+
+
+REFUSED_HINT = ("The camera said no to remote wake-up (LUMIX Sync shows \"Due to the state of the camera, "
+                "this function cannot be used\"). Make sure it isn't busy (menu open, playback, recording), "
+                "then try again. If it keeps refusing, switch it on by hand once and check its Wi-Fi "
+                "connection settings.")
+
+
+class BleRefused(BleStepError):
+    """e182ec41 = 01 after the Wi-Fi start write: the camera refused
+    (ON_BT_CANNOT_REMOTE_WAKEUP, I5/g.java:497-509, HomeActivity.java:1097-1121)."""
+
+    def __init__(self, message: str = "camera refused remote wake-up (camera state)"):
+        super().__init__("wifi", message)
+        self.refused = True
+
+
+def trace_line(text: str, t0: Optional[float] = None) -> str:
+    """'ble.trace <wall clock> [+rel] text': one grep finds the experiment in
+    /tmp/lumix-server.log (the server logs lumix-ble stderr as 'ble: ...')."""
+    now = time.time()
+    ts = _dt.datetime.fromtimestamp(now).strftime("%H:%M:%S.%f")[:-3]
+    rel = (" +%.2fs" % (now - t0)) if t0 is not None else ""
+    return "ble.trace %s%s %s" % (ts, rel, text)
 
 
 def describe(e: BaseException) -> str:
@@ -116,7 +152,11 @@ def error_fields(e: BaseException, step: Optional[str] = None) -> Dict[str, Any]
         out["step"] = e.step
         if e.need_pair:
             out["need_pair"] = True
+    if isinstance(e, BleRefused):
+        out["refused"] = True
+        out["hint"] = REFUSED_HINT
     return out
+
 
 # G9II ("APS" bodies) answer constants from the Aikhjarto capture. Not used by
 # S5-generation bodies, which write the plain client UUID instead.
@@ -287,19 +327,34 @@ def _is_lumix(name: str, mfr: Dict[int, bytes], services: Optional[List[str]] = 
     return PANASONIC_CID in mfr and bool(name and NAME_RE.match(name))
 
 
+def adv_matches(n: str, mfr: Optional[bytes], name: Optional[str], mfr_addr: Optional[str]) -> bool:
+    """Is this advertisement our camera? The BT address the OS reports can
+    rotate (two resolvable addresses at once on 2026-10-12 23:22), so match the
+    name or the address bytes the camera puts in its manufacturer data (bytes
+    after the state byte). LUMIX Sync re-finds the camera by a "publicAddress",
+    not the OS address (HomeActivity.java:1234-1240); that it is these bytes is
+    an inference. No filter: any Lumix."""
+    if not name and not mfr_addr:
+        return True
+    if name and n == name:
+        return True
+    return bool(mfr_addr and mfr is not None and len(mfr) > 1 and mfr[1:].hex() == mfr_addr.lower())
+
+
 async def scan(timeout: float = 8.0, name: Optional[str] = None,
-               stop_on_first: bool = False) -> List[Dict[str, Any]]:
+               stop_on_first: bool = False, mfr_addr: Optional[str] = None) -> List[Dict[str, Any]]:
     """Advertising Lumix bodies: name, address, rssi, manufacturer data."""
     bleak = _bleak()
     found: Dict[str, Dict[str, Any]] = {}
 
     def cb(dev, adv):
         n = adv.local_name or dev.name or ""
-        if not _is_lumix(n, adv.manufacturer_data, adv.service_uuids) or (name and n != name):
-            return
         m = adv.manufacturer_data.get(PANASONIC_CID)
+        if not _is_lumix(n, adv.manufacturer_data, adv.service_uuids) or not adv_matches(n, m, name, mfr_addr):
+            return
         found[dev.address] = {"name": n, "address": dev.address, "rssi": adv.rssi,
                               "mfr": m.hex() if m is not None else None,
+                              "mfr_addr": m[1:].hex() if m is not None and len(m) > 1 else None,
                               "state_byte": m[0] if m else None,
                               "state": ADV_STATES.get(m[0]) if m else None, "_dev": dev}
     async with bleak.BleakScanner(cb):
@@ -311,10 +366,39 @@ async def scan(timeout: float = 8.0, name: Optional[str] = None,
     return list(found.values())
 
 
-async def find(name: Optional[str] = None, timeout: float = 15.0):
+async def find(name: Optional[str] = None, timeout: float = 15.0, mfr_addr: Optional[str] = None):
     """BLEDevice of the first matching camera, or None."""
-    res = await scan(timeout, name, stop_on_first=True)
+    res = await scan(timeout, name, stop_on_first=True, mfr_addr=mfr_addr)
     return res[0]["_dev"] if res else None
+
+
+async def wait_state(name: Optional[str], mfr_addr: Optional[str], want: "frozenset[int]" = AWAKE_STATES,
+                     timeout: float = 40.0, every: float = 1.0, log: Callable[[str], None] = print,
+                     t0: Optional[float] = None) -> Optional[int]:
+    """Poll the advertisement (one ~1 s scan per round) until the camera
+    advertises a state in ``want``; return it, else the last state seen (None
+    when it never showed up). Every change is logged as ble.trace."""
+    start = time.time()
+    last: Optional[Tuple[int, ...]] = None
+    seen: Optional[int] = None
+    while time.time() - start < timeout:
+        try:
+            res = await scan(every, name, mfr_addr=mfr_addr)
+        except Exception as e:
+            log(trace_line("adv scan failed: %s" % describe(e), t0))
+            res = []
+            await asyncio.sleep(every)
+        states = tuple(sorted({r["state_byte"] for r in res if r.get("state_byte") is not None}))
+        if states != last:
+            log(trace_line("adv state %s" % (", ".join("%d %s" % (x, ADV_STATES.get(x, "?")) for x in states)
+                                             or "not advertising"), t0))
+            last = states
+        if states:
+            seen = states[-1]
+        hit = [x for x in states if x in want]
+        if hit:
+            return hit[0]
+    return seen
 
 
 class LumixBle:
@@ -322,22 +406,30 @@ class LumixBle:
 
     def __init__(self, name: Optional[str] = None, scan_timeout: float = 20.0,
                  on_event: Optional[Callable[[str], None]] = None,
-                 connect_timeout: float = CONNECT_TIMEOUT, connect_tries: int = 2):
+                 connect_timeout: float = CONNECT_TIMEOUT, connect_tries: int = 2,
+                 mfr_addr: Optional[str] = None, answer_clock: bool = True):
         self.name = name
+        self.mfr_addr = mfr_addr            # manufacturer-data address bytes (hex), see adv_matches
         self.scan_timeout = scan_timeout
         self.connect_timeout = connect_timeout
         self.connect_tries = max(1, connect_tries)
+        # LUMIX Sync writes the clock only when the camera asks on 4cf487c0
+        # (I5/g.java:389-391); never unrequested.
+        self.answer_clock = answer_clock
         self.client = None
         self.found_name: Optional[str] = None   # advertised name of the camera we connected to
         self.address: Optional[str] = None
         self.notes: List[Tuple[float, str, str]] = []
         self._waiters: Dict[str, asyncio.Queue] = {}
+        self._cbs: Dict[str, Callable[..., None]] = {}
+        self.subscribed: set = set()           # notify subscriptions the OS confirmed
+        self._ap: Optional[Tuple[str, str]] = None   # camera AP (ssid, password): memory only, never logged
         self._on_event = on_event or (lambda s: log.info("%s", s))
         self.t0 = time.time()
         self.disconnected = asyncio.Event()
 
     def ev(self, text: str) -> None:
-        self._on_event("[%6.2fs] %s" % (time.time() - self.t0, text))
+        self._on_event(trace_line(text, self.t0))
 
     async def __aenter__(self) -> "LumixBle":
         await self.connect()
@@ -353,7 +445,7 @@ class LumixBle:
         bleak = _bleak()
         last: Optional[BaseException] = None
         for attempt in range(1, self.connect_tries + 1):
-            dev = await find(self.name, self.scan_timeout)
+            dev = await find(self.name, self.scan_timeout, mfr_addr=self.mfr_addr)
             if dev is None:
                 raise BleStepError("scan", "camera not advertising over Bluetooth after %.0f s (%s); is it "
                                    "in range with Bluetooth on (and Remote Wakeup on, if switched off)?"
@@ -363,24 +455,27 @@ class LumixBle:
             self.disconnected.clear()
 
             def on_disc(_c):
-                self.ev("disconnected")
+                self.ev("state: disconnected")
                 self.disconnected.set()
-            self.client = bleak.BleakClient(dev, disconnected_callback=on_disc, timeout=self.connect_timeout)
+            client = self.client = bleak.BleakClient(dev, disconnected_callback=on_disc,
+                                                     timeout=self.connect_timeout)
+            self.ev("state: connecting (try %d)" % attempt)
             try:
-                await self.client.connect()
+                await client.connect()
             except Exception as e:  # TimeoutError / BleakError
                 last = e
                 self.ev("connect try %d failed: %s" % (attempt, describe(e)))
                 with contextlib.suppress(Exception):
-                    await self.client.disconnect()
+                    await client.disconnect()
                 continue
-            self.ev("connected")
+            self.ev("state: connected")
             return
         raise BleStepError("connect", "camera found but the Bluetooth link didn't come up (%s, %d tries of %.0f s)"
                            % (describe(last) if last else "?", self.connect_tries, self.connect_timeout))
 
     async def close(self) -> None:
         if self.client is not None and self.client.is_connected:
+            self.ev("state: closing")
             try:
                 await self.client.disconnect()
             except Exception:
@@ -394,15 +489,34 @@ class LumixBle:
         self.ev("write %s %s" % (uuid[:8], data.hex()))
         await asyncio.wait_for(self.client.write_gatt_char(uuid, data, response=response), timeout)
 
-    async def subscribe(self, uuid: str) -> None:
-        q: asyncio.Queue = asyncio.Queue()
-        self._waiters[uuid] = q
+    def _queue(self, uuid: str) -> asyncio.Queue:
+        q = self._waiters.get(uuid)
+        if q is None:
+            q = self._waiters[uuid] = asyncio.Queue()
+        return q
 
-        def cb(_ch, data: bytearray, uuid=uuid):
-            self.notes.append((time.time() - self.t0, uuid, bytes(data).hex()))
-            self.ev("notify %s %s" % (uuid[:8], bytes(data).hex()))
-            q.put_nowait(bytes(data))
+    def _on_notify(self, uuid: str, data: bytes) -> None:
+        self.notes.append((round(time.time() - self.t0, 2), uuid, data.hex()))
+        self.ev("notify %s %s%s" % (uuid[:8], data.hex(), _notify_meaning(uuid, data)))
+        self._queue(uuid).put_nowait(data)
+        if uuid == CH_CLOCK_NOTIFY and self.answer_clock:
+            asyncio.ensure_future(self._answer_clock())
+
+    async def _answer_clock(self) -> None:
+        try:
+            await self.set_clock()
+        except Exception as e:
+            self.ev("clock answer failed: %s" % describe(e))
+
+    async def subscribe(self, uuid: str) -> None:
+        self._queue(uuid)
+        cb = self._cbs.get(uuid)
+        if cb is None:
+            def cb(_ch, data: bytearray, uuid=uuid):
+                self._on_notify(uuid, bytes(data))
+            self._cbs[uuid] = cb
         await self.client.start_notify(uuid, cb)
+        self.subscribed.add(uuid)
 
     async def wait_notify(self, uuid: str, timeout: float = 5.0) -> Optional[bytes]:
         q = self._waiters.get(uuid)
@@ -412,6 +526,11 @@ class LumixBle:
             return await asyncio.wait_for(q.get(), timeout)
         except asyncio.TimeoutError:
             return None
+
+    def drain(self, uuid: str) -> None:
+        q = self._waiters.get(uuid)
+        while q is not None and not q.empty():
+            q.get_nowait()
 
     def readable(self) -> List[str]:
         return [c.uuid for s in self.client.services for c in s.characteristics if "read" in c.properties]
@@ -454,16 +573,81 @@ class LumixBle:
             try:
                 await self.subscribe(u)
             except Exception:
-                # macOS finds no CCCDs on the S5 ("attribute not found"); the
-                # camera notifies anyway, so this is harmless.
+                # macOS finds no CCCDs on the S5 before registration ("attribute
+                # not found"); rediscover_cccds() retries once we are registered.
                 failed += 1
         if failed:
-            self.ev("notify subscriptions refused: %d/%d (expected on macOS)" % (failed, len(REGISTER_NOTIFY)))
+            self.ev("notify subscriptions refused: %d/%d before registration" % (failed, len(REGISTER_NOTIFY)))
         await self.write(CH_DLNA_UUID, client_uuid_bytes())
         await self.write(CH_FRIENDLY_NAME, name.encode("ascii", "replace")[:20])
 
-    async def login(self) -> bytes:
-        """Register, then read INITIAL_INFORM (the XOR key).
+    def _forget_notify(self, uuid: str) -> None:
+        """bleak (CoreBluetooth) keeps the callback of a start_notify that failed
+        and then refuses a second start_notify ("already started"); drop it."""
+        d = getattr(getattr(self.client, "_backend", None), "_delegate", None)
+        cbs = getattr(d, "_characteristic_notify_callbacks", None)
+        if cbs is None:
+            return
+        try:
+            ch = self.client.services.get_characteristic(uuid)
+        except Exception:
+            return
+        if ch is not None:
+            cbs.pop(ch.handle, None)
+            getattr(d, "_characteristic_notification_discriminators", {}).pop(ch.handle, None)
+
+    def _cccd_count(self, uuid: str) -> Optional[int]:
+        try:
+            ch = self.client.services.get_characteristic(uuid)
+            return sum(1 for x in ch.descriptors if x.uuid.lower().startswith("00002902"))
+        except Exception:
+            return None
+
+    async def rediscover_cccds(self, uuids: Optional[List[str]] = None) -> int:
+        """After registration, rediscover services/descriptors and enable notify
+        on the LUMIX Sync chars that failed before; return how many are on.
+
+        Before registration CoreBluetooth lists no CCCDs on the S5, so every
+        start_notify failed with "attribute not found" and e182ec41 (Wi-Fi start
+        result), e182ec43 (camera requests) and 4cf487c0 (clock request) were
+        never seen. Real-device verified: no."""
+        uuids = list(uuids or REGISTER_NOTIFY)
+        todo = [u for u in uuids if u not in self.subscribed]
+        if not todo or self.client is None:
+            return len(uuids) - len(todo)
+        for u in todo:
+            self._forget_notify(u)
+        be = getattr(self.client, "_backend", None)
+        if be is not None and hasattr(be, "_get_services") and hasattr(be, "services"):
+            old = be.services
+            try:
+                be.services = None
+                await asyncio.wait_for(be._get_services(), 20)
+                self.ev("services rediscovered")
+            except Exception as e:
+                be.services = old
+                self.ev("service rediscovery failed: %s" % describe(e))
+        ok = 0
+        for u in todo:
+            if self.disconnected.is_set():
+                break
+            try:
+                await asyncio.wait_for(self.subscribe(u), 5)
+                ok += 1
+                self.ev("notify on %s (cccd %s)" % (u[:8], self._cccd_count(u)))
+            except Exception as e:
+                self.ev("notify %s still refused (cccd %s): %s" % (u[:8], self._cccd_count(u), describe(e)))
+        on = len(uuids) - len(todo) + ok
+        self.ev("notify subscriptions after registration: %d/%d on" % (on, len(uuids)))
+        return on
+
+    async def login(self, legacy: bool = False) -> bytes:
+        """Register, then read the XOR key, the camera SSID and the AP
+        password in LUMIX Sync's order (K5/j.java:191-205), then enable the
+        notifications that failed before registration.
+
+        ``legacy``: our pre-2026-10-13 order (camera SSID, then key; no AP
+        password read, no rediscovery), kept for the baseline experiment.
 
         A camera that doesn't know our client id drops the link right after
         the friendly-name write (seen on the S5 when the id had changed: HCI
@@ -472,8 +656,15 @@ class LumixBle:
         need_pair."""
         try:
             await self.register()
-            await self.read(CH_CAMERA_SSID)   # LUMIX Sync reads this next; keep the order
-            key = await self.read(CH_INITIAL_INFORM)
+            if legacy:
+                await self.read(CH_CAMERA_SSID)
+                key = await self.read(CH_INITIAL_INFORM)
+            else:
+                key = await self.read(CH_INITIAL_INFORM)
+                ap_ssid = _printable(await self.read(CH_CAMERA_SSID))
+                raw_pw = await self.read(CH_CAMERA_AP_PASS)
+                with contextlib.suppress(Exception):
+                    self._ap = (ap_ssid, xor_decode(raw_pw, struct.unpack(">I", key[:4])[0]))
         except Exception as e:
             if self.disconnected.is_set():
                 raise BleStepError(
@@ -481,24 +672,65 @@ class LumixBle:
                     "doesn't know that id. Pair again (camera: Bluetooth > SET > Pairing), or restore the "
                     "id it was paired with" % _client_id(), need_pair=True) from e
             raise BleStepError("login", describe(e)) from e
-        self.ev("initial_inform %s" % key.hex())
+        self.ev("state: logged in (initial_inform %s)" % key.hex())
+        if not legacy:
+            await self.rediscover_cccds()
         return key
 
     async def set_clock(self) -> None:
         await self.write(CH_CLOCK, clock_payload())
 
-    async def wifi_join(self, ssid: Optional[str] = None, purpose: int = PURPOSE_REMOTE) -> None:
+    async def _write_connect_type(self, value: int) -> None:
+        """LUMIX Sync retries this write 3 times, 500 ms apart (I5/g.java:349-361)."""
+        for i in range(3):
+            try:
+                await self.write(CH_WIFI_CMD, bytes([value]))
+                return
+            except Exception as e:
+                if i == 2 or self.disconnected.is_set():
+                    raise
+                self.ev("connect type write retry %d: %s" % (i + 1, describe(e)))
+                await asyncio.sleep(0.5)
+
+    async def wait_start_ack(self, timeout: float = 10.0) -> Optional[bytes]:
+        """e182ec41 after the Wi-Fi start write, or None (timeout / link lost)."""
+        t = asyncio.ensure_future(self.wait_notify(CH_WIFI_START_ACK, timeout))
+        d = asyncio.ensure_future(self.disconnected.wait())
+        try:
+            await asyncio.wait({t, d}, timeout=timeout + 0.5, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            d.cancel()
+        if not t.done():
+            t.cancel()
+            return None
+        return t.result()
+
+    async def wifi_join(self, ssid: Optional[str] = None, purpose: int = PURPOSE_REMOTE,
+                        sta: bool = True, softap: bool = False, legacy: bool = False,
+                        start_ack_wait: Optional[float] = None) -> Optional[bytes]:
         """Bring Wi-Fi up joined to a known network (the camera keeps the
-        password), the way LUMIX Sync does for Remote shooting:
+        password), the way LUMIX Sync does for Remote shooting
+        (I5/g.java:777-824, 969-998):
 
-          SSID -> connect type 03 ("SSID set") -> camera acks 18345be1 = 00
-          -> connect type 02 (STA) -> start e182ec40 = 03.
+          SSID -> connect type 03 ("SSID set") -> camera acks 18345be1
+          -> connect type 02 if the ack is 00, else 01 (g.java:333-366)
+          -> start e182ec40 = purpose -> camera answers e182ec41 (00 ok, 01 refused).
 
-        The 02 after the ack is what a camera woken from OFF needs: without it
-        (SSID, 03, start 01 -- enough while the camera's Wi-Fi was already up)
-        the body powered up but never joined the network. A non-zero ack means
-        the camera wants its own access point instead; that is reported, not
-        followed (it would take the camera off the home network)."""
+        Returns the e182ec41 value (None when the camera sent none within
+        ``start_ack_wait`` s). Raises BleRefused on 01.
+
+        A non-zero ack means the camera wants its own access point: reported,
+        not followed, unless ``softap`` (that takes this Mac off the LAN).
+        ``softap`` alone runs LUMIX Sync's purpose-5 path: connect type 01, then
+        start 05 (g.java:936-967). ``legacy``: the pre-2026-10-13 sequence
+        (fixed 0.3 s pause, no wait for e182ec41)."""
+        if start_ack_wait is None:
+            start_ack_wait = START_ACK_WAIT
+        if softap and purpose == PURPOSE_SOFTAP:
+            self.drain(CH_WIFI_START_ACK)
+            await self._write_connect_type(WIFI_SOFTAP)
+            await self.write(CH_WIFI_START, bytes([PURPOSE_SOFTAP]))
+            return await self._start_result(start_ack_wait)
         if not ssid:
             try:
                 ssid = parse_sta_ssid(await self.read(CH_CAMERA_STA_SSID, 8))
@@ -509,20 +741,56 @@ class LumixBle:
         ssid = ssid or current_ssid()
         if not ssid:
             raise RuntimeError("no home SSID (set LUMIX_HOME_SSID)")
-        q = self._waiters.get(CH_WIFI_CMD_ACK)
-        while q is not None and not q.empty():   # drop stale acks
-            q.get_nowait()
+        self.drain(CH_WIFI_CMD_ACK)              # drop stale acks
         await self.write(CH_WIFI_SSID, ssid_payload(ssid))
         await self.write(CH_WIFI_CMD, bytes([WIFI_STA_SSID_SET]))
         ack = await self.wait_notify(CH_WIFI_CMD_ACK, 5.0)
+        ctype = WIFI_STA
         if ack is None:
             self.ev("no join ack from the camera; sending STA anyway")
         elif ack[:1] != b"\x00":
-            raise BleStepError("wifi", "the camera answered %s to joining %r (it wants its own access point; "
-                               "is that network saved on the camera?)" % (ack.hex(), ssid))
-        await self.write(CH_WIFI_CMD, bytes([WIFI_STA]))
-        await asyncio.sleep(0.3)
+            if not softap:
+                raise BleStepError("wifi", "the camera answered %s to joining %r (it wants its own access point; "
+                                   "is that network saved on the camera?)" % (ack.hex(), ssid))
+            ctype = WIFI_SOFTAP
+        if sta or ctype == WIFI_SOFTAP:
+            if legacy:
+                await self.write(CH_WIFI_CMD, bytes([ctype]))
+                await asyncio.sleep(0.3)
+            else:
+                await self._write_connect_type(ctype)    # write response = the camera took it
+        self.drain(CH_WIFI_START_ACK)
         await self.write(CH_WIFI_START, bytes([purpose]))
+        if legacy:
+            return None
+        return await self._start_result(start_ack_wait)
+
+    async def _start_result(self, wait: float) -> Optional[bytes]:
+        res = await self.wait_start_ack(wait)
+        self.ev("wifi start result: %s" % (res.hex() if res is not None else
+                                           "none in %.0f s%s" % (wait, " (link lost)" if self.disconnected.is_set()
+                                                                 else "")))
+        if res is not None and res[:1] == b"\x01":
+            raise BleRefused()
+        return res
+
+
+_E182EC43 = {1: "camera wants Wi-Fi (transfer)", 2: "camera resets the request", 3: "camera asks to read SSID",
+             4: "camera wants Wi-Fi (transfer)"}
+
+
+def _notify_meaning(uuid: str, data: bytes) -> str:
+    """Short gloss for the trace (docs/ble-power-protocol.md section 1)."""
+    v = data[0] if data else None
+    if uuid == CH_WIFI_START_ACK:
+        return {0: " (wifi start ok)", 1: " (REFUSED: camera state)"}.get(v, "")
+    if uuid == CH_MAIN_NOTIFY3:
+        return " (%s)" % _E182EC43[v] if v in _E182EC43 else ""
+    if uuid == CH_CLOCK_NOTIFY:
+        return " (camera asks for the time)"
+    if uuid == CH_WIFI_CMD_ACK:
+        return " (join ack: %s)" % ("STA" if v == 0 else "wants SoftAP")
+    return ""
 
 
 # ------------------------------------------------------------- high level
@@ -635,42 +903,129 @@ async def wait_wifi(ip: Optional[str], timeout: float) -> Optional[float]:
     return None
 
 
+ADV_SLEEP_GAP_S = 100.0   # longest gap between a sleeping camera's advertising bursts, plus margin
+
+
+async def adv_snapshot(name: Optional[str] = None, timeout: float = 10.0,
+                       log: Callable[[str], None] = print, t0: Optional[float] = None) -> Dict[str, Any]:
+    """One scan before connecting: the advertised state byte (byte 2 of the
+    0x003A manufacturer data) and the address bytes to re-find the camera.
+    {} when nothing was found; never raises."""
+    try:
+        res = await scan(timeout, name, stop_on_first=True)
+    except Exception as e:
+        log(trace_line("adv scan failed: %s" % describe(e), t0))
+        return {}
+    if not res:
+        log(trace_line("adv: camera not advertising (%s)" % (name or "any Lumix"), t0))
+        return {}
+    adv = {k: v for k, v in res[0].items() if k != "_dev"}
+    log(trace_line("adv state %s %s (mfr %s)" % (adv.get("state_byte"), adv.get("state"), adv.get("mfr")), t0))
+    return adv
+
+
 async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait: float = 90.0,
-               camera_ip: Optional[str] = None, log: Callable[[str], None] = print) -> Dict[str, Any]:
-    """Connect, log in, sync the clock, start Wi-Fi joined to the home network,
-    then wait for the camera on :60606. Powers the body up from switch-OFF when
-    Remote Wakeup is on. Never raises: a failure comes back as {"ok": false,
-    "step": scan|connect|login|wifi|wifi-wait, "error": "<step>: ..."}."""
+               camera_ip: Optional[str] = None, log: Callable[[str], None] = print,
+               purpose: int = PURPOSE_REMOTE, sta: bool = True, single_session: bool = False,
+               legacy: bool = False, softap: bool = False, wifi_if: str = "en0",
+               wake_wait: float = 40.0) -> Dict[str, Any]:
+    """Bring the camera onto the home network over BLE, then wait for :60606.
+    Powers the body up from switch-OFF when Remote Wakeup is on. Never raises:
+    a failure comes back as {"ok": false, "step": scan|connect|login|wifi|
+    wifi-wait, "error": "<step>: ..."} (plus "refused"/"hint" when the camera
+    answered e182ec41 = 01).
+
+    1. Scan once and record the advertised state.
+    2. Sleep state (1, 4-10), the LUMIX Sync way (HomeActivity.java:1230-1259):
+       stage 1 connects and logs in to wake the body, then disconnects; poll the
+       advertisement every ~1 s for up to ``wake_wait`` s until it is 0 or 2.
+    3. Connect, log in (key, camera SSID, AP password; notifications on),
+       SSID -> 03 -> ack -> 02/01 -> start 03, wait for e182ec41.
+    No unrequested clock write: the clock is answered on 4cf487c0 only.
+
+    ``single_session``: skip step 2 (the pre-2026-10-13 shape).
+    ``legacy``: single session with the old bytes (clock written up front, old
+    read order, no notify rediscovery, fixed 0.3 s pause) -- the baseline.
+    ``softap``: purpose 05 + connect type 01, then this Mac joins the camera's
+    own access point (it leaves the home LAN for the duration)."""
     t0 = time.time()
     out: Dict[str, Any] = {"ok": False}
     ip = camera_ip or _last_ip()
     out["ip"] = ip
     took = None
-    c = LumixBle(name, scan_timeout=30, on_event=log)
+
+    def tr(text: str) -> None:
+        log(trace_line(text, t0))
+
+    if legacy:
+        single_session = True
+    # A sleeping S5 (state 6) advertises in ~10 s bursts about every 90 s
+    # (2026-10-13 12:19-12:21); a 10 s look misses it and drops to single-session.
+    adv = await adv_snapshot(name, ADV_SLEEP_GAP_S, log, t0)
+    state = adv.get("state_byte")
+    mfr_addr = adv.get("mfr_addr")
+    out["adv_state_before"] = state
+    out["adv_state_name_before"] = adv.get("state")
+    two = (not single_session) and state in SLEEP_STATES
+    out["mode"] = "legacy" if legacy else "two-session" if two else "single-session"
+    if softap:
+        out["mode"] += "+softap"
+        purpose = PURPOSE_SOFTAP
+    if state in FAST_STATES and not softap:
+        out["note"] = ("camera advertised a _fast sleep state; LUMIX Sync asks for the camera's own access "
+                       "point here (purpose 05, connect type 01), so it may ignore the STA request")
+    tr("wake start: mode %s, adv state %s" % (out["mode"], state))
+    notes: List[Tuple[float, str, str]] = []
+    c = LumixBle(name, scan_timeout=ADV_SLEEP_GAP_S, on_event=log, mfr_addr=mfr_addr, answer_clock=not legacy)
     step = "connect"
     try:
+        if two:
+            tr("stage 1: connect + login to wake the body")
+            await c.connect()
+            out["stage1_connected_s"] = round(time.time() - t0, 1)
+            step = "login"
+            await c.login()
+            out["registered"] = True
+            out["saved"] = mark_registered(c.found_name or name, c.address)
+            notes += c.notes
+            await c.close()
+            tr("stage 1 done; waiting up to %.0f s for the camera to advertise normal/wakeup" % wake_wait)
+            step = "wake-wait"
+            woke = await wait_state(name, mfr_addr, AWAKE_STATES, wake_wait, 1.0, log, t0)
+            out["adv_state_after_wake"] = woke
+            out["woke_s"] = round(time.time() - t0, 1)
+            tr("stage 2: state %s; reconnecting" % woke)
+            c = LumixBle(name, scan_timeout=20, on_event=log, mfr_addr=mfr_addr, answer_clock=True)
+            step = "connect"
         await c.connect()
         out["ble_connected_s"] = round(time.time() - t0, 1)
         step = "login"
-        await c.login()
+        await c.login(legacy=legacy)
         # login() read INITIAL_INFORM: an unknown central is cut off before that
         out["registered"] = True
         out["saved"] = mark_registered(c.found_name or name, c.address)
-        try:
-            await c.set_clock()
-        except Exception as e:
-            log("clock: %s" % describe(e))
+        out["notify_on"] = len(c.subscribed)
+        if legacy:
+            try:
+                await c.set_clock()
+            except Exception as e:
+                log("clock: %s" % describe(e))
         step = "wifi"
-        await c.wifi_join(ssid)
+        res = await c.wifi_join(ssid, purpose=purpose, sta=sta, softap=softap, legacy=legacy)
+        out["wifi_start_result"] = res.hex() if res is not None else None
         out["wifi_cmd_s"] = round(time.time() - t0, 1)
-        # Stay connected while the camera brings Wi-Fi up (11-40 s); the camera
-        # drops BLE itself once it is on the network.
         step = "wifi-wait"
-        took = await wait_wifi(ip, wifi_wait)
+        if softap:
+            took = await _softap_check(c, wifi_if, wifi_wait, out, tr)
+        else:
+            # Stay connected while the camera brings Wi-Fi up (11-40 s); the camera
+            # drops BLE itself once it is on the network.
+            took = await wait_wifi(ip, wifi_wait)
     except Exception as e:
         out.update(error_fields(e, step))
+        tr("failed at %s: %s" % (step, out.get("error")))
     finally:
-        out["notifies"] = c.notes
+        out["notifies"] = notes + c.notes
         with contextlib.suppress(Exception):
             await c.close()
     out["wifi_up_s"] = round(time.time() - t0, 1) if took is not None else None
@@ -679,7 +1034,39 @@ async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait
         out["step"] = "wifi-wait"
         out["error"] = ("wifi-wait: the camera took the Wi-Fi command but didn't answer on %s:60606 within %ds"
                         % (ip, wifi_wait) if ip else "wifi-wait: no camera IP known to check")
+    tr("wake end: ok=%s wifi_up_s=%s" % (out["ok"], out["wifi_up_s"]))
     return out
+
+
+async def _softap_check(c: LumixBle, wifi_if: str, wait: float, out: Dict[str, Any],
+                        tr: Callable[[str], None]) -> Optional[float]:
+    """--softap only: join the camera AP like LUMIX Sync (HomeActivity.java:
+    1449-1458), check :60606 at 192.168.54.1, then rejoin the home network.
+    The AP password stays in memory."""
+    if not c._ap or not c._ap[0]:
+        raise BleStepError("wifi-wait", "camera AP SSID unknown (login didn't read it)")
+    ap_ssid, pw = c._ap
+    t0 = time.time()
+    loop = asyncio.get_running_loop()
+    tr("softap: joining the camera AP %s (this Mac leaves the LAN)" % ap_ssid)
+    try:
+        r = await loop.run_in_executor(None, lambda: _sh("networksetup", "-setairportnetwork", wifi_if, ap_ssid,
+                                                         *([pw] if pw else [])))
+        if r:
+            tr("softap: networksetup: %s" % (r.replace(pw, "***") if pw else r))
+        while time.time() - t0 < wait:
+            if await loop.run_in_executor(None, ddd_ok, "192.168.54.1", 2.0):
+                took = round(time.time() - t0, 1)
+                out["softap_up_s"] = took
+                tr("softap: camera answers on its own AP after %.1f s" % took)
+                return took
+            await asyncio.sleep(1.0)
+        return None
+    finally:
+        _sh("networksetup", "-removepreferredwirelessnetwork", wifi_if, ap_ssid)
+        _sh("networksetup", "-setairportpower", wifi_if, "off")
+        _sh("networksetup", "-setairportpower", wifi_if, "on")
+        tr("softap: left the camera AP; home Wi-Fi rejoining")
 
 
 def wifi_poweroff(ip: str, server: Optional[str], log: Callable[[str], None] = print) -> Dict[str, Any]:

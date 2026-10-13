@@ -102,6 +102,69 @@ class BleWakeApiTest(EmuTestCase):
         self.run_(go(), 30)
 
 
+class BleWakeVariantTest(EmuTestCase):
+    """tools/ble-wake-experiment.py runs its variants through the server, so they
+    share the BLE lock and the wake cap with the UI."""
+
+    def wake(self, line):
+        stub = stub_ble(os.path.join(self.tmp.name, "lumix-ble"), line)
+        return mock.patch.object(ble_api, "BLE_BIN", stub)
+
+    def test_variant_flags_reach_lumix_ble(self):
+        r = self.rig
+
+        async def go():
+            with self.wake('{"ok": false, "error": "wifi-wait: x", "step": "wifi-wait"}'):
+                st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {"variant": "baseline"})
+                self.assertEqual(st, 502, d)
+                self.assertEqual(d["variant"], "baseline")
+                self.assertTrue(any("wake --single-session --legacy" in x for x in d["log"]), d["log"])
+                st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {"variant": "notify-only"})
+                self.assertTrue(any(x.startswith("stub wake --single-session") and "--legacy" not in x
+                                    for x in d["log"]), d["log"])
+                st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {"variant": "two-session"})
+                self.assertEqual(st, 429, d)               # same cap as the UI's wakes
+        self.run_(go(), 30)
+
+    def test_default_wake_is_two_session(self):
+        r = self.rig
+
+        async def go():
+            with self.wake('{"ok": true}'):
+                st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {})
+            self.assertEqual(st, 200, d)
+            self.assertNotIn("variant", d)
+            self.assertFalse(any("--single-session" in x for x in d["log"]), d["log"])
+        self.run_(go(), 30)
+
+    def test_unknown_variant_is_400_and_costs_no_wake(self):
+        r = self.rig
+
+        async def go():
+            st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {"variant": "softap"})
+            self.assertEqual(st, 400, d)
+            st, s = await r.call("GET", "/api/cameras/emu/ble/status")
+            self.assertEqual(s["wakes"]["recent"], 0)
+        self.run_(go(), 30)
+
+    def test_refusal_hint_is_passed_to_the_ui(self):
+        r = self.rig
+
+        async def go():
+            line = json.dumps({"ok": False, "step": "wifi", "refused": True, "hint": ble.REFUSED_HINT,
+                               "error": "wifi: camera refused remote wake-up (camera state)"})
+            with self.wake(line):
+                st, d = await r.call("POST", "/api/cameras/emu/ble/wake", {})
+            self.assertEqual(st, 502)
+            self.assertTrue(d["refused"])
+            self.assertEqual(d["hint"], ble.REFUSED_HINT)
+        self.run_(go(), 30)
+        with open(os.path.join(STATIC, "app.js")) as f:
+            js = f.read()
+        self.assertIn("wake.data && wake.data.refused", js)
+        self.assertIn("wake.data.hint", js)
+
+
 class ClientUuidApiTest(EmuTestCase):
     """PATCH client_uuid: restore the id the camera was paired with (BLE MEI0 +
     Wi-Fi req_acc must be the same id; the S5 hangs up on any other)."""

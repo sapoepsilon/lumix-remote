@@ -1994,7 +1994,9 @@ async function bleWake() {
   clearInterval(wake.timer); wake.timer = null;
   wake.running = false; wake.secs = Math.round((Date.now() - wake.t0) / 1000);
   wake.needPair = !wake.ok && (wake.unsure || !!(wake.data && wake.data.need_pair));
-  if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); } else toast("Bluetooth wake failed: " + wake.error, true);
+  if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); }
+  else if (wake.data && wake.data.refused) toast("The camera refused remote wake-up; see the hint", true);
+  else toast("Bluetooth wake failed: " + wake.error, true);
   renderWake();
 }
 
@@ -2032,7 +2034,7 @@ function renderWake() {
   const paired = blePaired();
   const label = wake.running ? `Turning on… ${wake.secs} s` : "Turn on over Bluetooth";
   $("wakelabel").textContent = label;
-  $("wakesub").textContent = wake.running ? "Keep the camera near this computer. Takes up to 90 s."
+  $("wakesub").textContent = wake.running ? "Keep the camera near this computer. Takes up to 3 min."
     : paired ? "Switches the camera on and joins it to Wi-Fi" : "Pairing not confirmed; tries anyway";
   $("btnwake").disabled = wake.running;
   $("cswake").textContent = label;
@@ -2048,6 +2050,11 @@ function renderWake() {
       box.replaceChildren(el("div", { class: "wake-head" }, el("span", { class: "spinner" }),
         el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. ${wake.secs} s so far.`
           + (wake.unsure ? " This computer may not be paired yet; trying anyway." : "")))));
+    } else if (wake.data && wake.data.refused) {
+      // e182ec41 = 01: the camera itself said no (LUMIX Sync: "cannot remote wakeup"); login worked, so not a pairing problem
+      box.className = "wake-state callout warn";
+      box.replaceChildren(el("b", {}, "The camera refused to turn on remotely"),
+        el("span", {}, wake.data.hint || "Make sure it isn't busy, then try again."), wakeDetails());
     } else if (wake.needPair) {
       box.className = "wake-state callout warn";
       box.replaceChildren(el("b", {}, "Couldn't turn it on. This computer may not be paired over Bluetooth"),

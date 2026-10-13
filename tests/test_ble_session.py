@@ -8,6 +8,16 @@ OFF and Remote Wakeup ON (tests/fixtures/real-s5-ble-wake-2026-10-12.log):
 - Wi-Fi only comes up after the LUMIX Sync Remote-shooting sequence
   SSID, 03, ack, 02, start 03 (run C); SSID, 03, start 01 never got the woken
   camera onto the network (run B).
+
+Behaviour added from the LUMIX Sync 2.0.17 decompile (docs/ble-power-protocol.md;
+none of it real-device verified yet), each test cites its source:
+- reads after registration: INITIAL_INFORM, camera SSID, AP password (K5/j.java:191-205);
+- clock only when the camera asks on 4cf487c0 (I5/g.java:389-391);
+- 18345be1 = 00 -> connect type 02, else 01 (I5/g.java:333-366, 471-480);
+- e182ec41 = 01 after the start write = "cannot remote wakeup" (I5/g.java:497-509,
+  HomeActivity.java:1097-1121);
+- from a sleep state, wake with one connection and reconnect once the camera
+  advertises "wakeup" (HomeActivity.java:1230-1259).
 """
 import isolate  # noqa: F401  (temp config dir; must come first)
 
@@ -28,14 +38,19 @@ PAIRED = "4D454930-0100-1000-8001-0A0B0C0D0E0F"
 class StubCamera:
     """GATT behaviour of the S5 as seen from bleak."""
 
-    def __init__(self, known_id=PAIRED, connect_fails=0, ack=b"\x00", wifi_needs=(3, 2)):
+    def __init__(self, known_id=PAIRED, connect_fails=0, ack=b"\x00", wifi_needs=(3, 2),
+                 start_ack=None, clock_request=False):
         self.known = bytes.fromhex(known_id.replace("-", ""))
         self.connect_fails = connect_fails
         self.ack = ack
         self.wifi_needs = list(wifi_needs)      # 0d6f1880 values a join needs, in order
+        self.start_ack = start_ack              # e182ec41 after e182ec40 (None: never sent, as on macOS so far)
+        self.clock_request = clock_request      # 4cf487c0 after registration
         self.writes = []                        # (short uuid, hex)
         self.reads = []
         self.wifi_up = False
+        self.connects = 0
+        self.sessions = []                      # writes per connection
 
 
 def fake_bleak(cam: StubCamera):
@@ -52,6 +67,8 @@ def fake_bleak(cam: StubCamera):
                 cam.connect_fails -= 1
                 raise asyncio.TimeoutError()
             self.is_connected = True
+            cam.connects += 1
+            cam.sessions.append([])
 
         async def disconnect(self):
             self.is_connected = False
@@ -76,17 +93,23 @@ def fake_bleak(cam: StubCamera):
                 raise RuntimeError("disconnected")
             data = bytes(data)
             cam.writes.append((uuid[:8], data.hex()))
+            cam.sessions[-1].append((uuid[:8], data.hex()))
             if uuid == ble.CH_DLNA_UUID:
                 self._id_ok = data == cam.known
             elif uuid == ble.CH_FRIENDLY_NAME and not self._id_ok:
                 self._drop()                    # run A: HCI 0x13 right after the name write
                 raise RuntimeError("disconnected")
+            elif uuid == ble.CH_FRIENDLY_NAME and cam.clock_request:
+                asyncio.get_running_loop().call_later(0.01, self._notify, ble.CH_CLOCK_NOTIFY, b"\x01")
             elif uuid == ble.CH_WIFI_CMD:
                 if data == bytes([ble.WIFI_STA_SSID_SET]):
                     asyncio.get_running_loop().call_later(0.01, self._notify, ble.CH_WIFI_CMD_ACK, cam.ack)
             elif uuid == ble.CH_WIFI_START:
                 cmds = [int(h, 16) for u, h in cam.writes if u == ble.CH_WIFI_CMD[:8]]
-                cam.wifi_up = cmds[-len(cam.wifi_needs):] == cam.wifi_needs and data == b"\x03"
+                cam.wifi_up = (cmds[-len(cam.wifi_needs):] == cam.wifi_needs and data == b"\x03"
+                               and cam.start_ack != b"\x01")
+                if cam.start_ack is not None:
+                    asyncio.get_running_loop().call_later(0.01, self._notify, ble.CH_WIFI_START_ACK, cam.start_ack)
 
         async def read_gatt_char(self, uuid):
             if not self.is_connected or not self._id_ok:
@@ -105,15 +128,28 @@ class BleSessionTest(unittest.TestCase):
         self.reg.add("S5", client_uuid=PAIRED, ble={"home_ssid": "Home"})
         self.log = []
 
-    def wake(self, cam, **kw):
-        async def find(name=None, timeout=15.0):
-            return types.SimpleNamespace(name="S5-XXXXXX", address="ADDR")
+    def wake(self, cam, adv_states=(), **kw):
+        """adv_states: state bytes the camera advertises on successive scans
+        (the last one repeats); empty = not seen by the pre-wake scan."""
+        states = list(adv_states)
+        self.scans = 0
+
+        async def scan(timeout=8.0, name=None, stop_on_first=False, mfr_addr=None):
+            self.scans += 1
+            if not states:
+                return []
+            st = states.pop(0) if len(states) > 1 else states[0]
+            return [{"name": "S5-XXXXXX", "address": "ADDR%d" % self.scans, "rssi": -60,
+                     "mfr": "%02x0a0b0c0d0e" % st, "mfr_addr": "0a0b0c0d0e", "state_byte": st,
+                     "state": ble.ADV_STATES.get(st)}]
 
         async def wifi(ip, timeout):
             return 11.7 if cam.wifi_up else None
         with mock.patch.object(ble, "_bleak", lambda: fake_bleak(cam)), \
-                mock.patch.object(ble, "find", find), \
+                mock.patch.object(ble, "find", _find), \
+                mock.patch.object(ble, "scan", scan), \
                 mock.patch.object(ble, "wait_wifi", wifi), \
+                mock.patch.object(ble, "START_ACK_WAIT", 0.05), \
                 mock.patch.object(asyncio, "sleep", _fast_sleep):
             return asyncio.run(ble.wake(camera_ip="10.0.0.2", log=self.log.append, **kw))
 
@@ -123,11 +159,15 @@ class BleSessionTest(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["wifi_up_s"] is not None, True)
         seq = [u for u, _ in cam.writes]
-        self.assertEqual(seq, ["8d08a420", "cd7a71a0", "ead55e60", "18345be0", "0d6f1880", "0d6f1880", "e182ec40"])
+        # no unrequested clock write (ead55e60): I5/g.java:389-391
+        self.assertEqual(seq, ["8d08a420", "cd7a71a0", "18345be0", "0d6f1880", "0d6f1880", "e182ec40"])
         self.assertEqual([h for u, h in cam.writes if u in ("0d6f1880", "e182ec40")], ["03", "02", "03"])
         self.assertEqual(cam.writes[0][1], "4d454930010010008001" + PAIRED[-12:].lower())
-        self.assertEqual(cam.reads[:2], ["e206a5c0", "03e23a31"])   # reads only after the writes
+        # reads only after the writes, in K5/j.java:191-205 order
+        self.assertEqual(cam.reads[:3], ["03e23a31", "e206a5c0", "c97cf1a5"])
         self.assertTrue(any("notify 18345be1 00" in x for x in self.log), self.log)
+        self.assertTrue(all(x.startswith("ble.trace ") for x in self.log), self.log)
+        self.assertEqual(res["mode"], "single-session")     # camera not seen asleep by the pre-scan
         self.assertNotIn("7be5fd56", seq)
         self.assertTrue(self.reg.get(self.reg.active_id())["ble"]["registered_at"])
 
@@ -177,6 +217,116 @@ class BleSessionTest(unittest.TestCase):
         self.assertGreaterEqual(ble.CONNECT_TIMEOUT, 40)
         import inspect
         self.assertGreaterEqual(inspect.signature(ble.LumixBle).parameters["connect_tries"].default, 2)
+
+    def test_refusal_on_e182ec41_is_reported(self):
+        # e182ec41 = 01 -> ON_BT_CANNOT_REMOTE_WAKEUP (I5/g.java:497-509, HomeActivity.java:1097-1121)
+        cam = StubCamera(start_ack=b"\x01")
+        res = self.wake(cam, ssid="Home")
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["step"], "wifi")
+        self.assertTrue(res["refused"])
+        self.assertEqual(res["error"], "wifi: camera refused remote wake-up (camera state)")
+        self.assertIn("isn't busy", res["hint"])
+        self.assertIn([ble.CH_WIFI_START_ACK, "01"], [[u, h] for _, u, h in res["notifies"]])
+
+    def test_start_ack_ok_is_recorded(self):
+        cam = StubCamera(start_ack=b"\x00")
+        res = self.wake(cam, ssid="Home")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["wifi_start_result"], "00")
+
+    def test_clock_written_only_when_the_camera_asks(self):
+        # 4cf487c0 -> write clock (type 9), the only clock write in the app (I5/g.java:389-391)
+        cam = StubCamera(clock_request=True)
+        res = self.wake(cam, ssid="Home")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([u for u, _ in cam.writes].count("ead55e60"), 1)
+        self.assertTrue(any("notify 4cf487c0" in x for x in self.log), self.log)
+
+    def test_two_session_wake_from_sleep(self):
+        # sleep_pow_off_fast -> stage-1 login, wait for "wakeup", reconnect (HomeActivity.java:1230-1259)
+        cam = StubCamera()
+        res = self.wake(cam, adv_states=(6, 6, 2), ssid="Home")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["mode"], "two-session")
+        self.assertEqual(res["adv_state_before"], 6)
+        self.assertEqual(res["adv_state_after_wake"], 2)
+        self.assertEqual(cam.connects, 2)
+        first, second = cam.sessions
+        self.assertEqual([u for u, _ in first], ["8d08a420", "cd7a71a0"])     # login only
+        self.assertEqual([h for u, h in second if u in ("0d6f1880", "e182ec40")], ["03", "02", "03"])
+        self.assertIn("note", res)                           # _fast state: LUMIX Sync would use SoftAP
+        self.assertTrue(any("adv state 2 wakeup" in x for x in self.log), self.log)
+
+    def test_single_session_flag_keeps_one_connection(self):
+        cam = StubCamera()
+        res = self.wake(cam, adv_states=(6,), ssid="Home", single_session=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(cam.connects, 1)
+        self.assertEqual(res["mode"], "single-session")
+
+    def test_awake_camera_needs_one_session(self):
+        cam = StubCamera()
+        res = self.wake(cam, adv_states=(0,), ssid="Home")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(cam.connects, 1)
+
+    def test_legacy_baseline_keeps_the_old_bytes(self):
+        cam = StubCamera()
+        res = self.wake(cam, adv_states=(6,), ssid="Home", legacy=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["mode"], "legacy")
+        self.assertEqual([u for u, _ in cam.writes],
+                         ["8d08a420", "cd7a71a0", "ead55e60", "18345be0", "0d6f1880", "0d6f1880", "e182ec40"])
+        self.assertEqual(cam.reads[:2], ["e206a5c0", "03e23a31"])
+
+    def test_nonzero_ack_with_softap_writes_01(self):
+        # 18345be1 != 00 -> connect type 01 (I5/g.java:333-366, 471-480); only behind --softap
+        cam = StubCamera(ack=b"\x01")
+        async def go():
+            c = ble.LumixBle()
+            with mock.patch.object(ble, "_bleak", lambda: fake_bleak(cam)), \
+                    mock.patch.object(ble, "find", _find), mock.patch.object(ble, "START_ACK_WAIT", 0.05):
+                await c.connect()
+                await c.login()
+                await c.wifi_join("Home", softap=True)
+        asyncio.run(go())
+        self.assertEqual([h for u, h in cam.writes if u in ("0d6f1880", "e182ec40")], ["03", "01", "03"])
+
+    def test_softap_purpose_5_sequence(self):
+        # purpose 5: connect type 01, then e182ec40 = 05 (I5/g.java:936-967)
+        cam = StubCamera()
+        async def go():
+            c = ble.LumixBle()
+            with mock.patch.object(ble, "_bleak", lambda: fake_bleak(cam)), \
+                    mock.patch.object(ble, "find", _find), mock.patch.object(ble, "START_ACK_WAIT", 0.05):
+                await c.connect()
+                await c.login()
+                await c.wifi_join(purpose=ble.PURPOSE_SOFTAP, softap=True)
+                return c
+        c = asyncio.run(go())
+        self.assertEqual([(u, h) for u, h in cam.writes if u in ("0d6f1880", "e182ec40")],
+                         [("0d6f1880", "01"), ("e182ec40", "05")])
+        self.assertEqual(c._ap[0], "S5-XXXXXX")       # camera AP SSID kept for the join
+
+    def test_notify_retried_after_registration(self):
+        cam = StubCamera()
+        log = []
+        async def go():
+            c = ble.LumixBle(on_event=log.append)
+            with mock.patch.object(ble, "_bleak", lambda: fake_bleak(cam)), mock.patch.object(ble, "find", _find):
+                await c.connect()
+                await c.login()
+        asyncio.run(go())
+        self.assertTrue(any("notify subscriptions after registration: 0/10 on" in x for x in log), log)
+        self.assertTrue(any("notify e182ec41 still refused" in x for x in log), log)
+
+    def test_adv_match_uses_name_or_mfr_address(self):
+        m = bytes.fromhex("060a0b0c0d0e")
+        self.assertTrue(ble.adv_matches("S5-XXXXXX", m, "S5-XXXXXX", None))
+        self.assertTrue(ble.adv_matches("", m, "S5-XXXXXX", "0a0b0c0d0e"))    # rotated, nameless
+        self.assertFalse(ble.adv_matches("S5-YYYYYY", bytes.fromhex("06ffffffffff"), "S5-XXXXXX", "0a0b0c0d0e"))
+        self.assertTrue(ble.adv_matches("S5-YYYYYY", m, None, None))
 
     def test_nonzero_ack_is_reported_not_followed(self):
         cam = StubCamera(ack=b"\x01")
@@ -234,7 +384,10 @@ class FixtureReplayTest(unittest.TestCase):
 
         async def wifi(ip, timeout):
             return 1.0 if cam.wifi_up else None
+        async def scan(*a, **kw):
+            return []
         with mock.patch.object(ble, "_bleak", lambda: fake_bleak(cam)), mock.patch.object(ble, "find", _find), \
+                mock.patch.object(ble, "scan", scan), mock.patch.object(ble, "START_ACK_WAIT", 0.05), \
                 mock.patch.object(ble, "wait_wifi", wifi), mock.patch.object(asyncio, "sleep", _fast_sleep):
             res = asyncio.run(ble.wake(ssid="Home", camera_ip="10.0.0.2", log=lambda s: None))
         self.assertTrue(res["ok"], res)
@@ -268,7 +421,7 @@ async def _fast_sleep(delay, *a, **kw):
     return await _real_sleep(min(delay, 0.02), *a, **kw)
 
 
-async def _find(name=None, timeout=15.0):
+async def _find(name=None, timeout=15.0, **kw):
     return types.SimpleNamespace(name="S5-XXXXXX", address="ADDR")
 
 

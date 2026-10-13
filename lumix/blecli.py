@@ -7,7 +7,14 @@
   status               connect, read the info characteristics
   dump                 read every readable characteristic (JSON)
   wake / wifi-on       log in and ask the camera to start Wi-Fi (Via Network);
-                       powers the body up from OFF when Remote Wakeup is ON
+                       powers the body up from OFF when Remote Wakeup is ON.
+                       From a sleep state it first wakes the body with a short
+                       login, waits for the camera to advertise normal/wakeup,
+                       then reconnects (LUMIX Sync's two-session wake).
+                       --single-session  one connection (the old shape)
+                       --legacy          one connection, the old bytes (baseline)
+                       --softap          purpose 05: join the camera's own AP
+                                         (this Mac leaves the LAN while it runs)
   power-cycle          Wi-Fi poweroff -> wait -> BLE wake -> wait for :60606
 
 Every command prints one JSON object on stdout (progress goes to stderr), so
@@ -60,7 +67,12 @@ async def cmd_dump(a) -> Dict[str, Any]:
 
 
 async def cmd_wake(a) -> Dict[str, Any]:
-    return await ble.wake(a.name, ssid=a.ssid, wifi_wait=a.wifi_wait, camera_ip=a.camera_ip, log=_err)
+    res = await ble.wake(a.name, ssid=a.ssid, wifi_wait=a.wifi_wait, camera_ip=a.camera_ip, log=_err,
+                         purpose=a.purpose, sta=not a.no_sta, single_session=a.single_session,
+                         legacy=a.legacy, softap=a.softap, wifi_if=a.wifi_if)
+    if res.get("hint"):
+        _err("hint: %s" % res["hint"])
+    return res
 
 
 async def cmd_cycle(a) -> Dict[str, Any]:
@@ -84,6 +96,18 @@ def main() -> None:
         s.add_argument("--ssid", default=None, help="network to join (default: the camera's saved network, then LUMIX_HOME_SSID / ble.json)")
         s.add_argument("--camera-ip", default=None, help="expected camera IP (default: last known)")
         s.add_argument("--wifi-wait", type=float, default=90.0, help="seconds to wait for :60606")
+        if nm != "power-cycle":
+            s.add_argument("--purpose", type=int, default=ble.PURPOSE_REMOTE, help=argparse.SUPPRESS)
+            s.add_argument("--no-sta", action="store_true", help=argparse.SUPPRESS)
+            s.add_argument("--single-session", action="store_true",
+                           help="one BLE connection even from a sleep state (pre-2026-10-13 behaviour)")
+            s.add_argument("--legacy", action="store_true",
+                           help="baseline: single session with the old bytes (clock up front, old read order, "
+                                "no notify rediscovery)")
+            s.add_argument("--softap", action="store_true",
+                           help="purpose 05 + connect type 01 and join the camera's own access point; "
+                                "this Mac leaves the home LAN while it runs")
+            s.add_argument("--wifi-if", default="en0", help="Wi-Fi interface for --softap")
         if nm == "power-cycle":
             s.add_argument("--server", default="http://127.0.0.1:8770",
                            help="Lumix Remote server for the Wi-Fi poweroff ('' = talk to the camera directly)")

@@ -2,7 +2,9 @@
 
 GET  /api/ble/status         manager state, last results; ?probe=1 also scans + reads info over BLE
                              (a probe whose reads succeed records the pairing: "Check Bluetooth pairing")
-POST /api/ble/wake           BLE login + "start Wi-Fi via network" (powers up from OFF with Remote Wakeup ON)
+POST /api/ble/wake           BLE login + "start Wi-Fi via network" (powers up from OFF with Remote Wakeup ON);
+                             optional {"variant": "two-session"|"notify-only"|"baseline"} (WAKE_VARIANTS),
+                             used by tools/ble-wake-experiment.py so experiments share the lock and wake cap
 POST /api/ble/power-cycle    Wi-Fi camcmd poweroff -> wait -> BLE wake -> reconnect
 POST /api/ble/watchdog       {"enabled": true|false} toggle the watchdog at runtime
 POST /api/ble/register       first-time registration (camera on Bluetooth > SET > Pairing); the
@@ -56,6 +58,16 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_on(name: str) -> bool:
     return os.environ.get(name, "") in ("1", "true", "yes", "on")
+
+
+# lumix-ble wake flags per experiment variant (docs/ble-power-protocol.md section 8).
+# "two-session" is the default wake: from a sleep state, wake with one login,
+# wait for normal/wakeup, then reconnect for the Wi-Fi request.
+WAKE_VARIANTS: Dict[str, List[str]] = {
+    "two-session": [],
+    "notify-only": ["--single-session"],          # one session, notifications + e182ec41 handling
+    "baseline": ["--single-session", "--legacy"],  # the pre-2026-10-13 bytes
+}
 
 
 class BleManager:
@@ -194,16 +206,21 @@ class BleManager:
                     "and costs battery. Try again in %d s" % (len(self.wakes), self.wake_window // 60, wait))
         return None
 
-    async def wake(self) -> Dict[str, Any]:
+    async def wake(self, variant: Optional[str] = None) -> Dict[str, Any]:
+        if variant is not None and variant not in WAKE_VARIANTS:
+            raise ValueError("variant must be one of %s" % ", ".join(sorted(WAKE_VARIANTS)))
         why = self.wake_blocked()
         if why:
             return {"ok": False, "step": "limit", "error": why, "rate_limited": True}
         self.wakes.append(time.time())
-        args = ["wake"]
+        args = ["wake"] + WAKE_VARIANTS[variant or "two-session"]
         if self.cam.ip:
             args += ["--camera-ip", self.cam.ip]
-        # scan 30 s + connect 45 s, twice when the first link attempt fails, + 90 s for Wi-Fi
-        res = await self.run(*args, timeout=330)
+        # adv scan 10 s; stage 1: scan 30 s + connect 45 s x2, adv poll 40 s; stage 2:
+        # scan 20 s + connect 45 s x2; e182ec41 10 s; Wi-Fi 90 s
+        res = await self.run(*args, timeout=480)
+        if variant:
+            res["variant"] = variant
         if res.get("ok"):
             ip = res.get("ip") or None
             cam = self.cam
@@ -260,6 +277,8 @@ class BleManager:
         res["ok"] = bool(res["wake"].get("ok"))
         if not res["ok"]:
             res["error"] = res["wake"].get("error")
+            if res["wake"].get("refused"):
+                res["refused"], res["hint"] = True, res["wake"].get("hint")
         res["total_s"] = round(time.time() - t0, 1)
         return res
 
@@ -353,7 +372,11 @@ async def ble_wake(request: web.Request) -> web.Response:
     m = _m(request)
     if m.lock.locked():
         return _json({"error": "BLE busy (%s)" % m.running}, 409)
-    res = await m.wake()
+    b = await _body(request)
+    variant = b.get("variant") if isinstance(b, dict) else None
+    if variant is not None and variant not in WAKE_VARIANTS:
+        return _json({"error": "variant must be one of %s" % ", ".join(sorted(WAKE_VARIANTS))}, 400)
+    res = await m.wake(variant)
     return _json(res, 200 if res.get("ok") else 429 if res.get("rate_limited") else 502)
 
 
