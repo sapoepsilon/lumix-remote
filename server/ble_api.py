@@ -105,9 +105,24 @@ class BleManager:
         return os.environ.get("LUMIX_BLE_NAME") or None
 
     # ---------------------------------------------------------------- runner
+    async def btle_stuck(self) -> Optional[Dict[str, Any]]:
+        """A failure result when macOS's BTLEServer is stuck at ~100% CPU (two
+        `ps` samples 1 s apart), else None. Checked before anything touches the
+        radio, so a refused wake costs no battery and no wake-cap slot."""
+        from lumix import ble
+        try:
+            await ble.check_btle_server()
+        except ble.BtleServerStuck as e:
+            self.cam.log_event("warn", "Bluetooth refused: %s" % e)
+            return dict(ble.error_fields(e), ok=False)
+        return None
+
     async def run(self, *args: str, timeout: float = 240) -> Dict[str, Any]:
         if not os.access(BLE_BIN, os.X_OK):
             return {"ok": False, "error": "bin/lumix-ble missing"}
+        stuck = await self.btle_stuck()
+        if stuck:
+            return stuck
         name = self.name                 # (reloads the entry)
         was_registered = self.registered
         cmd = [BLE_BIN] + (["--name", name] if name else []) + list(args)
@@ -135,7 +150,15 @@ class BleManager:
                     out, _ = await asyncio.wait_for(
                         asyncio.gather(proc.stdout.read(), proc.wait()), timeout)  # type: ignore[union-attr]
                 except asyncio.TimeoutError:
-                    proc.kill()
+                    # SIGTERM first: lumix-ble then stops its scan and disconnects before
+                    # exiting. A SIGKILLed helper leaves CoreBluetooth to clean up after it.
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), 15)
+                    except asyncio.TimeoutError:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()
                     res: Dict[str, Any] = {"ok": False, "error": "timeout after %ds" % timeout}
                 else:
                     lines = [x for x in out.decode("utf-8", "replace").splitlines() if x.strip()]
@@ -212,6 +235,9 @@ class BleManager:
         why = self.wake_blocked()
         if why:
             return {"ok": False, "step": "limit", "error": why, "rate_limited": True}
+        stuck = await self.btle_stuck()
+        if stuck:
+            return stuck
         self.wakes.append(time.time())
         args = ["wake"] + WAKE_VARIANTS[variant or "two-session"]
         if self.cam.ip:
@@ -242,6 +268,9 @@ class BleManager:
         why = self.wake_blocked()
         if why:   # don't switch it off when the wake after that would be refused
             return dict(res, ok=False, step="limit", error=why, rate_limited=True)
+        stuck = await self.btle_stuck()
+        if stuck:   # before switching the camera off: the wake after that couldn't run
+            return dict(res, **stuck)
         if self.session is not None and getattr(self.session, "running", False):
             # same central path as a power-off: imports/timelapse paused, recording stopped
             with contextlib.suppress(Exception):

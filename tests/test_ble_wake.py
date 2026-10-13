@@ -328,7 +328,7 @@ class WakeUiWiringTest(unittest.TestCase):
         self.assertIn("unsure: !blePaired()", body)
         self.assertIn('fetch(cp("/api/ble/wake")', body)
         # ...or when lumix-ble says the camera doesn't know this computer's id
-        self.assertIn("wake.needPair = !wake.ok && (wake.unsure || !!(wake.data && wake.data.need_pair))", body)
+        self.assertIn("wake.needPair = !wake.ok && !btleStuck(wake.data, wake.error) && (wake.unsure || !!(wake.data && wake.data.need_pair))", body)
         self.assertIn("may not be paired", js)
         self.assertNotIn("Needs Bluetooth pairing first", js)
 

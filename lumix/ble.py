@@ -155,8 +155,68 @@ def error_fields(e: BaseException, step: Optional[str] = None) -> Dict[str, Any]
     if isinstance(e, BleRefused):
         out["refused"] = True
         out["hint"] = REFUSED_HINT
+    if isinstance(e, BtleServerStuck):
+        out["btle_stuck"] = True
     return out
 
+
+# ------------------------------------------------- macOS Bluetooth daemon guard
+# /usr/sbin/BTLEServer has twice stuck at ~100% CPU for hours after BLE wake
+# attempts, which kills a Bluetooth mouse. Never start (or keep poking) the radio
+# while it is in that state.
+BTLE_DAEMON = "BTLEServer"
+BTLE_CPU_LIMIT = 80.0          # percent; above this in both samples = stuck
+BTLE_SAMPLE_GAP = 1.0          # seconds between the two samples
+BTLE_STUCK_MESSAGE = ("macOS Bluetooth daemon (BTLEServer) is stuck at 100% CPU; "
+                      "run: sudo killall -9 BTLEServer")
+
+
+class BtleServerStuck(BleStepError):
+    """BTLEServer is above BTLE_CPU_LIMIT in two samples 1 s apart. The message
+    is the exact user-facing text (no "step:" prefix)."""
+
+    def __init__(self, message: str = BTLE_STUCK_MESSAGE):
+        RuntimeError.__init__(self, message)
+        self.step = "bluetooth"
+        self.need_pair = False
+        self.btle_stuck = True
+
+
+def btle_cpu() -> Optional[float]:
+    """Highest %CPU of any BTLEServer process (`ps -Ao pcpu,comm`); None when
+    it isn't running or ps can't be read (never blocks a BLE operation)."""
+    import subprocess
+    try:
+        out = subprocess.run(["ps", "-Ao", "pcpu,comm"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    best: Optional[float] = None
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or parts[1].rsplit("/", 1)[-1] != BTLE_DAEMON:
+            continue
+        try:
+            v = float(parts[0])
+        except ValueError:
+            continue
+        best = v if best is None else max(best, v)
+    return best
+
+
+async def check_btle_server(gap: float = BTLE_SAMPLE_GAP) -> None:
+    """Raise BtleServerStuck when BTLEServer's CPU is above 80% in two samples
+    ``gap`` s apart. A first sample at or under the limit already settles it, so
+    the usual cost is one `ps`. Call before any BLE scan or connect."""
+    if os.environ.get("LUMIX_BLE_SKIP_BTLE_CHECK") == "1":
+        return
+    loop = asyncio.get_running_loop()
+    first = await loop.run_in_executor(None, btle_cpu)
+    if first is None or first <= BTLE_CPU_LIMIT:
+        return
+    await asyncio.sleep(gap)
+    second = await loop.run_in_executor(None, btle_cpu)
+    if second is not None and second > BTLE_CPU_LIMIT:
+        raise BtleServerStuck()
 
 # G9II ("APS" bodies) answer constants from the Aikhjarto capture. Not used by
 # S5-generation bodies, which write the plain client UUID instead.
@@ -314,6 +374,45 @@ def current_ssid() -> Optional[str]:
 
 
 # ------------------------------------------------------------------ bleak
+SCAN_START_TIMEOUT = 15.0     # scanner.start() hung on a sick BTLEServer
+STOP_TIMEOUT = 8.0            # scanner.stop() / client.disconnect()
+
+# Every scanner/client this process has started and not yet stopped. release_all()
+# (end of each wake / lumix-ble command) stops whatever a failure path missed.
+_LIVE_SCANNERS: set = set()
+_LIVE_CLIENTS: set = set()
+
+
+async def _stop_scanner(scanner: Any) -> None:
+    try:
+        await asyncio.wait_for(scanner.stop(), STOP_TIMEOUT)
+    except BaseException as e:      # incl. a second cancel: the scan must still be forgotten
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        log.warning("scanner.stop failed: %s", describe(e))
+    finally:
+        _LIVE_SCANNERS.discard(scanner)
+
+
+async def _disconnect_client(client: Any) -> None:
+    try:
+        await asyncio.wait_for(client.disconnect(), STOP_TIMEOUT)
+    except BaseException as e:
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+        log.warning("client.disconnect failed: %s", describe(e))
+    finally:
+        _LIVE_CLIENTS.discard(client)
+
+
+async def release_all() -> None:
+    """Stop every scan and disconnect every client still registered."""
+    for sc in list(_LIVE_SCANNERS):
+        await _stop_scanner(sc)
+    for cl in list(_LIVE_CLIENTS):
+        await _disconnect_client(cl)
+
+
 def _bleak():
     import bleak  # noqa: F401  (imported lazily: needs Python >= 3.10 + pyobjc)
     return bleak
@@ -343,7 +442,9 @@ def adv_matches(n: str, mfr: Optional[bytes], name: Optional[str], mfr_addr: Opt
 
 async def scan(timeout: float = 8.0, name: Optional[str] = None,
                stop_on_first: bool = False, mfr_addr: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Advertising Lumix bodies: name, address, rssi, manufacturer data."""
+    """Advertising Lumix bodies: name, address, rssi, manufacturer data.
+    Refuses (BtleServerStuck) while macOS's BTLEServer is stuck at 100% CPU."""
+    await check_btle_server()
     bleak = _bleak()
     found: Dict[str, Dict[str, Any]] = {}
 
@@ -357,12 +458,21 @@ async def scan(timeout: float = 8.0, name: Optional[str] = None,
                               "mfr_addr": m[1:].hex() if m is not None and len(m) > 1 else None,
                               "state_byte": m[0] if m else None,
                               "state": ADV_STATES.get(m[0]) if m else None, "_dev": dev}
-    async with bleak.BleakScanner(cb):
+    scanner = bleak.BleakScanner(cb)
+    _LIVE_SCANNERS.add(scanner)
+    try:
+        try:
+            await asyncio.wait_for(scanner.start(), SCAN_START_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise BleStepError("scan", "Bluetooth scan didn't start within %.0f s" % SCAN_START_TIMEOUT)
         t0 = time.time()
         while time.time() - t0 < timeout:
             await asyncio.sleep(0.25)
             if stop_on_first and found:
                 break
+    finally:
+        # also on error and on cancellation (a wake timeout): never leave a scan running
+        await _stop_scanner(scanner)
     return list(found.values())
 
 
@@ -384,6 +494,8 @@ async def wait_state(name: Optional[str], mfr_addr: Optional[str], want: "frozen
     while time.time() - start < timeout:
         try:
             res = await scan(every, name, mfr_addr=mfr_addr)
+        except BtleServerStuck:
+            raise
         except Exception as e:
             log(trace_line("adv scan failed: %s" % describe(e), t0))
             res = []
@@ -442,6 +554,7 @@ class LumixBle:
         """Scan, then connect. A sleeping S5 (switch OFF, Remote Wakeup on)
         advertises slowly and takes 24-27 s to accept the link, so the connect
         timeout is long and one fresh scan + connect is retried."""
+        await check_btle_server()
         bleak = _bleak()
         last: Optional[BaseException] = None
         for attempt in range(1, self.connect_tries + 1):
@@ -459,14 +572,19 @@ class LumixBle:
                 self.disconnected.set()
             client = self.client = bleak.BleakClient(dev, disconnected_callback=on_disc,
                                                      timeout=self.connect_timeout)
+            _LIVE_CLIENTS.add(client)
             self.ev("state: connecting (try %d)" % attempt)
             try:
                 await client.connect()
-            except Exception as e:  # TimeoutError / BleakError
-                last = e
+            except BaseException as e:
+                # Cancellation (wake timeout) must also drop the half-open link, not just errors.
+                await _disconnect_client(client)
+                if not isinstance(e, Exception):
+                    raise
+                last = e            # TimeoutError / BleakError
                 self.ev("connect try %d failed: %s" % (attempt, describe(e)))
-                with contextlib.suppress(Exception):
-                    await client.disconnect()
+                if attempt < self.connect_tries:
+                    await check_btle_server()    # a failed connect is what wedges the daemon
                 continue
             self.ev("state: connected")
             return
@@ -474,12 +592,12 @@ class LumixBle:
                            % (describe(last) if last else "?", self.connect_tries, self.connect_timeout))
 
     async def close(self) -> None:
-        if self.client is not None and self.client.is_connected:
-            self.ev("state: closing")
-            try:
-                await self.client.disconnect()
-            except Exception:
-                pass
+        # Disconnect even when is_connected is False: a link that is still being
+        # set up (or half torn down) is not "connected" but is not released either.
+        if self.client is not None:
+            if self.client.is_connected:
+                self.ev("state: closing")
+            await _disconnect_client(self.client)
 
     # -- primitives
     async def read(self, uuid: str, timeout: float = 10.0) -> bytes:
@@ -838,6 +956,8 @@ async def pair(name: Optional[str] = None, wait: float = 300.0,
                 return {"ok": True, "tries": tries, "camera_ssid": _printable(ssid),
                         "initial_inform_len": len(key), "notifies": c.notes,
                         "elapsed_s": round(time.time() - t0, 1)}
+        except BtleServerStuck:
+            raise
         except Exception as e:
             last_err = "%s: %s" % (type(e).__name__, e)
             log("try %d: %s" % (tries, last_err))
@@ -910,9 +1030,11 @@ async def adv_snapshot(name: Optional[str] = None, timeout: float = 10.0,
                        log: Callable[[str], None] = print, t0: Optional[float] = None) -> Dict[str, Any]:
     """One scan before connecting: the advertised state byte (byte 2 of the
     0x003A manufacturer data) and the address bytes to re-find the camera.
-    {} when nothing was found; never raises."""
+    {} when nothing was found; raises only BtleServerStuck."""
     try:
         res = await scan(timeout, name, stop_on_first=True)
+    except BtleServerStuck:
+        raise
     except Exception as e:
         log(trace_line("adv scan failed: %s" % describe(e), t0))
         return {}
@@ -959,9 +1081,15 @@ async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait
 
     if legacy:
         single_session = True
-    # A sleeping S5 (state 6) advertises in ~10 s bursts about every 90 s
-    # (2026-10-13 12:19-12:21); a 10 s look misses it and drops to single-session.
-    adv = await adv_snapshot(name, ADV_SLEEP_GAP_S, log, t0)
+    try:
+        await check_btle_server()        # before the first scan, not after a failed connect
+        # A sleeping S5 (state 6) advertises in ~10 s bursts about every 90 s
+        # (2026-10-13 12:19-12:21); a 10 s look misses it and drops to single-session.
+        adv = await adv_snapshot(name, ADV_SLEEP_GAP_S, log, t0)
+    except BtleServerStuck as e:
+        out.update(error_fields(e))
+        tr("refused: %s" % out["error"])
+        return out
     state = adv.get("state_byte")
     mfr_addr = adv.get("mfr_addr")
     out["adv_state_before"] = state
@@ -1025,9 +1153,12 @@ async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait
         out.update(error_fields(e, step))
         tr("failed at %s: %s" % (step, out.get("error")))
     finally:
+        # Whatever happened (error, two connect timeouts, cancellation): no client
+        # left connecting/connected and no scan running.
         out["notifies"] = notes + c.notes
         with contextlib.suppress(Exception):
             await c.close()
+        await release_all()
     out["wifi_up_s"] = round(time.time() - t0, 1) if took is not None else None
     out["ok"] = took is not None
     if not out["ok"] and "error" not in out:
@@ -1188,8 +1319,8 @@ async def first_register(name: Optional[str] = None, wait: float = 300.0, wifi_i
         return out
     ap_ssid = None
     c = LumixBle(name, scan_timeout=20, on_event=log)
-    await c.connect()
     try:
+        await c.connect()
         await c.register(device_name)
         ap_ssid = _printable(await c.read(CH_CAMERA_SSID, 20))
         key = struct.unpack(">I", await c.read(CH_INITIAL_INFORM, 20))[0]
@@ -1221,6 +1352,7 @@ async def first_register(name: Optional[str] = None, wait: float = 300.0, wifi_i
             await c.close()
         except Exception:
             pass
+        await release_all()
         if ap_ssid:
             _sh("networksetup", "-removepreferredwirelessnetwork", wifi_if, ap_ssid)
             _sh("networksetup", "-setairportpower", wifi_if, "off")

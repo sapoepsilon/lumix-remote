@@ -80,6 +80,23 @@ async def cmd_cycle(a) -> Dict[str, Any]:
                                  wifi_wait=a.wifi_wait, ssid=a.ssid, log=_err)
 
 
+async def _run(a) -> Dict[str, Any]:
+    """Run one command as a task so SIGTERM/SIGINT (the server's timeout) cancel it
+    and the finally blocks stop the scan / disconnect the link before we exit."""
+    import signal
+    task = asyncio.ensure_future(a.fn(a))
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, task.cancel)
+        except (NotImplementedError, RuntimeError):
+            pass
+    try:
+        return await task
+    finally:
+        await ble.release_all()
+
+
 def main() -> None:
     p = argparse.ArgumentParser(prog="lumix-ble", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -118,13 +135,15 @@ def main() -> None:
     a = p.parse_args()
     t0 = time.time()
     try:
-        res = asyncio.run(a.fn(a))
-    except KeyboardInterrupt:
+        res = asyncio.run(_run(a))
+    except (KeyboardInterrupt, asyncio.CancelledError):
         res = {"ok": False, "error": "interrupted"}
     except Exception as e:
         res = {"ok": False}
         res.update(ble.error_fields(e))
     res.setdefault("elapsed_s", round(time.time() - t0, 1))
+    if res.get("btle_stuck"):
+        _err("error: %s" % res.get("error"))    # plain text for a terminal user, JSON follows
     _out(res)
     sys.exit(0 if res.get("ok") else 1)
 

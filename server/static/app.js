@@ -1410,6 +1410,7 @@ async function checkBlePairing(id) {
     const p = (d && d.probe) || {};
     if (r.ok && d && d.registered && p.registered) { haptic([8, 30, 8]); toast("Paired: this computer can turn the camera on over Bluetooth"); }
     else if (!r.ok || !d) toast(`Bluetooth check failed: server answered ${r.status}`, true);
+    else if (btleStuck(p, p.error)) toast(p.error, true);
     else if (p.advertising === false) toast("Camera not found over Bluetooth. Turn it on (or check its Bluetooth is on) and try again.", true);
     else toast("Not paired: " + (p.error || "the camera didn't accept this computer") + ". Pair it in Run setup again…", true);
   } catch (e) {
@@ -1993,11 +1994,19 @@ async function bleWake() {
   }
   clearInterval(wake.timer); wake.timer = null;
   wake.running = false; wake.secs = Math.round((Date.now() - wake.t0) / 1000);
-  wake.needPair = !wake.ok && (wake.unsure || !!(wake.data && wake.data.need_pair));
+  wake.needPair = !wake.ok && !btleStuck(wake.data, wake.error) && (wake.unsure || !!(wake.data && wake.data.need_pair));
   if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); }
+  else if (btleStuck(wake.data, wake.error)) toast(wake.error, true);
   else if (wake.data && wake.data.refused) toast("The camera refused remote wake-up; see the hint", true);
   else toast("Bluetooth wake failed: " + wake.error, true);
   renderWake();
+}
+
+// macOS's Bluetooth daemon (BTLEServer) stuck at ~100% CPU: the server refuses every Bluetooth
+// action until `sudo killall -9 BTLEServer` (it also freezes Bluetooth mice). The error text
+// carries the command; `btle_stuck` is set by lumix-ble, the text match covers the page-reopened path.
+function btleStuck(data, error) {
+  return !!((data && data.btle_stuck) || /BTLEServer/.test(error || ""));
 }
 
 // A wake started from a page that was closed since: show it running, then its result.
@@ -2050,6 +2059,10 @@ function renderWake() {
       box.replaceChildren(el("div", { class: "wake-head" }, el("span", { class: "spinner" }),
         el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. ${wake.secs} s so far.`
           + (wake.unsure ? " This computer may not be paired yet; trying anyway." : "")))));
+    } else if (btleStuck(wake.data, wake.error)) {
+      box.className = "wake-state callout bad";
+      box.replaceChildren(el("b", {}, "Bluetooth is stuck on this computer"),
+        el("span", {}, wake.error), wakeDetails());
     } else if (wake.data && wake.data.refused) {
       // e182ec41 = 01: the camera itself said no (LUMIX Sync: "cannot remote wakeup"); login worked, so not a pairing problem
       box.className = "wake-state callout warn";
