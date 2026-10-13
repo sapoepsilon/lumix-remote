@@ -312,7 +312,8 @@ async def capture(request: web.Request) -> web.Response:
 
 @_guard
 async def video_start(request: web.Request) -> web.Response:
-    return _json(await (await _shooting(request)).video(True))
+    with camera(request).video_starting():      # a stop sent now waits for this start
+        return _json(await (await _shooting(request)).video(True))
 
 
 @_guard

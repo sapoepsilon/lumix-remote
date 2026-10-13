@@ -773,8 +773,13 @@ class FileBrowser:
             if not publish:
                 raise
         except Exception as e:
-            job.state = "failed"
-            job.errors.append({"error": "%s: %s" % (type(e).__name__, e)})
+            if getattr(self.cam, "status", "ready") != "ready" and "not connected" in str(e):
+                # chaos seed 39 (tests/test_chaos.py ImportDuringReconnectTest): started
+                # or resumed while the camera (re)connects; wait for it, don't fail
+                job.state, job.paused_by, job.paused_at = "paused", "reconnect", time.time()
+            else:
+                job.state = "failed"
+                job.errors.append({"error": "%s: %s" % (type(e).__name__, e)})
         finally:
             job._pause_req = None
             job.current = None

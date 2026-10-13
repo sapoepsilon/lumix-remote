@@ -394,6 +394,11 @@ class Chaos:
             self.res.violations.append("server not ready %.0f s after the traffic stopped: %s (%s)"
                                        % (self.recover_s, cam.status, cam.status_msg))
         # give a running time-lapse a moment, then its state must not be failed
+        # a run the shutter started just now: give the session's watcher time to adopt it
+        end = time.monotonic() + 6.0
+        while time.monotonic() < end and rig.emu.interval.get("state") in ("rec", "pause") \
+                and not (rig.job() is not None and rig.job().state in ("running", "paused")):
+            await asyncio.sleep(0.2)
         j = rig.job()
         run = rig.emu.interval.get("state")
         if run in ("rec", "pause") and not (j is not None and j.state in ("running", "paused")
@@ -404,7 +409,7 @@ class Chaos:
             self.res.violations.append("time-lapse job failed: %s" % j.message)
         for jid, fj in rig.sess.files.jobs.items():
             if fj.state == "failed":
-                self.res.violations.append("import job %s failed: %s" % (jid, getattr(fj, "error", "")))
+                self.res.violations.append("import job %s failed: %s" % (jid, fj.errors[-1:] if fj.errors else ""))
 
     def check(self, rig: Rig) -> None:
         emu = rig.emu

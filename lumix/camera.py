@@ -23,7 +23,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Deque, Dict, List, Optional, Set
+from typing import Any, AsyncIterator, Callable, Deque, Dict, Iterator, List, Optional, Set
 
 from . import discovery, exposure, models
 from .events import EventListener
@@ -191,6 +191,13 @@ class Camera:
         self.wedge_hooks: List[Any] = []
         self._lv_running = False           # we sent startstream and have not stopped it
         self._lv_pending: Optional[str] = None   # live-view start requested by an event
+        self._lv_pending_after = 0.0             # ... not before this (monotonic)
+        self._last_recmode = ""                  # result of ensure_rec()'s last recmode
+        # video starts on their way (API handler or video(True)): a stop waits for
+        # them instead of answering "was not recording" from a stale getstate
+        self._video_starts = 0
+        self._video_started = asyncio.Event()
+        self._video_started.set()
         self._lv_backoff = 10.0
         self._busy_ended = False
         self._last_ok = time.monotonic()
@@ -1014,6 +1021,7 @@ class Camera:
         True when getstate says rec."""
         assert self.transport
         r = await self.cmd("camcmd", value="recmode", tries=self.RECMODE_TRIES)
+        self._last_recmode = r.result
         for _ in range(8):
             await asyncio.sleep(0.4)
             await self._refresh_state()
@@ -1124,6 +1132,15 @@ class Camera:
             self._lv_running = False
             self.log_event("warn", "live view start (%s): camera stays in %s"
                            % (reason, self.state.get("cammode")))
+            lim = getattr(self.transport, "limiter", None)
+            if self._last_recmode == RATE_LIMITED and lim is not None and self.liveview_wanted:
+                # withheld locally (never sent): run it once the cap allows instead
+                # of leaving the camera in the play mode we put it in (scenario 13,
+                # tests/test_chaos.py HeldBackRecmodeIsRetriedTest). A switch to
+                # play on the body clears this (_lv_pending = None on mod_Play).
+                self._lv_pending = "%s, after the mode-switch cap" % reason.split(", after")[0]
+                self._lv_pending_after = time.monotonic() + lim.wait_s() + 0.1
+                self.log_event("lv", "live view start retried in %.0f s (mode-switch cap)" % lim.wait_s())
             return False
         why = await self._wait_rec_settled()
         if why:
@@ -1296,7 +1313,8 @@ class Camera:
                 with contextlib.suppress(Busy):
                     await self._complete_readonly()
             if (self._lv_pending and not self._op_lock.locked()
-                    and time.monotonic() - self._lv_restart_at > 5):
+                    and time.monotonic() - self._lv_restart_at > 5
+                    and time.monotonic() >= self._lv_pending_after):
                 reason, self._lv_pending = self._lv_pending, None
                 if self.liveview_wanted:
                     try:
@@ -1453,6 +1471,7 @@ class Camera:
         async with self.exclusive("capture") as t:
             before = self.state.get("remaincapacity")
             self._check_usable()
+            await self._wait_card_write()
             r = await self.cmd("camcmd", value="capture", timeout=15)
             self.log_event("cmd", "capture -> %s" % r.result)
             # the camera needs a moment to write; watch remaincapacity / sd_access
@@ -1466,10 +1485,61 @@ class Camera:
             return {"result": r.result, "remain_before": before,
                     "remain_after": self.state.get("remaincapacity"), "count_changed": changed}
 
+    CARD_WRITE_WAIT_S = 8.0
+
+    async def _wait_card_write(self) -> None:
+        """Pace the shutter on the card write: while getstate says sd_access on,
+        the S5 answers a capture with err_busy (scenario 05: 6-9 of 10 presses in
+        5 s; tests/test_chaos.py ShutterBurstPacedOnCardWritesTest). Reads only."""
+        deadline = time.monotonic() + self.CARD_WRITE_WAIT_S
+        await self._refresh_state()
+        while self.state.get("sd_access") == "on" and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            await self._refresh_state()
+
+    CARD_WRITE_WAIT_S = 8.0
+
+    async def _wait_card_write(self) -> None:
+        """Pace the shutter on the card write: while getstate says sd_access on,
+        the S5 answers a capture with err_busy (scenario 05: 6-9 of 10 presses in
+        5 s; tests/test_chaos.py ShutterBurstPacedOnCardWritesTest). Reads only."""
+        deadline = time.monotonic() + self.CARD_WRITE_WAIT_S
+        await self._refresh_state()
+        while self.state.get("sd_access") == "on" and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            await self._refresh_state()
+
+    @contextlib.contextmanager
+    def video_starting(self) -> Iterator[None]:
+        """Mark a video start in flight (from the request, before any leave-Files
+        or lock wait), so a stop sent right after it waits for it."""
+        self._video_starts += 1
+        self._video_started.clear()
+        try:
+            yield
+        finally:
+            self._video_starts -= 1
+            if self._video_starts <= 0:
+                self._video_starts = 0
+                self._video_started.set()
+
     async def video(self, start: bool) -> Dict[str, Any]:
-        if not start and self.state.get("rec") == "off":
+        if start:
+            with self.video_starting():
+                return await self._video(True)
+        waited = False
+        if self._video_starts:
+            # scenario 07 (tests/test_chaos.py): start + stop sent together; the stop
+            # must land after the start, never before it
+            waited = True
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._video_started.wait(), 60)
+        if not waited and self.state.get("rec") == "off":
             # nothing to stop; the S5 answers err_reject to a stray video_recstop
             return {"result": "ok", "recording": False, "note": "was not recording"}
+        return await self._video(False)
+
+    async def _video(self, start: bool) -> Dict[str, Any]:
         async with self.exclusive("video") as t:
             if start:
                 self._check_usable()
