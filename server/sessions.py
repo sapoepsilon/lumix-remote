@@ -62,6 +62,7 @@ class CameraSession:
         self.ble = BleManager(self.cam, session=self)
         self.sources: Dict[str, Any] = {"wifi": self.cam.liveview}
         self.running = False
+        self._run_watch: Optional[asyncio.Task] = None
         # quiesce hooks (server/quiesce.py): files <-> shooting, reconnect resume
         self.files.on_enter = self._files_enter
         self.files.on_leave = self._files_leave
@@ -87,6 +88,35 @@ class CameraSession:
         from server import quiesce
         await quiesce.resume_after_reconnect(self)
 
+    # an interval run seen this long with no job here is adopted (not one ending
+    # right after a job's Stop, which getstate shows for a moment)
+    ADOPT_AFTER_S = 2.0
+
+    async def _watch_camera_runs(self) -> None:
+        """Adopt an in-camera interval run that starts while connected.
+
+        The S5 starts its own run for a shutter press in Time Lapse drive (the UI
+        shutter after a drive-mode quick control, or the body's button). Without a
+        job every command answered "stop the timelapse first" while
+        /api/timelapse/stop had nothing to stop (chaos seed 2,
+        tests/test_chaos.py). The reconnect hook already adopts such a run; this
+        does it as soon as getstate shows it. Nothing is sent to the camera."""
+        cam, tl = self.cam, self.timelapse
+        seen: Optional[float] = None
+        while True:
+            # polls local state only (getstate is the supervisor's); a plain sleep,
+            # not wait_for(queue): Python 3.9's wait_for can swallow the cancel
+            await asyncio.sleep(0.5)
+            if not cam.interval_running or cam.interval_owner is not None or tl.is_active():
+                seen = None
+                continue
+            now = asyncio.get_event_loop().time()
+            seen = seen if seen is not None else now
+            if now - seen >= self.ADOPT_AFTER_S:
+                with contextlib.suppress(Exception):
+                    tl.adopt_camera_run()
+                seen = None
+
     def reload(self) -> Dict[str, Any]:
         e = self.mgr.registry.get(self.id)
         if e is not None:
@@ -101,11 +131,17 @@ class CameraSession:
         self.files.start()
         self.ble.start()
         self.timelapse.start()
+        self._run_watch = asyncio.ensure_future(self._watch_camera_runs())
 
     async def stop(self) -> None:
         if not self.running:
             return
         self.running = False
+        if self._run_watch is not None:
+            self._run_watch.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._run_watch
+            self._run_watch = None
         for coro in (self.timelapse.shutdown(), self.ble.stop(), self.files.stop(), self.cam.stop()):
             with contextlib.suppress(Exception):
                 await coro

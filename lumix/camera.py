@@ -199,6 +199,9 @@ class Camera:
         # Address of the handshake in progress (None outside _connect): a
         # reconnect request for the same camera during it is already satisfied.
         self._connecting_ip: Optional[str] = None
+        # True between a handshake's SUBSCRIBE and the camera's mod_Play (or the
+        # settle timeout): the S5's own switch window, see _pre_send
+        self._settle_open = False
         # (type, value) of an accctrl request the camera is still researching:
         # stop() cancels it with req_acc_can, as LUMIX Sync does.
         self._acc_waiting: Optional[tuple] = None
@@ -320,10 +323,16 @@ class Camera:
           whether setsetting/startstream alone (no mode switch) harm a running run;
           they are withheld anyway.
         * startstream: only in a settled rec (``stream_blocked``).
+        * camcmd/stopstream: never between a handshake's SUBSCRIBE and its
+          settle (``_settle_open``; err_critical + wedge on the S5).
         getstate/getinfo/getsetting/accctrl/stopstream/camctrl (interval
         pause|restart|stop, touch) always pass. The mode-switch rate limit
         sits in CamTransport itself (``ModeSwitchLimiter``)."""
-        if mode == "camcmd" and value in MODE_SWITCHES:
+        if self._settle_open and mode in ("camcmd", "stopstream"):
+            # chaos seed 14 (tests/test_chaos.py): a recmode that was waiting for the
+            # mode-switch cap went out inside a reconnect's switch window -> wedge
+            why = "the camera is finishing the connection (its own switch after SUBSCRIBE)"
+        elif mode == "camcmd" and value in MODE_SWITCHES:
             why = await self.mode_switch_blocked()
         elif (mode == "camcmd" and value != "poweroff") or mode in ("setsetting", "startstream"):
             why = await self.interval_blocked()
@@ -657,10 +666,10 @@ class Camera:
             self.transport = CamTransport(
                 ip, user_agent=LUMIX_SYNC_UA, trace=self._trace, port=self.cfg.http_port,
                 guard=self._pre_send, trace_error=self._trace_error, refused=self._trace_refused,
-                limiter=ModeSwitchLimiter(self.MODE_SWITCH_MIN_GAP_S, self.MODE_SWITCH_MAX,
-                                          self.MODE_SWITCH_WINDOW_S))
+                limiter=self._mode_switch_limiter())
         t = self.transport
         self.liveview.camera_ip = ip
+        self._settle_open = False
         self.busy_streak = 0
         self.wedged, self.wedged_since, self.body_busy = False, None, False
         self._lv_running = False
@@ -754,6 +763,7 @@ class Camera:
             if not deferred:
                 self._set_status("connecting", "finishing the connection (the camera needs 5-30 s)")
             await self._settle_wait(left)
+        self._settle_open = False
         self.log_event("conn", "camera settled after SUBSCRIBE in %.1fs (%s)" % (
             time.monotonic() - sub_at, (q.settle_event or "settle") if self._mod_play.is_set() else "timeout"))
         await self._refresh_state(strict=True)
@@ -945,6 +955,10 @@ class Camera:
             if r.result == RATE_LIMITED and self.state.get("cammode") == "rec":
                 # never SUBSCRIBE in rec (the 21:24 trigger); connect again later
                 raise Disconnected("playmode before SUBSCRIBE withheld by the mode-switch rate limit")
+        # From the SUBSCRIBE to the settle (_full_setup) nothing but reads may reach
+        # the camera, also not from an operation that began before this (re)connect
+        # (_pre_send)
+        self._settle_open = True
         await self.listener.unsubscribe()
         try:
             sub = await self.listener.subscribe(ip)
@@ -1600,6 +1614,14 @@ class Camera:
         }
 
     # ----------------------------------------------------------- persistence
+    def _mode_switch_limiter(self) -> ModeSwitchLimiter:
+        """The transport's mode-switch cap, seeded with the switches an earlier
+        server process sent (a restart must not reset the camera's count)."""
+        lim = ModeSwitchLimiter(self.MODE_SWITCH_MIN_GAP_S, self.MODE_SWITCH_MAX, self.MODE_SWITCH_WINDOW_S)
+        lim.restore(self._load_state().get("mode_switches") or [])
+        lim.on_note = lambda: self._save_state(mode_switches=lim.export())
+        return lim
+
     def _load_state(self) -> Dict[str, Any]:
         try:
             return self.store.load()

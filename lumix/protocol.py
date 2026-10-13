@@ -117,6 +117,7 @@ class ModeSwitchLimiter:
         self.min_gap_s, self.max_n, self.window_s = min_gap_s, max_n, window_s
         self.clock = clock
         self.sent: List[float] = []
+        self.on_note: Optional[Callable[[], None]] = None
 
     def wait_s(self) -> float:
         """Seconds until a switch would be allowed (0 = now)."""
@@ -140,6 +141,30 @@ class ModeSwitchLimiter:
 
     def note(self) -> None:
         self.sent.append(self.clock())
+        if self.on_note is not None:
+            self.on_note()
+
+    # Persistence: the camera does not know the server restarted, so the history
+    # survives a restart (or a crash loop) as wall-clock times.
+    def export(self) -> List[float]:
+        """Wall-clock times of the switches that still count."""
+        self.wait_s()                                   # prunes old entries
+        now_m, now_w = self.clock(), time.time()
+        return [round(now_w - (now_m - t), 3) for t in self.sent]
+
+    def restore(self, wall_times: List[float]) -> None:
+        """Seed from export() of an earlier process (wall clock went back = now)."""
+        now_m, now_w = self.clock(), time.time()
+        keep = max(self.window_s, self.min_gap_s)
+        old = []
+        for w in wall_times or []:
+            try:
+                age = max(0.0, now_w - float(w))
+            except (TypeError, ValueError):
+                continue
+            if age < keep:
+                old.append(now_m - age)
+        self.sent = sorted(old + self.sent)
 
 
 class CamTransport:
