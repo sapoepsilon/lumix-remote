@@ -134,7 +134,55 @@ class HeldBackRecmodeIsRetriedTest(EmuTestCase):
             await r.wait(lambda: r.emu.cammode == "rec" and r.sess.cam._lv_running, 25,
                          "back in rec with live view once the cap allows")
             self.assertFalse(r.emu.wedged, r.emu.wedge_reason)
+            # the retried recmode counted against auto_rec()'s budget
+            self.assertEqual(len(r.sess.cam._auto_recmodes), 1)
         self.run_(go(), 60)
+
+    def _held_back(self, block):
+        """Restart until the recmode is held back by the cap, apply ``block``,
+        then check that the queued retry sends no recmode."""
+        r = self.rig
+
+        async def go():
+            await r.wait(lambda: r.emu.cammode == "rec" and r.sess.cam._lv_running, 10, "live view")
+            await r.stop_server()
+            await r.start_server()
+            cam = r.sess.cam
+            await r.wait(lambda: cam._lv_pending_cap is not None, 15, "recmode queued after the cap")
+            n = len([e for e in r.emu.log if "value=recmode" in e["q"]])
+            await block(cam)
+            await asyncio.sleep(10)                  # past the cap (8 s window)
+            self.assertEqual(len([e for e in r.emu.log if "value=recmode" in e["q"]]), n,
+                             "queued recmode sent although it must not")
+            self.assertIsNone(cam._lv_pending)
+            self.assertFalse(r.emu.wedged, r.emu.wedge_reason)
+        self.run_(go(), 60)
+
+    def test_queued_recmode_respects_the_auto_rec_budget(self):
+        async def used_up(cam):
+            now = time.monotonic()
+            cam._auto_recmodes.extend([now - 1] * cam.AUTO_REC_MAX)   # two this window
+        self._held_back(used_up)
+
+    def test_queued_recmode_never_fires_while_the_body_is_busy(self):
+        async def busy(cam):
+            self.rig.emu.body_action("busy")
+            await self.rig.wait(lambda: cam.body_busy, 5, "busy")
+        self._held_back(busy)
+
+    def test_queued_recmode_never_fires_into_an_interval_run(self):
+        async def interval(cam):
+            cam.interval_owner = "test"          # an in-camera run armed/running
+        self._held_back(interval)
+
+    def test_queued_recmode_dropped_when_the_camera_changes_mode_itself(self):
+        async def own_switch(cam):
+            # the camera moves on its own (no NOTIFY): auto_rec()'s case, not ours
+            self.rig.emu.set_mode("rec")
+            await self.rig.wait(lambda: cam.state.get("cammode") == "rec", 5, "rec seen")
+            self.rig.emu.set_mode("play")
+            await self.rig.wait(lambda: cam.state.get("cammode") == "play", 5, "play seen")
+        self._held_back(own_switch)
 
 
 class VideoStopRightAfterStartTest(EmuTestCase):
@@ -244,6 +292,62 @@ class ImportDuringReconnectTest(EmuTestCase):
             j = fb.jobs[job["id"]]
             self.assertEqual(j.state, "done", j.errors)
             self.assertEqual(len(j.saved), 2)
+        self.run_(go(), 90)
+
+
+class NoDoubleStopstreamTest(EmuTestCase):
+    """Chaos seed 98: at a server stop a live-view restart (quality toggle) and
+    the shutdown's stop_liveview both saw _lv_running and both sent stopstream;
+    the second one, with no stream, is err_critical on the S5. The flag is
+    cleared before the request goes out, so only one stop is sent."""
+
+    def test_restart_and_stop_together_send_one_stopstream(self):
+        r = self.rig
+
+        async def go():
+            cam = r.sess.cam
+            await r.wait(lambda: cam._lv_running, 10, "live view")
+            n = len([e for e in r.emu.log if "mode=stopstream" in e["q"]])
+            a = asyncio.ensure_future(cam.start_liveview("restart"))
+            await asyncio.sleep(0)
+            await cam.stop_liveview("server stop")
+            await a
+            stops = [e for e in r.emu.log if "mode=stopstream" in e["q"]][n:]
+            self.assertTrue(stops)
+            self.assertEqual([e["result"] for e in stops if e["result"] != "ok"], [])
+            self.assertFalse(r.emu.wedged, r.emu.wedge_reason)
+        self.run_(go(), 30)
+
+
+class SettleCountsFromTheSubscribeTest(EmuTestCase):
+    """Chaos seeds 206/207 (real timing, after the limiter history survived the
+    restart): the playmode before SUBSCRIBE waited 13 s for the mode-switch cap,
+    and the post-SUBSCRIBE settle (30 s) was counted from before that wait, so
+    the server stopped waiting 13 s early and its recmode landed inside the
+    camera's own switch window: err_critical, wedged. The settle now counts
+    from the SUBSCRIBE itself. Scaled: cap 2 per 6 s, settle 4 s, camera 3 s."""
+    cfg = chaos_harness.chaos_emu_cfg(settle_min=3.0, settle_max=3.2)
+    camera_timing = dict(chaos_harness.FAST_CAMERA, MODE_SWITCH_MIN_GAP_S=0.1, MODE_SWITCH_MAX=2,
+                         MODE_SWITCH_WINDOW_S=6.0, MODE_SWITCH_MAX_WAIT_S=7.0)
+
+    def test_playmode_waiting_for_the_cap_does_not_shorten_the_settle(self):
+        from unittest import mock
+        r = self.rig
+
+        async def go():
+            cam = r.sess.cam
+            p = mock.patch.object(cam.profile.connect, "settle_s", 4.0)
+            p.start()
+            self.addCleanup(p.stop)
+            await r.wait(lambda: cam._lv_running, 10, "live view")
+            await asyncio.sleep(6.5)                                  # cap empty again
+            st, d = await r.call("GET", "/api/files?limit=2")         # playmode
+            st, d = await r.call("POST", "/api/files/done")           # recmode: cap full
+            self.assertEqual(r.emu.cammode, "rec")
+            await r.call("POST", "/api/connection/reconnect", {})     # playmode waits ~6 s
+            await r.wait(lambda: cam.status != "ready", 10, "reconnecting")
+            await r.wait(lambda: cam.status == "ready", 40, "ready after the reconnect")
+            self.assertFalse(r.emu.wedged, r.emu.wedge_reason)
         self.run_(go(), 90)
 
 

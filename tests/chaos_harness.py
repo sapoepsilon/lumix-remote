@@ -81,7 +81,7 @@ class ChaosResult:
     def ok(self) -> bool:
         return not self.violations
 
-    def report(self, tail: int = 60) -> str:
+    def report(self, tail: int = 90) -> str:
         lines = ["seed %d: %s" % (self.seed, "OK" if self.ok else "%d violation(s)" % len(self.violations))]
         lines += ["  ! " + v for v in self.violations]
         if not self.ok:
@@ -141,6 +141,9 @@ class Chaos:
             if kind == "wedge":
                 self.wedges.append("%.2f %s" % (time.monotonic() - self.t0, what))
                 self.note("camera", "WEDGE " + what)
+                if rig.mgr is not None and rig.sess is not None:      # what the server did
+                    for e in list(rig.sess.cam.events)[-25:]:
+                        self.note("server", "%.2f %s %s" % (e["ts"] - self.wall0, e["kind"], e["text"][:150]))
             return orig(kind, what, result, ip)
         cam.record = record
 
@@ -408,7 +411,12 @@ class Chaos:
         if j is not None and j.state == "failed":
             self.res.violations.append("time-lapse job failed: %s" % j.message)
         for jid, fj in rig.sess.files.jobs.items():
-            if fj.state == "failed":
+            refused = (fj.files_total == 0 and fj.errors
+                       and str(fj.errors[-1].get("error", "")).startswith("ModeError: not switching"))
+            if refused:
+                # refused up front (recording, interval run): nothing was copied or lost
+                self.note("check", "import %s refused: %s" % (jid, fj.errors[-1]))
+            elif fj.state == "failed":
                 self.res.violations.append("import job %s failed: %s" % (jid, fj.errors[-1:] if fj.errors else ""))
 
     def check(self, rig: Rig) -> None:

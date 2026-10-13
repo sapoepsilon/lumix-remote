@@ -192,6 +192,7 @@ class Camera:
         self._lv_running = False           # we sent startstream and have not stopped it
         self._lv_pending: Optional[str] = None   # live-view start requested by an event
         self._lv_pending_after = 0.0             # ... not before this (monotonic)
+        self._lv_pending_cap: Optional[float] = None  # set: a cap-held recmode retry (scheduled at)
         self._last_recmode = ""                  # result of ensure_rec()'s last recmode
         # video starts on their way (API handler or video(True)): a stop waits for
         # them instead of answering "was not recording" from a stale getstate
@@ -209,6 +210,7 @@ class Camera:
         # True between a handshake's SUBSCRIBE and the camera's mod_Play (or the
         # settle timeout): the S5's own switch window, see _pre_send
         self._settle_open = False
+        self._subscribed_at = float("-inf")     # monotonic time of the handshake's SUBSCRIBE
         # (type, value) of an accctrl request the camera is still researching:
         # stop() cancels it with req_acc_can, as LUMIX Sync does.
         self._acc_waiting: Optional[tuple] = None
@@ -500,11 +502,11 @@ class Camera:
         await self._cancel_background()
         await self._cancel_access_request()
         if self.transport is not None:
-            if self._lv_running or not self.profile.connect.stopstream_only_if_running:
+            was_streaming, self._lv_running = self._lv_running, False   # before the await
+            if was_streaming or not self.profile.connect.stopstream_only_if_running:
                 # stopstream with no stream answers err_critical on the S5
                 with contextlib.suppress(Exception):
                     await self.transport.cgi("stopstream", timeout=2)
-            self._lv_running = False
             await self.transport.close()
         await self.listener.unsubscribe()
         await self.listener.stop()
@@ -747,6 +749,10 @@ class Camera:
         self._mod_play.clear()
         sub_at = time.monotonic()
         await self._subscribe_safely(ip)
+        # the camera's switch window opens at the SUBSCRIBE, not before the playmode
+        # (which may wait up to MODE_SWITCH_MAX_WAIT_S for the cap): chaos seeds
+        # 206/207, tests/test_chaos.py SettleCountsFromTheSubscribeTest
+        sub_at = max(sub_at, self._subscribed_at)
         await asyncio.sleep(0.2)
         # 4. read-only setup, as LUMIX Sync does it
         if q.raw_img_send:
@@ -966,6 +972,7 @@ class Camera:
         # the camera, also not from an operation that began before this (re)connect
         # (_pre_send)
         self._settle_open = True
+        self._subscribed_at = time.monotonic()
         await self.listener.unsubscribe()
         try:
             sub = await self.listener.subscribe(ip)
@@ -1105,6 +1112,26 @@ class Camera:
         await self._refresh_state()
         return "wait", "sent one recmode (%s); waiting for rec to settle" % r.result
 
+    def _cap_retry_blocked(self, scheduled_at: float) -> Optional[str]:
+        """Why a cap-held recmode retry (start_liveview) must not run now: the
+        camera changed mode since (a drop to play on its own is auto_rec()'s to
+        handle: 20 s reads, one recmode per drop, AUTO_REC_MAX per window), it is
+        busy / in an interval run / wedged, or auto_rec()'s budget is used up."""
+        if self.state.get("cammode") == "rec":
+            return None if not self._lv_running else "camera already in rec"
+        if self._mode_changed_at > scheduled_at:
+            return "the camera changed mode on its own since"
+        if self.body_busy or self.wedged or self.interval_active or self.readonly:
+            return "camera busy, wedged or mid-operation"
+        why = self.mid_operation()
+        if why:
+            return why
+        now = time.monotonic()
+        recent = [t for t in self._auto_recmodes if now - t < self.AUTO_REC_WINDOW_S]
+        if len(recent) >= self.AUTO_REC_MAX:
+            return "%d automatic recmodes in the last %.0f min" % (len(recent), self.AUTO_REC_WINDOW_S / 60)
+        return None
+
     async def start_liveview(self, reason: str) -> bool:
         """LUMIX Sync's live-view start, run once per lifecycle event:
         stopstream -> recmode -> startstream (each 5 x 1 s on err_busy)."""
@@ -1122,7 +1149,10 @@ class Camera:
             return False
         q = self.profile.connect
         if self._lv_running or not q.stopstream_only_if_running:
-            # stopstream with no stream running answers err_critical on the S5
+            # stopstream with no stream running answers err_critical on the S5;
+            # clear the flag first so a concurrent stop_liveview() can't send a
+            # second one (chaos seed 98, tests/test_chaos.py NoDoubleStopstreamTest)
+            self._lv_running = False
             await self.cmd("stopstream")
         await self._refresh_state()
         # recmode only when needed: every recmode makes the camera echo
@@ -1140,6 +1170,7 @@ class Camera:
                 # play on the body clears this (_lv_pending = None on mod_Play).
                 self._lv_pending = "%s, after the mode-switch cap" % reason.split(", after")[0]
                 self._lv_pending_after = time.monotonic() + lim.wait_s() + 0.1
+                self._lv_pending_cap = time.monotonic()
                 self.log_event("lv", "live view start retried in %.0f s (mode-switch cap)" % lim.wait_s())
             return False
         why = await self._wait_rec_settled()
@@ -1316,7 +1347,14 @@ class Camera:
                     and time.monotonic() - self._lv_restart_at > 5
                     and time.monotonic() >= self._lv_pending_after):
                 reason, self._lv_pending = self._lv_pending, None
-                if self.liveview_wanted:
+                cap_retry, self._lv_pending_cap = self._lv_pending_cap, None
+                drop = self._cap_retry_blocked(cap_retry) if cap_retry is not None else None
+                if drop:
+                    self.log_event("lv", "queued recmode (%s) dropped: %s" % (reason, drop))
+                elif self.liveview_wanted:
+                    if cap_retry is not None:
+                        # counts against auto_rec()'s budget like its own recmode
+                        self._auto_recmodes.append(time.monotonic())
                     try:
                         async with self.exclusive("liveview"):
                             await self.start_liveview(reason)
@@ -1403,10 +1441,12 @@ class Camera:
                     self._busy_ended = False
                     if self.liveview_wanted:
                         self._lv_pending = "lens_Atta after camera use"
+                        self._lv_pending_cap = None
                 self.body_busy = False
                 self.bus.publish("status", self.status_dict())
             elif value == "mod_Play":
                 self._lv_pending = None   # never pull the camera back to rec
+                self._lv_pending_cap = None
                 self._lv_running = False
                 self._mod_play.set()
             # mod_Play: ignored on purpose (never pull the camera back to rec)
@@ -1503,18 +1543,6 @@ class Camera:
                     break
             return {"result": r.result, "remain_before": before,
                     "remain_after": self.state.get("remaincapacity"), "count_changed": changed}
-
-    CARD_WRITE_WAIT_S = 8.0
-
-    async def _wait_card_write(self) -> None:
-        """Pace the shutter on the card write: while getstate says sd_access on,
-        the S5 answers a capture with err_busy (scenario 05: 6-9 of 10 presses in
-        5 s; tests/test_chaos.py ShutterBurstPacedOnCardWritesTest). Reads only."""
-        deadline = time.monotonic() + self.CARD_WRITE_WAIT_S
-        await self._refresh_state()
-        while self.state.get("sd_access") == "on" and time.monotonic() < deadline:
-            await asyncio.sleep(0.2)
-            await self._refresh_state()
 
     CARD_WRITE_WAIT_S = 8.0
 
