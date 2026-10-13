@@ -22,11 +22,15 @@ lumix-ble helper logs each step as "ble.trace" lines in /tmp/lumix-server.log.
 Needs a server started after this change (the variant field is new).
 
 Meanwhile it only listens and looks:
+  - before the wake, up to ble.ADV_SLEEP_GAP_S (100 s) for the advertised state:
+    a sleeping S5 (state 6) only advertises in ~10 s bursts about every 88 s;
   - advertised state byte every 2 s (passive BLE scan, no connection);
   - macOS Wi-Fi scan for the camera's own access point (S5-xxxxxx) with
     `system_profiler -json SPAirPortDataType`. Without Location permission macOS
-    redacts SSIDs there, so the tool also records networks that appear during
-    the wake by channel/PHY/security (other networks' names are never stored);
+    redacts SSIDs there. Unnamed networks that appear by channel/PHY/security are
+    logged as "fingerprint_churn" only: in both real runs that was neighbouring
+    networks, not the camera, so it is no longer a signal (other networks' names
+    are never stored);
   - the camera on the LAN: TCP connect to <camera ip>:60606 and the ARP cache
     (`arp -n`, no packets sent). Only the configured camera IP is contacted.
 
@@ -186,12 +190,13 @@ async def wifi_loop(rec: Recorder, base: "collections.Counter[str]", stop: async
         if "error" in w:
             rec.add("wifi-error", error=w["error"])
         else:
-            new = list((collections.Counter(w["fingerprints"]) - base).elements())
-            rec.add("wifi", n=w["n"], redacted=w["redacted"], camera_ssids=w["camera_ssids"], new=new)
+            # Neighbour churn, not the camera AP (2026-10-13: fired at ~35 s in both
+            # runs, including one that never connected). Logged, never summarised.
+            churn = list((collections.Counter(w["fingerprints"]) - base).elements())
+            rec.add("wifi", n=w["n"], redacted=w["redacted"], camera_ssids=w["camera_ssids"],
+                    fingerprint_churn=churn)
             if w["camera_ssids"]:
                 rec.mark("camera_ap_seen")
-            if new:
-                rec.mark("new_wifi_network")
         await _pause(stop, every - (time.time() - t))
 
 
@@ -245,7 +250,8 @@ async def run(a: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
     tasks = []
     mfr_addr = None
     if not a.no_adv:
-        snap = await ble.adv_snapshot(name, 6.0, log=lambda s: print(s, file=sys.stderr), t0=rec.t0)
+        # Same window as the server's own pre-scan: a 6 s look missed state 6 twice.
+        snap = await ble.adv_snapshot(name, ble.ADV_SLEEP_GAP_S, log=lambda s: print(s, file=sys.stderr), t0=rec.t0)
         mfr_addr = snap.get("mfr_addr")
         out["adv_state_before"] = snap.get("state_byte")
         tasks.append(asyncio.ensure_future(adv_loop(rec, name, mfr_addr, stop)))
@@ -284,7 +290,6 @@ async def run(a: argparse.Namespace) -> Tuple[int, Dict[str, Any]]:
             "adv_state_after_wake": res.get("adv_state_after_wake"),
             "wifi_start_result": res.get("wifi_start_result"),
             "camera_ap_seen_s": rec.first.get("camera_ap_seen"),
-            "new_wifi_network_s": rec.first.get("new_wifi_network"),
             "lan_60606_up_s": rec.first.get("lan_60606_up"),
         },
     })

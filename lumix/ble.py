@@ -441,8 +441,11 @@ def adv_matches(n: str, mfr: Optional[bytes], name: Optional[str], mfr_addr: Opt
 
 
 async def scan(timeout: float = 8.0, name: Optional[str] = None,
-               stop_on_first: bool = False, mfr_addr: Optional[str] = None) -> List[Dict[str, Any]]:
+               stop_on_first: bool = False, mfr_addr: Optional[str] = None,
+               stop_on_state: bool = False) -> List[Dict[str, Any]]:
     """Advertising Lumix bodies: name, address, rssi, manufacturer data.
+    ``stop_on_state``: stop at the first match that carries a state byte (an
+    advertisement without manufacturer data doesn't count).
     Refuses (BtleServerStuck) while macOS's BTLEServer is stuck at 100% CPU."""
     await check_btle_server()
     bleak = _bleak()
@@ -469,6 +472,8 @@ async def scan(timeout: float = 8.0, name: Optional[str] = None,
         while time.time() - t0 < timeout:
             await asyncio.sleep(0.25)
             if stop_on_first and found:
+                break
+            if stop_on_state and any(f["state_byte"] is not None for f in found.values()):
                 break
     finally:
         # also on error and on cancellation (a wake timeout): never leave a scan running
@@ -884,6 +889,13 @@ class LumixBle:
         return await self._start_result(start_ack_wait)
 
     async def _start_result(self, wait: float) -> Optional[bytes]:
+        if not self.subscribed:
+            # macOS refuses every notify on the real S5 ("attribute not found",
+            # docs/ble-power-protocol.md section 8): e182ec41 can't arrive, so
+            # waiting only costs time and a refusal (01) can't be seen.
+            self.ev("wifi start result: not awaited (0 notify subscriptions on this host, so a "
+                    "refusal can't be observed)")
+            return None
         res = await self.wait_start_ack(wait)
         self.ev("wifi start result: %s" % (res.hex() if res is not None else
                                            "none in %.0f s%s" % (wait, " (link lost)" if self.disconnected.is_set()
@@ -1030,9 +1042,12 @@ async def adv_snapshot(name: Optional[str] = None, timeout: float = 10.0,
                        log: Callable[[str], None] = print, t0: Optional[float] = None) -> Dict[str, Any]:
     """One scan before connecting: the advertised state byte (byte 2 of the
     0x003A manufacturer data) and the address bytes to re-find the camera.
-    {} when nothing was found; raises only BtleServerStuck."""
+    Keeps scanning for up to ``timeout`` s until an advertisement carries the
+    state byte (one without manufacturer data doesn't end the scan); returns
+    the last match without a state when none did. {} when nothing was found;
+    raises only BtleServerStuck."""
     try:
-        res = await scan(timeout, name, stop_on_first=True)
+        res = await scan(timeout, name, stop_on_state=True)
     except BtleServerStuck:
         raise
     except Exception as e:
@@ -1041,7 +1056,8 @@ async def adv_snapshot(name: Optional[str] = None, timeout: float = 10.0,
     if not res:
         log(trace_line("adv: camera not advertising (%s)" % (name or "any Lumix"), t0))
         return {}
-    adv = {k: v for k, v in res[0].items() if k != "_dev"}
+    best = next((r for r in res if r.get("state_byte") is not None), res[0])
+    adv = {k: v for k, v in best.items() if k != "_dev"}
     log(trace_line("adv state %s %s (mfr %s)" % (adv.get("state_byte"), adv.get("state"), adv.get("mfr")), t0))
     return adv
 
@@ -1094,7 +1110,15 @@ async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait
     mfr_addr = adv.get("mfr_addr")
     out["adv_state_before"] = state
     out["adv_state_name_before"] = adv.get("state")
-    two = (not single_session) and state in SLEEP_STATES
+    # No state after a full ADV_SLEEP_GAP_S look: assume asleep. Two-session is
+    # safe for an awake camera too: stage 1 is a plain connect + login + close
+    # (no Wi-Fi or power write), and wait_state() returns on the first 1 s scan
+    # that shows 0/2, so an awake body costs one extra connection.
+    two = (not single_session) and (state in SLEEP_STATES or state is None)
+    if two and state is None:
+        tr("WARNING: no advertised state after %.0f s; using two-session anyway (safe if the camera is "
+           "awake, one extra connection)" % ADV_SLEEP_GAP_S)
+        out["note_state"] = "no advertised state seen; two-session used anyway"
     out["mode"] = "legacy" if legacy else "two-session" if two else "single-session"
     if softap:
         out["mode"] += "+softap"

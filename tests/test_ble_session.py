@@ -39,13 +39,14 @@ class StubCamera:
     """GATT behaviour of the S5 as seen from bleak."""
 
     def __init__(self, known_id=PAIRED, connect_fails=0, ack=b"\x00", wifi_needs=(3, 2),
-                 start_ack=None, clock_request=False):
+                 start_ack=None, clock_request=False, notify_ok=False):
         self.known = bytes.fromhex(known_id.replace("-", ""))
         self.connect_fails = connect_fails
         self.ack = ack
         self.wifi_needs = list(wifi_needs)      # 0d6f1880 values a join needs, in order
         self.start_ack = start_ack              # e182ec41 after e182ec40 (None: never sent, as on macOS so far)
         self.clock_request = clock_request      # 4cf487c0 after registration
+        self.notify_ok = notify_ok              # start_notify succeeds (a host that sees the CCCDs)
         self.writes = []                        # (short uuid, hex)
         self.reads = []
         self.wifi_up = False
@@ -81,7 +82,8 @@ def fake_bleak(cam: StubCamera):
         async def start_notify(self, uuid, cb):
             # macOS finds no CCCDs on the S5, but the camera notifies anyway
             self._cbs[uuid] = cb
-            raise RuntimeError("attribute not found")
+            if not cam.notify_ok:
+                raise RuntimeError("attribute not found")
 
         def _notify(self, uuid, data):
             for u, cb in self._cbs.items():
@@ -128,13 +130,14 @@ class BleSessionTest(unittest.TestCase):
         self.reg.add("S5", client_uuid=PAIRED, ble={"home_ssid": "Home"})
         self.log = []
 
-    def wake(self, cam, adv_states=(), **kw):
+    def wake(self, cam, adv_states=(0,), **kw):
         """adv_states: state bytes the camera advertises on successive scans
-        (the last one repeats); empty = not seen by the pre-wake scan."""
+        (the last one repeats); empty = not seen by the pre-wake scan.
+        Default: awake (0 normal)."""
         states = list(adv_states)
         self.scans = 0
 
-        async def scan(timeout=8.0, name=None, stop_on_first=False, mfr_addr=None):
+        async def scan(timeout=8.0, name=None, stop_on_first=False, mfr_addr=None, stop_on_state=False):
             self.scans += 1
             if not states:
                 return []
@@ -167,7 +170,7 @@ class BleSessionTest(unittest.TestCase):
         self.assertEqual(cam.reads[:3], ["03e23a31", "e206a5c0", "c97cf1a5"])
         self.assertTrue(any("notify 18345be1 00" in x for x in self.log), self.log)
         self.assertTrue(all(x.startswith("ble.trace ") for x in self.log), self.log)
-        self.assertEqual(res["mode"], "single-session")     # camera not seen asleep by the pre-scan
+        self.assertEqual(res["mode"], "single-session")     # awake (adv state 0): one connection
         self.assertNotIn("7be5fd56", seq)
         self.assertTrue(self.reg.get(self.reg.active_id())["ble"]["registered_at"])
 
@@ -220,7 +223,7 @@ class BleSessionTest(unittest.TestCase):
 
     def test_refusal_on_e182ec41_is_reported(self):
         # e182ec41 = 01 -> ON_BT_CANNOT_REMOTE_WAKEUP (I5/g.java:497-509, HomeActivity.java:1097-1121)
-        cam = StubCamera(start_ack=b"\x01")
+        cam = StubCamera(start_ack=b"\x01", notify_ok=True)
         res = self.wake(cam, ssid="Home")
         self.assertFalse(res["ok"])
         self.assertEqual(res["step"], "wifi")
@@ -230,10 +233,47 @@ class BleSessionTest(unittest.TestCase):
         self.assertIn([ble.CH_WIFI_START_ACK, "01"], [[u, h] for _, u, h in res["notifies"]])
 
     def test_start_ack_ok_is_recorded(self):
-        cam = StubCamera(start_ack=b"\x00")
+        cam = StubCamera(start_ack=b"\x00", notify_ok=True)
         res = self.wake(cam, ssid="Home")
         self.assertTrue(res["ok"], res)
         self.assertEqual(res["wifi_start_result"], "00")
+
+    def test_start_ack_not_awaited_without_subscriptions(self):
+        # Real S5 on macOS: all 10 start_notify calls fail, so e182ec41 can't be
+        # seen; don't spend START_ACK_WAIT on it and say so.
+        cam = StubCamera(start_ack=b"\x01")    # would refuse, but this host can't observe it
+        res = self.wake(cam, ssid="Home")
+        self.assertEqual(res["notify_on"], 0)
+        self.assertIsNone(res["wifi_start_result"])
+        self.assertNotIn("refused", res)
+        self.assertTrue(any("refusal can't be observed" in x for x in self.log), self.log)
+        self.assertFalse(any("wifi start result: none in" in x for x in self.log), self.log)
+
+    def test_snapshot_waits_for_a_state_byte(self):
+        # An advertisement without manufacturer data must not end the pre-scan.
+        calls = []
+
+        async def scan(timeout=8.0, name=None, **kw):
+            calls.append((timeout, kw))
+            return [{"name": "S5-XXXXXX", "address": "A", "state_byte": None, "mfr_addr": None, "_dev": 1},
+                    {"name": "S5-XXXXXX", "address": "B", "state_byte": 6, "state": "sleep_pow_off_fast",
+                     "mfr_addr": "0a0b", "_dev": 2}]
+        with mock.patch.object(ble, "scan", scan):
+            adv = asyncio.run(ble.adv_snapshot("S5-XXXXXX", ble.ADV_SLEEP_GAP_S, log=self.log.append))
+        self.assertEqual(calls, [(ble.ADV_SLEEP_GAP_S, {"stop_on_state": True})])
+        self.assertEqual(adv["state_byte"], 6)
+        self.assertNotIn("_dev", adv)
+
+    def test_unknown_state_still_uses_two_sessions(self):
+        # Pre-scan saw nothing for ADV_SLEEP_GAP_S: two-session anyway, loudly.
+        cam = StubCamera()
+        res = self.wake(cam, adv_states=(), ssid="Home", wake_wait=0.1)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["mode"], "two-session")
+        self.assertIsNone(res["adv_state_before"])
+        self.assertEqual(cam.connects, 2)
+        self.assertEqual([u for u, _ in cam.sessions[0]], ["8d08a420", "cd7a71a0"])     # login only
+        self.assertTrue(any("WARNING: no advertised state" in x for x in self.log), self.log)
 
     def test_clock_written_only_when_the_camera_asks(self):
         # 4cf487c0 -> write clock (type 9), the only clock write in the app (I5/g.java:389-391)
@@ -385,7 +425,8 @@ class FixtureReplayTest(unittest.TestCase):
         async def wifi(ip, timeout):
             return 1.0 if cam.wifi_up else None
         async def scan(*a, **kw):
-            return []
+            return [{"name": "S5-XXXXXX", "address": "ADDR", "rssi": -60, "mfr": "000a0b0c0d0e",
+                     "mfr_addr": "0a0b0c0d0e", "state_byte": 0, "state": ble.ADV_STATES.get(0)}]
         with mock.patch.object(ble, "_bleak", lambda: fake_bleak(cam)), mock.patch.object(ble, "find", _find), \
                 mock.patch.object(ble, "scan", scan), mock.patch.object(ble, "START_ACK_WAIT", 0.05), \
                 mock.patch.object(ble, "wait_wifi", wifi), mock.patch.object(asyncio, "sleep", _fast_sleep):

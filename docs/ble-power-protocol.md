@@ -341,19 +341,26 @@ Run against the real S5 on 2026-10-13 12:19-12:27 with `tools/ble-wake-experimen
 | Server wake takes `{"variant": "two-session"\|"notify-only"\|"baseline"}`; default is two-session; timeout 480 s | `server/ble_api.py` | — | **yes**: `POST /api/ble/wake {"variant": "two-session"}` → HTTP 200, `mode two-session`; the cap counted both runs (`recent` 0 → 1 → 2). Afterwards one connect: `waiting_approval` 12:26:11 → `ready S5-XXXXXX connected` 12:26:53, a single handshake; one `POST /api/capture` → `count_changed: true`, 1844 → 1843. Camera left connected |
 | `wake`: snapshot and stage-1 connect scan wait up to 100 s (`ADV_SLEEP_GAP_S`) for a sleeping camera's next advertising burst | `ble.wake` | [S5] 2026-10-13 12:19-12:21 | **yes** (run 2) |
 
+### Follow-ups after the real run (2026-10-13, unit-tested, not yet re-run on the camera)
+
+- `wifi_join`: when no notify subscription succeeded (0/10 on macOS), the 10 s `e182ec41` wait is skipped and logged as `wifi start result: not awaited (0 notify subscriptions on this host, so a refusal can't be observed)`. A host whose subscriptions work still waits and still raises `BleRefused` on `01`.
+- Pre-scan: `adv_snapshot` keeps scanning for up to `ADV_SLEEP_GAP_S` until an advertisement carries the state byte. If the state is still None, `wake` uses two-session anyway and logs `WARNING: no advertised state ...` (result field `note_state`). That is safe for an awake camera: stage 1 is connect + login + close with no Wi-Fi or power write (the same login a single-session wake does first), and `wait_state` returns on the first ~1 s scan that shows 0/2, so an awake body costs one extra connection.
+- UI: the wake progress text says it can take up to ~3 minutes (run 2 took 168 s).
+
 ### Experiment tool
 
 `tools/ble-wake-experiment.py --variant baseline|two-session|notify-only` (run with `.venv-ble/bin/python`).
 
 - **BLE link: through the server.** The tool never connects to the camera itself. It calls `POST /api/ble/wake` with the variant, so it shares the server's BLE lock and the same in-memory wake cap (2 per 10 min) as the UI and watchdog. It refuses to start when the server is unreachable, its BLE worker is busy, or the cap is used up. A restarted server starts with an empty cap.
 - While the wake runs it logs the adv state every 2 s (passive scan), runs `system_profiler -json SPAirPortDataType` about every 5 s, and checks the camera on the LAN (TCP 60606 on the configured camera IP, `arp -n` from the cache; no other host is contacted).
-- Wi-Fi scan limits: without Location permission macOS shows `<redacted>` for every SSID, so an `S5-…` match only works when that permission exists. The tool also records networks that appear during the wake by channel/PHY/security as a fallback. Other networks' names are never stored.
+- Before the wake it scans up to `ADV_SLEEP_GAP_S` (100 s) for the advertised state, the same window as the server's pre-scan.
+- Wi-Fi scan limits: without Location permission macOS shows `<redacted>` for every SSID, so an `S5-…` match only works when that permission exists. Networks that appear during the wake by channel/PHY/security are logged per scan as `fingerprint_churn` but are not a signal (see below) and are not in the summary. Other networks' names are never stored.
 - Result: `logs/ble-experiments/<time>-<variant>.json` (gitignored); the step-by-step trace is in `/tmp/lumix-server.log` (`grep ble.trace`).
 - Each run costs one wake from the cap.
 
 Real-device notes (2026-10-13):
-- The tool's own pre-wake snapshot is 6 s, so its `adv_state_before` is also None from state 6; read the server's `adv_state_before` instead.
-- The "new Wi-Fi network" fallback fired at ~35 s in both runs, including the run that never connected, so it is neighbour churn, not the camera AP. No `S5-…` SSID was seen (SSIDs are redacted without Location permission).
+- The tool's own pre-wake snapshot was 6 s, so its `adv_state_before` was None from state 6 in both runs; it now uses the 100 s window.
+- The "new Wi-Fi network" fallback fired at ~35 s in both runs, including the run that never connected, so it was neighbour churn, not the camera AP. It was dropped from the summary and relabelled `fingerprint_churn` in the event log. No `S5-…` SSID was seen (SSIDs are redacted without Location permission).
 - Open: e182ec41/e182ec43/4cf487c0 stay invisible on macOS; the switch-OFF start case has not been run with this code yet.
 
 Not changed: `emulator/` has no BLE model; the BLE camera stub lives in `tests/test_ble_session.py`, extended only with behaviour cited above.

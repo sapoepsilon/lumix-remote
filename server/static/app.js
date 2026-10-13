@@ -1967,7 +1967,8 @@ function quiesceToast(r) {
 
 // ---------------------------------------------------------------- Bluetooth wake
 // POST /api/ble/wake: BLE login + "start Wi-Fi via network". Powers the camera up from
-// off when its Remote Wakeup is on, then the server reconnects. Takes 30-90 s.
+// off when its Remote Wakeup is on, then the server reconnects. Takes ~30 s awake, up to ~3 min
+// asleep (it advertises only every ~90 s; a real wake took 168 s).
 // unsure: no recorded pairing (e.g. paired before the server saved it). We still try; a
 // successful wake records the pairing server-side, a failed one shows the pairing hint.
 const wake = { running: false, camId: null, t0: 0, secs: 0, ok: null, data: null, error: "", unsure: false, needPair: false, timer: null };
@@ -2043,7 +2044,7 @@ function renderWake() {
   const paired = blePaired();
   const label = wake.running ? `Turning on… ${wake.secs} s` : "Turn on over Bluetooth";
   $("wakelabel").textContent = label;
-  $("wakesub").textContent = wake.running ? "Keep the camera near this computer. Takes up to 3 min."
+  $("wakesub").textContent = wake.running ? "Keep the camera near this computer. A sleeping camera can take up to 3 minutes."
     : paired ? "Switches the camera on and joins it to Wi-Fi" : "Pairing not confirmed; tries anyway";
   $("btnwake").disabled = wake.running;
   $("cswake").textContent = label;
@@ -2057,7 +2058,7 @@ function renderWake() {
     if (wake.running) {
       box.className = "wake-state callout";
       box.replaceChildren(el("div", { class: "wake-head" }, el("span", { class: "spinner" }),
-        el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. ${wake.secs} s so far.`
+        el("div", {}, el("b", {}, "Turning the camera on…"), el("span", {}, `Bluetooth login, then the camera joins Wi-Fi. A sleeping camera can take up to 3 minutes; ${wake.secs} s so far.`
           + (wake.unsure ? " This computer may not be paired yet; trying anyway." : "")))));
     } else if (btleStuck(wake.data, wake.error)) {
       box.className = "wake-state callout bad";
