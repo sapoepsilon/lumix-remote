@@ -106,6 +106,7 @@ class _Entry:
 
 
 ACTIVE_JOB_STATES = ("queued", "running")
+CONNECTING = ("connecting", "waiting_approval")   # Camera.status while a handshake runs
 
 
 class ImportJob:
@@ -203,6 +204,15 @@ class FileBrowser:
         self.on_enter: Optional[Callable[[], Awaitable[Any]]] = None
         self.on_leave: Optional[Callable[[], Awaitable[Any]]] = None
         self._quiet = 0                # >0: internal play-mode use (timelapse import), no hooks
+        # A leave (POST /api/files/done) while ensure_play() is still on its way into
+        # playback is queued and runs once the enter is done (QA F1: closing Files
+        # 1.5 s after opening left the camera in playback until the idle timer).
+        self._entering = 0
+        self._leave_pending: Optional[bool] = None    # queued leave's pause_jobs flag
+        self._deferred: Optional[asyncio.Task] = None
+        # The user left Files while imports run: they keep going (camera stays in
+        # playback) and the camera goes back to shooting when the last one ends.
+        self.leave_after_jobs = False
         self._load_jobs()
 
     # ------------------------------------------------------------ lifecycle
@@ -215,6 +225,9 @@ class FileBrowser:
             self._idle_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._idle_task
+        self._leave_pending, self.leave_after_jobs = None, False
+        if self._deferred is not None and not self._deferred.done():
+            self._deferred.cancel()
         # running imports are checkpointed (resumable), not lost
         await self.pause_jobs("server-stop", timeout=3.0)
         for j in self.jobs.values():
@@ -251,6 +264,8 @@ class FileBrowser:
                 "card_files": sum(e.count for e in self.entries) if self.entries is not None else None,
                 "listed_at": self.listed_at or None, "last_error": self.last_error,
                 "jobs": [j.id for j in self.jobs.values() if j.state in ("queued", "running")],
+                "entering": self._entering > 0, "leave_queued": self._leave_pending is not None,
+                "leave_after_jobs": self.leave_after_jobs,
                 "default_dest": os.path.abspath(os.path.expanduser(DEFAULT_DEST))}
 
     def _publish(self) -> None:
@@ -275,11 +290,59 @@ class FileBrowser:
 
     # ---------------------------------------------------------------- mode
     async def ensure_play(self) -> None:
-        """Camera in play mode with live view paused; raises ModeError."""
+        """Camera in play mode with live view paused; raises ModeError. A leave()
+        that arrives meanwhile is queued and runs when this returns."""
         self.touch()
         if self.active and self.cam.state.get("cammode") == "play":
             return
+        self._entering += 1
+        try:
+            await self._enter_play()
+        finally:
+            self._entering -= 1
+            if self._entering == 0 and self._leave_pending is not None:
+                pause, self._leave_pending = self._leave_pending, None
+                self._schedule_leave(pause, "queued while entering playback")
+
+    def user_browsing(self) -> None:
+        """The user (re)opened Files: drop a queued leave / leave-after-imports."""
+        if self._leave_pending is not None or self.leave_after_jobs:
+            self.cam.log_event("files", "file browsing again: queued switch back to shooting dropped")
+        self._leave_pending, self.leave_after_jobs = None, False
+        if self._deferred is not None and not self._deferred.done():
+            self._deferred.cancel()
+
+    def _schedule_leave(self, pause_jobs: bool, why: str) -> None:
+        if self._deferred is not None and not self._deferred.done():
+            return
+        self._deferred = asyncio.ensure_future(self._deferred_leave(pause_jobs, why))
+
+    async def _deferred_leave(self, pause_jobs: bool, why: str, max_wait_s: float = 120.0) -> None:
+        """leave() once the transport's mode-switch limiter has a free slot: the
+        playmode just sent used one, and a recmode that cmd() gives up on would
+        leave the camera in playback."""
+        try:
+            lim = getattr(getattr(self.cam, "transport", None), "limiter", None)
+            end = time.monotonic() + max_wait_s
+            while lim is not None and time.monotonic() < end:
+                w = lim.wait_s()
+                if w <= 0:
+                    break
+                await asyncio.sleep(min(w, 5.0))
+            self.cam.log_event("files", "back to shooting (%s)" % why)
+            await self.leave(pause_jobs=pause_jobs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # never die; the idle timer is the fallback
+            log.warning("files: deferred leave failed: %s", e)
+
+    async def _enter_play(self) -> None:
         cam = self.cam
+        # no camera (off, out of range, never connected): say so at once instead of
+        # waiting; only a handshake that is already running is worth waiting for
+        st = getattr(cam, "status", "ready")
+        if st not in ("ready",) + CONNECTING:
+            raise ModeError("camera not connected (%s)" % st)
         # playmode during an in-camera interval run wedged the S5 (2026-10-12 11:55,
         # see Camera.mid_operation): refuse before anything is paused or stopped
         blocked = getattr(cam, "interval_blocked", None)
@@ -297,14 +360,14 @@ class FileBrowser:
             raise ModeError("not switching to playback: %s" % why)
         # camera reconnecting (e.g. a power cycle): wait a little, then fail fast
         for _ in range(40):
-            if getattr(cam, "status", "ready") == "ready":
+            st = getattr(cam, "status", "ready")
+            if st == "ready" or st not in CONNECTING:
                 break
             await asyncio.sleep(0.5)
-        else:
+        if getattr(cam, "status", "ready") != "ready":
             raise ModeError("camera not connected (%s)" % cam.status)
         if getattr(cam, "wedged", False) and cam.state.get("cammode") != "play":
-            raise ModeError("camera is stuck answering err_busy to mode switches; "
-                            "power-cycle the camera")
+            raise ModeError("the camera is stuck and ignores commands; switch it off and on again")
         if getattr(cam, "body_busy", False):
             raise ModeError("camera is being operated on the body; try again when it is done")
         async with cam.exclusive("files") as t:
@@ -358,6 +421,14 @@ class FileBrowser:
         if self.pins and not force:
             return {"left": False, "reason": "%d transfer(s) running" % self.pins, **self.status()}
         cam = self.cam
+        if not self.active and self._entering:
+            # ensure_play() is still switching to playback: leave right after it
+            self._leave_pending = bool(self._leave_pending) or pause_jobs
+            self.cam.log_event("files", "leave queued: playback switch still in progress")
+            self._publish()
+            return {"left": False, "queued": True,
+                    "reason": "the camera is still switching to playback; it goes back to "
+                              "shooting as soon as that is done", **self.status()}
         result = "not active"
         was_active = self.active
         if self.active:
@@ -476,6 +547,7 @@ class FileBrowser:
         costs one Browse per touched group, never a walk of the whole card."""
         if kind not in ("all", "photo", "video"):
             raise ValueError("kind must be all|photo|video")
+        self.user_browsing()
         await self.ensure_play()
         entries = await self._ensure_root(refresh)
         sel = entries if kind == "all" else [e for e in entries if e.kind == kind]
@@ -661,6 +733,17 @@ class FileBrowser:
             self._save_jobs()
         return job
 
+    def keep_importing(self) -> List[str]:
+        """Files closed while imports run: let them finish in playback, then back
+        to shooting (``leave_after_jobs``). Returns the running job ids."""
+        ids = [j.id for j in self.running_jobs()]
+        if ids:
+            self.leave_after_jobs = True
+            self.cam.log_event("files", "Files closed; %d import(s) continue in playback, "
+                                        "back to shooting when they end" % len(ids))
+            self._publish()
+        return ids
+
     async def pause_jobs(self, by: str, timeout: float = 5.0) -> List[str]:
         ids = [j.id for j in self.running_jobs()]
         for i in ids:
@@ -791,6 +874,9 @@ class FileBrowser:
             if publish:
                 self._save_jobs()
                 self.cam.bus.publish("job", job.to_dict())
+                if self.leave_after_jobs and not self.running_jobs():
+                    self.leave_after_jobs = False
+                    self._schedule_leave(False, "imports ended after Files was closed")
 
     async def _download_to(self, job: ImportJob, res: Res, path: str) -> bool:
         """Download res to path. False = skipped (same name and size already there)."""

@@ -10,6 +10,8 @@ All of them also exist under /api/cameras/{cam}/... (see server.app.camera_route
 
 from __future__ import annotations
 
+import ipaddress
+
 from aiohttp import web
 
 from lumix import models
@@ -63,9 +65,16 @@ async def reconnect(request: web.Request) -> web.Response:
     ip = b.get("ip")
     if ip is not None and not isinstance(ip, str):
         raise ValueError("ip must be a string")
+    ip = (ip or "").strip() or None
+    if ip is not None:
+        try:
+            if ipaddress.ip_address(ip).version != 4:
+                raise ValueError
+        except ValueError:
+            return _json({"error": "%r is not an IPv4 address (like 192.0.2.10)" % ip}, 400)
     sess = session(request)
     forget = bool(b.get("forget"))
-    started = sess.cam.request_reconnect(ip=(ip or "").strip() or None, forget=forget)
+    started = sess.cam.request_reconnect(ip=ip, forget=forget)
     if forget and sess.entry.get("fixed_ip") and not ip:
         # "search from scratch" must not leave a fixed address behind in cameras.json
         # (the session would ignore it, and setting the same address again later

@@ -164,6 +164,9 @@ class CameraSession:
                     "name": (e.get("ble") or {}).get("name"),
                     "home_ssid": (e.get("ble") or {}).get("home_ssid")},
             "ports": e.get("ports"), "settings": e.get("settings"),
+            # what the session really uses (command-line --lv-port etc. included)
+            "effective_ports": {"http": cam.cfg.http_port, "upnp": cam.cfg.upnp_port,
+                                "files": cam.cfg.files_port, "liveview": cam.cfg.lv_port},
             "connected_at": e.get("connected_at"), "added_at": e.get("added_at"),
             "wedged": st.get("wedged", False),
             "timelapse": (self.timelapse.job.state if self.timelapse.job

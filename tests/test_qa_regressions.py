@@ -116,6 +116,7 @@ class ShootingLeavesFilesTest(EmuTestCase):
         r = self.rig
 
         async def go():
+            r.emu.settings["drivemode"] = ("normal", "")      # Single (the recorded S5 is Time Lapse)
             st, d = await r.call("GET", "/api/files?limit=1")
             self.assertEqual(st, 200)
             self.assertEqual(r.emu.cammode, "play")
@@ -242,6 +243,7 @@ class ShutterFromPlaybackTest(EmuTestCase):
         r = self.rig
 
         async def go():
+            r.emu.settings["drivemode"] = ("normal", "")      # Single (the recorded S5 is Time Lapse)
             await r.wait(lambda: r.sess.cam.liveview.age is not None, 10, "frames")
             await r.ctl("/emu/body/play")             # someone pressed playback on the body
             await r.wait(lambda: r.sess.cam.state.get("cammode") == "play", 10, "camera in play")

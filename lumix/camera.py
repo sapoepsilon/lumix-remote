@@ -1074,7 +1074,7 @@ class Camera:
                 return "wait", "camera just switched to rec (settling, %.1f s)" % left
             return "ready", ""
         if self.wedged:
-            return "give_up", "camera stuck answering err_busy (power-cycle it)"
+            return "give_up", "camera stuck: it ignores commands (switch it off and on)"
         since = now - self._mode_changed_at
         sent = self._auto_rec_sent_at
         if sent is not None and sent >= self._mode_changed_at:
@@ -1463,14 +1463,33 @@ class Camera:
         if self.body_busy:
             raise Busy("camera is being operated on the body (waiting for it to finish)")
         if self.wedged:
-            raise Busy("camera is stuck answering err_busy; switch it off and on again")
+            raise Busy("the camera is stuck and ignores commands; switch it off and on again")
         if self.interval_active:
             raise Busy("an in-camera interval run is in progress (stop the timelapse first)")
+
+    async def drive_is_interval(self, t: CamTransport) -> bool:
+        """Drive mode Time Lapse (``stopmotion_interval``/``interval``): the shutter
+        would start the camera's own interval run, not take a photo. getstate's
+        ``burst_interval_status`` is ``on`` for it (real S5 2026-10-11: on with Time
+        Lapse, off with Single); getsetting drivemode tells Time Lapse from Stop
+        Motion Animation, which takes one frame per press."""
+        if self.state.get("burst_interval_status") != "on":
+            return False
+        r = await t.cgi("getsetting", "drivemode", timeout=4)
+        el = r.xml.find("settingvalue") if r.ok and r.xml is not None else None
+        if el is None or el.get("drivemode") is None:
+            return False
+        return el.get("drivemode") == "stopmotion_interval" and (el.text or "").strip() in ("interval", "")
 
     async def capture(self) -> Dict[str, Any]:
         async with self.exclusive("capture") as t:
             before = self.state.get("remaincapacity")
             self._check_usable()
+            if await self.drive_is_interval(t):
+                # QA F4: the photo shutter started an in-camera interval run
+                raise DriveIsTimeLapse("Drive is Time Lapse \u2014 use the Timelapse tab or switch "
+                                       "drive to Single (the shutter would start the camera's own "
+                                       "interval run)")
             await self._wait_card_write()
             r = await self.cmd("camcmd", value="capture", timeout=15)
             self.log_event("cmd", "capture -> %s" % r.result)
@@ -1725,7 +1744,13 @@ def _oneline(text: str, limit: int = 400) -> str:
 
 
 class Busy(Exception):
-    pass
+    """The camera can't do it now (HTTP 409). ``code``: machine-readable reason
+    for clients that offer a fix (e.g. ``drive_timelapse``)."""
+    code: Optional[str] = None
+
+
+class DriveIsTimeLapse(Busy):
+    code = "drive_timelapse"
 
 
 def _capability_dict(rep: Reply) -> Dict[str, Any]:

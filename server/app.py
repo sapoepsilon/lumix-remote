@@ -84,7 +84,7 @@ def _guard(fn):
         except web.HTTPException:
             raise
         except Busy as e:
-            return _json({"error": str(e)}, 409)
+            return _json({"error": str(e), **({"code": e.code} if e.code else {})}, 409)
         except (KeyError, ValueError) as e:
             return _json({"error": "bad request: %s" % e}, 400)
         except Exception as e:  # camera transport errors etc.
@@ -286,15 +286,30 @@ async def _shooting(request: web.Request) -> Camera:
     the card (then 409; `lumix files done` / closing Files pauses it)."""
     s = session(request)
     fb = s.files
+    cam = s.cam
+    # known states first, so the shutter answers at once (QA F5: 8 s of silence
+    # wedged, 20 s in playback)
+    if cam.status != "ready":
+        raise Busy("camera not connected (%s)" % cam.status)
+    if cam.wedged:
+        raise Busy("the camera is stuck and ignores commands; switch it off and on again")
+    if cam.body_busy:
+        raise Busy("the camera is being operated on the body; try again when it is done")
     if fb.active:
         if fb.running_jobs() or fb.pins:
             raise Busy("the camera is in playback for an import from the card; wait for it, "
-                       "or leave Files (`lumix files done`) to pause it")
+                       "or stop the import to shoot")
         r = await fb.leave()
         if not r.get("left") or s.cam.state.get("cammode") != "rec":
             raise Busy("the camera did not switch back from playback (%s)" % r.get("recmode", r.get("reason")))
-    cam = s.cam
     if cam.state.get("cammode") == "play" and cam.liveview_wanted and not cam.interval_active:
+        lim = getattr(cam.transport, "limiter", None)
+        wait = lim.wait_s() if lim is not None else 0.0
+        if wait > 3.0:
+            # the switch back would sit in the mode-switch rate limit: say so now
+            raise Busy("the camera is in playback; it can be switched back to shooting in "
+                       "%.0f s (at most one mode switch per %.0f s protects it)"
+                       % (wait, cam.MODE_SWITCH_MIN_GAP_S))
         # playback chosen on the body (or a mode switch that didn't happen): a shutter
         # press is an explicit request to shoot, so switch back like leaving Files does
         async with cam.exclusive("shooting"):

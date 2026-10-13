@@ -76,8 +76,19 @@ async def files_status(request: web.Request) -> web.Response:
 async def done(request: web.Request) -> web.Response:
     """Back to shooting. Running imports are checkpointed (``paused``, by
     "shooting") and continue in the next file browsing session or via
-    POST /api/jobs/{id}/resume."""
-    return _json(await _fb(request).leave(pause_jobs=True))
+    POST /api/jobs/{id}/resume.
+
+    ``{"keep_imports": true}`` (the web UI closing Files): running imports go on
+    in playback and the camera goes back to shooting when the last one ends
+    (``leave_after_jobs`` in the answer; pause the job to stop sooner). A leave
+    while the switch to playback is still running is queued (``queued``)."""
+    body = await request.json() if request.can_read_body else {}
+    fb = _fb(request)
+    if isinstance(body, dict) and body.get("keep_imports"):
+        ids = fb.keep_importing()
+        if ids:
+            return _json({"left": False, "importing": ids, **fb.status()})
+    return _json(await fb.leave(pause_jobs=True))
 
 
 def _image(which: str):

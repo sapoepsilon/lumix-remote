@@ -524,7 +524,7 @@ the active camera. `{id}` may also be the nickname. `/api/status` answers
 | `GET /api/quick` | Quick-control subset + aperture/shutter (current + options) |
 | `POST /api/setting` `{"type","value","value2"?}` | Raw `setsetting`, e.g. `{"type":"focal","value":"1024/256"}` |
 | `GET /api/getsetting/{type}` | Raw `getsetting`, e.g. `focal`, `shtrspeed`, `iso`, `touch_type` |
-| `POST /api/capture` | Take a photo (returns remaining-shots before/after) |
+| `POST /api/capture` | Take a photo (returns remaining-shots before/after). 409 at once when the camera is stuck, used on the body or not connected; 409 `{"code":"drive_timelapse"}` when Drive is Time Lapse (the shutter would start the camera's own interval run) |
 | `POST /api/video/start`, `POST /api/video/stop` | Video recording |
 | `POST /api/touch` `{"x","y"}` | Touch AF at 0..1000 live-view coordinates |
 | `POST /api/af` | One-shot AF |
@@ -576,8 +576,8 @@ the API answers 409 with the camera's reply (see Known issues).
 | `GET /api/jobs`, `GET /api/jobs/{id}` | Job progress: `state` (`queued`, `running`, `paused`, `done`, `done_with_errors`, `failed`, `cancelled`), `paused_by`, `files_total/done/skipped/failed`, `bytes_total/done`, `progress` 0..1, `current`, `saved`, `errors` |
 | `POST /api/jobs/{id}/cancel` | Cancel an import (also a paused one) |
 | `POST /api/jobs/{id}/pause`, `/resume` | Checkpoint / continue an import (`.part` + Range) |
-| `POST /api/files/done` | Leave file browsing: running imports checkpointed (`paused_jobs`), rec mode + live view |
-| `GET /api/files/status` | `{active, cammode, pins, idle_left_s, cached_items, last_error, jobs}` |
+| `POST /api/files/done` | Leave file browsing: running imports checkpointed (`paused_jobs`), rec mode + live view. `{"keep_imports":true}` (the web UI): running imports go on in play mode (`importing`, `leave_after_jobs`) and the camera switches back when the last one ends. Sent while the switch to play mode is still running, the leave is queued (`queued`) and runs right after it (respecting the mode-switch cap) |
+| `GET /api/files/status` | `{active, cammode, pins, idle_left_s, cached_items, last_error, jobs, entering, leave_queued, leave_after_jobs}` |
 
 Card layout on the S5: the top level holds single files plus groups (time
 lapse / burst, `pana:X_RecGroupType`, up to ~1000 frames each). The listing

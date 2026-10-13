@@ -495,6 +495,10 @@ class TimelapseEngine:
         job = self.new_job(p)
         if self.cam.status != "ready":
             raise TimelapseError("camera not connected (%s)" % self.cam.status)
+        if getattr(self.cam, "wedged", False):
+            # QA F3: a server timelapse started on a wedged camera skipped every shot
+            raise TimelapseError("camera busy: it is stuck and ignores commands; switch it off "
+                                 "and on again, then start the timelapse")
         if getattr(self.files, "active", False):
             # files -> shooting: running imports are checkpointed, camera back to rec
             await self.files.leave(force=True, pause_jobs=True)
@@ -809,7 +813,7 @@ class TimelapseEngine:
         cam = self.cam
         reason = None
         if cam.wedged:
-            reason = "camera stuck answering err_busy (power-cycle it)"
+            reason = "camera stuck: it ignores commands (switch it off and on)"
         elif getattr(self.files, "active", False):
             reason = "file browsing"
         elif cam.state.get("rec") == "on":
@@ -876,7 +880,7 @@ class TimelapseEngine:
                             j.shots += 1
                             j.last_shot_at = time.time()
                     elif r.result == "err_busy":
-                        self._skip(j, "camera answered err_busy %dx" % tries)
+                        self._skip(j, "camera busy (%d tries)" % tries)
                     else:
                         j.failed += 1
                         j.errors.append("shot %d: capture -> %s" % (j.slot + 1, r.result))
