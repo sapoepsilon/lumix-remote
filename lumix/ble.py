@@ -97,6 +97,18 @@ CONNECT_TIMEOUT = 45.0
 # How long to wait for e182ec41 (Wi-Fi start result) after the start write. The
 # app has no fixed wait (it reacts whenever the notify comes); 10 s is ours.
 START_ACK_WAIT = 10.0
+# Before any notification has arrived on the link we don't know whether this host
+# gets them (macOS refuses every CCCD write on the S5, yet the camera's notifies
+# still arrive: 2026-10-15 09:09:40 "notify e182ec41 01" after 0/10 subscriptions).
+# A short wait costs little and catches the refusal (it came 0.21 s after the write).
+START_ACK_BLIND_WAIT = 2.0
+# A BLE wake while the camera is on Wi-Fi does harm: twice it made the S5 drop the
+# session it had with us (2026-10-15 08:29:26 e182ec40=03 -> 08:29:30 getstate
+# err_reject; 08:53:13 -> 08:53:15), once it refused (e182ec41 = 01 at 09:09:40,
+# the camera stuck but on Wi-Fi) and then went off the network for good.
+ON_WIFI_ERROR = ("the camera is on Wi-Fi already (it answers at its address), so a Bluetooth wake can't help: "
+                 "it makes the camera drop the connection or refuse. Wait for the reconnect; if the camera "
+                 "is stuck, switch it off and on by hand")
 
 
 class BleStepError(RuntimeError):
@@ -109,10 +121,11 @@ class BleStepError(RuntimeError):
         self.need_pair = need_pair
 
 
-REFUSED_HINT = ("The camera said no to remote wake-up (LUMIX Sync shows \"Due to the state of the camera, "
-                "this function cannot be used\"). Make sure it isn't busy (menu open, playback, recording), "
-                "then try again. If it keeps refusing, switch it on by hand once and check its Wi-Fi "
-                "connection settings.")
+REFUSED_HINT = ("The camera said no to remote wake-up (e182ec41 = 01; LUMIX Sync shows \"Due to the state of "
+                "the camera, this function cannot be used. Make sure the camera is not in operation\"). "
+                "Seen on the S5 when it was still on Wi-Fi with a session open, and stuck (2026-10-15 "
+                "09:09). If the camera doesn't answer on Wi-Fi either, switch it off and on by hand; "
+                "otherwise close its menu or playback and try again.")
 
 
 class BleRefused(BleStepError):
@@ -540,6 +553,10 @@ class LumixBle:
         self._waiters: Dict[str, asyncio.Queue] = {}
         self._cbs: Dict[str, Callable[..., None]] = {}
         self.subscribed: set = set()           # notify subscriptions the OS confirmed
+        # chars that delivered a notification on this link, whatever the CCCD write
+        # said: on macOS + S5 every start_notify fails ("attribute not found") and the
+        # camera notifies anyway (2026-10-13 14:45:39 18345be1, 2026-10-15 09:09:40 e182ec41)
+        self.observed: set = set()
         self._ap: Optional[Tuple[str, str]] = None   # camera AP (ssid, password): memory only, never logged
         self._on_event = on_event or (lambda s: log.info("%s", s))
         self.t0 = time.time()
@@ -618,7 +635,14 @@ class LumixBle:
             q = self._waiters[uuid] = asyncio.Queue()
         return q
 
+    @property
+    def notify_observable(self) -> bool:
+        """Notifications reach us on this link: the OS confirmed a subscription,
+        or one arrived anyway (the CCCD result on macOS says nothing about that)."""
+        return bool(self.subscribed or self.observed)
+
     def _on_notify(self, uuid: str, data: bytes) -> None:
+        self.observed.add(uuid)
         self.notes.append((round(time.time() - self.t0, 2), uuid, data.hex()))
         self.ev("notify %s %s%s" % (uuid[:8], data.hex(), _notify_meaning(uuid, data)))
         self._queue(uuid).put_nowait(data)
@@ -638,8 +662,29 @@ class LumixBle:
             def cb(_ch, data: bytearray, uuid=uuid):
                 self._on_notify(uuid, bytes(data))
             self._cbs[uuid] = cb
-        await self.client.start_notify(uuid, cb)
+        try:
+            await self.client.start_notify(uuid, cb)
+        except Exception:
+            # The CCCD write failed, but the camera may notify anyway: keep our
+            # callback registered so those notifications still reach _on_notify.
+            self._keep_callback(uuid, cb)
+            raise
         self.subscribed.add(uuid)
+
+    def _keep_callback(self, uuid: str, cb: Callable[..., None]) -> None:
+        """bleak's CoreBluetooth delegate files the callback by handle before it
+        writes the CCCD and leaves it there on failure; make sure it is there
+        (a no-op on other backends)."""
+        d = getattr(getattr(self.client, "_backend", None), "_delegate", None)
+        cbs = getattr(d, "_characteristic_notify_callbacks", None)
+        if cbs is None:
+            return
+        try:
+            ch = self.client.services.get_characteristic(uuid)
+        except Exception:
+            return
+        if ch is not None and ch.handle not in cbs:
+            cbs[ch.handle] = cb
 
     async def wait_notify(self, uuid: str, timeout: float = 5.0) -> Optional[bytes]:
         q = self._waiters.get(uuid)
@@ -889,17 +934,21 @@ class LumixBle:
         return await self._start_result(start_ack_wait)
 
     async def _start_result(self, wait: float) -> Optional[bytes]:
-        if not self.subscribed:
-            # macOS refuses every notify on the real S5 ("attribute not found",
-            # docs/ble-power-protocol.md section 8): e182ec41 can't arrive, so
-            # waiting only costs time and a refusal (01) can't be seen.
-            self.ev("wifi start result: not awaited (0 notify subscriptions on this host, so a "
-                    "refusal can't be observed)")
-            return None
+        """The camera's answer on e182ec41 to the Wi-Fi start write. Waited for
+        whenever notifications reach us, even with 0 confirmed subscriptions:
+        2026-10-15 09:09:40 the S5 sent "e182ec41 01" (refused) on a link where
+        all 10 CCCD writes had failed, and the old code didn't wait for it."""
+        if not self.notify_observable:
+            wait = min(wait, START_ACK_BLIND_WAIT)
         res = await self.wait_start_ack(wait)
-        self.ev("wifi start result: %s" % (res.hex() if res is not None else
-                                           "none in %.0f s%s" % (wait, " (link lost)" if self.disconnected.is_set()
-                                                                 else "")))
+        if res is None and not self.notify_observable:
+            self.ev("wifi start result: none in %.0f s (no notification has arrived on this link, so a "
+                    "refusal may not be visible)%s" % (wait, " (link lost)" if self.disconnected.is_set() else ""))
+        else:
+            self.ev("wifi start result: %s" % (res.hex() + _notify_meaning(CH_WIFI_START_ACK, res)
+                                               if res is not None else
+                                               "none in %.0f s%s" % (wait, " (link lost)" if self.disconnected.is_set()
+                                                                     else "")))
         if res is not None and res[:1] == b"\x01":
             raise BleRefused()
         return res
@@ -1180,6 +1229,7 @@ async def wake(name: Optional[str] = None, ssid: Optional[str] = None, wifi_wait
         # Whatever happened (error, two connect timeouts, cancellation): no client
         # left connecting/connected and no scan running.
         out["notifies"] = notes + c.notes
+        out["notify_seen"] = sorted(u[:8] for u in c.observed)
         with contextlib.suppress(Exception):
             await c.close()
         await release_all()

@@ -67,6 +67,10 @@ async def cmd_dump(a) -> Dict[str, Any]:
 
 
 async def cmd_wake(a) -> Dict[str, Any]:
+    ip = a.camera_ip or ble._last_ip()
+    if ip and not a.even_if_on_wifi and ble.ddd_ok(ip, 1.5):
+        _err("not sent: %s (--even-if-on-wifi overrides)" % ble.ON_WIFI_ERROR)
+        return {"ok": False, "step": "precheck", "error": ble.ON_WIFI_ERROR, "on_wifi": True, "ip": ip}
     res = await ble.wake(a.name, ssid=a.ssid, wifi_wait=a.wifi_wait, camera_ip=a.camera_ip, log=_err,
                          purpose=a.purpose, sta=not a.no_sta, single_session=a.single_session,
                          legacy=a.legacy, softap=a.softap, wifi_if=a.wifi_if)
@@ -125,6 +129,9 @@ def main() -> None:
                            help="purpose 05 + connect type 01 and join the camera's own access point; "
                                 "this Mac leaves the home LAN while it runs")
             s.add_argument("--wifi-if", default="en0", help="Wi-Fi interface for --softap")
+            s.add_argument("--even-if-on-wifi", action="store_true",
+                           help="wake even when the camera answers on Wi-Fi (it then drops that "
+                                "connection or refuses; the server checks this itself)")
         if nm == "power-cycle":
             s.add_argument("--server", default="http://127.0.0.1:8770",
                            help="Lumix Remote server for the Wi-Fi poweroff ('' = talk to the camera directly)")

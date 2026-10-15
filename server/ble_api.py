@@ -41,12 +41,14 @@ from typing import Any, Deque, Dict, List, Optional
 
 from aiohttp import web
 
+from lumix.ble import ON_WIFI_ERROR  # stdlib only; bleak loads lazily
 from lumix.camera import Camera
 from server.app import _body, _guard, _json, camera_route, session
 
 log = logging.getLogger("server.ble")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BLE_BIN = os.path.join(ROOT, "bin", "lumix-ble")
+ON_WIFI_CHECK_S = 1.5        # :60606 device-description check before a wake
 
 
 def _env_float(name: str, default: float) -> float:
@@ -229,17 +231,32 @@ class BleManager:
                     "and costs battery. Try again in %d s" % (len(self.wakes), self.wake_window // 60, wait))
         return None
 
-    async def wake(self, variant: Optional[str] = None) -> Dict[str, Any]:
+    async def on_wifi(self) -> bool:
+        """The camera answers on the LAN right now (device description on :60606)."""
+        if not self.cam.ip:
+            return False
+        from lumix.ble import ddd_ok  # stdlib-only helper; bleak is not imported
+        loop = asyncio.get_running_loop()
+        return bool(await loop.run_in_executor(None, ddd_ok, self.cam.ip, ON_WIFI_CHECK_S))
+
+    async def wake(self, variant: Optional[str] = None, if_on_wifi: bool = False) -> Dict[str, Any]:
+        """``if_on_wifi``: wake even when the camera answers on Wi-Fi (the power
+        cycle checked that it is off; otherwise refused, see ON_WIFI_ERROR)."""
         if variant is not None and variant not in WAKE_VARIANTS:
             raise ValueError("variant must be one of %s" % ", ".join(sorted(WAKE_VARIANTS)))
         why = self.wake_blocked()
         if why:
             return {"ok": False, "step": "limit", "error": why, "rate_limited": True}
+        if not if_on_wifi and await self.on_wifi():
+            self.cam.log_event("ble", "wake not sent: the camera answers on Wi-Fi")
+            return {"ok": False, "step": "precheck", "error": ON_WIFI_ERROR, "on_wifi": True,
+                    "wedged": bool(self.cam.wedged)}
         stuck = await self.btle_stuck()
         if stuck:
             return stuck
         self.wakes.append(time.time())
-        args = ["wake"] + WAKE_VARIANTS[variant or "two-session"]
+        # checked above (or by the power cycle): don't let lumix-ble refuse again
+        args = ["wake"] + WAKE_VARIANTS[variant or "two-session"] + ["--even-if-on-wifi"]
         if self.cam.ip:
             args += ["--camera-ip", self.cam.ip]
         # adv scan 10 s; stage 1: scan 30 s + connect 45 s x2, adv poll 40 s; stage 2:
@@ -302,7 +319,7 @@ class BleManager:
             res["total_s"] = round(time.time() - t0, 1)
             return res
         await asyncio.sleep(_env_float("LUMIX_BLE_OFF_WAIT", 8))
-        res["wake"] = await self.wake()
+        res["wake"] = await self.wake(if_on_wifi=True)
         res["ok"] = bool(res["wake"].get("ok"))
         if not res["ok"]:
             res["error"] = res["wake"].get("error")
@@ -406,7 +423,8 @@ async def ble_wake(request: web.Request) -> web.Response:
     if variant is not None and variant not in WAKE_VARIANTS:
         return _json({"error": "variant must be one of %s" % ", ".join(sorted(WAKE_VARIANTS))}, 400)
     res = await m.wake(variant)
-    return _json(res, 200 if res.get("ok") else 429 if res.get("rate_limited") else 502)
+    return _json(res, 200 if res.get("ok") else 429 if res.get("rate_limited")
+                 else 409 if res.get("on_wifi") else 502)
 
 
 @_guard

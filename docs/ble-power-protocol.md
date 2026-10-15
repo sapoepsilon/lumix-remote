@@ -20,7 +20,7 @@ Tags: **[APK]** = read from LUMIX Sync code. **[S5]** = seen on our DC-S5 (fw 2.
   - Only in the other states does it use purpose `03`, with STA when the phone is itself on Wi-Fi.
   - Our failing 2026-10-12 23:19 wake started from state 6 `sleep_pow_off_fast`, and we asked for STA anyway.
 - **When the camera is asleep, LUMIX Sync is built around two BLE connections, not one.** It connects once to wake the body. Then it waits for the camera to advertise `wakeup` (2) and connects again to run the Wi-Fi request (`HomeActivity.java:1230-1259`). Our only "split" success, runs B → C at 13:18/13:26 on 2026-10-12, followed exactly this shape.
-- **The camera reports the result of the Wi-Fi start command on `e182ec41`.** `01` means "Due to the state of the camera, this function cannot be used" [APK]. We have never received `e182ec41`, `e182ec43` or `4cf487c0`. On macOS every CCCD write fails with "attribute not found", so the camera's error and request channel is invisible to us.
+- **The camera reports the result of the Wi-Fi start command on `e182ec41`.** `01` means "Due to the state of the camera, this function cannot be used" [APK]. On macOS every CCCD write fails with "attribute not found", but the camera's notifications arrive anyway (bleak keeps the callback): `18345be1` acks on every wake, and on 2026-10-15 09:09:40 `e182ec41 = 01` with 0/10 subscriptions on (section 9). `e182ec43` and `4cf487c0` have not been seen yet.
 - **There is no BLE power-off for the S5.** The app's only power-off on this generation is Wi-Fi `camcmd poweroff`. A BLE power command (`96c82c33`) exists only on newer bodies.
 
 ---
@@ -179,7 +179,7 @@ So the cause is camera state, not bytes:
 
 What we never see (macOS):
 - Every CCCD write returns "attribute not found" (CoreBluetooth lists no descriptors before registration). We only ever received `18345be1` and `7be5fe6e`.
-- We have never seen `e182ec41` (the Wi-Fi start result), `e182ec43` (camera Wi-Fi requests) or `4cf487c0` (clock request). A camera refusal of our STA request would be invisible to us.
+- `e182ec41` (the Wi-Fi start result) arrives even though its CCCD write fails (first seen 2026-10-15 09:09:40, `01`). `e182ec43` (camera Wi-Fi requests) and `4cf487c0` (clock request) have not been seen.
 
 ---
 
@@ -343,7 +343,7 @@ Run against the real S5 on 2026-10-13 12:19-12:27 with `tools/ble-wake-experimen
 
 ### Follow-ups after the real run (2026-10-13, unit-tested, not yet re-run on the camera)
 
-- `wifi_join`: when no notify subscription succeeded (0/10 on macOS), the 10 s `e182ec41` wait is skipped and logged as `wifi start result: not awaited (0 notify subscriptions on this host, so a refusal can't be observed)`. A host whose subscriptions work still waits and still raises `BleRefused` on `01`.
+- `wifi_join`: ~~when no notify subscription succeeded, the `e182ec41` wait is skipped~~ (wrong, see section 9). Now the wait runs whenever a notification has arrived on the link (the `18345be1` ack always does), and for 2 s otherwise; `01` raises `BleRefused`.
 - Pre-scan: `adv_snapshot` keeps scanning for up to `ADV_SLEEP_GAP_S` until an advertisement carries the state byte. If the state is still None, `wake` uses two-session anyway and logs `WARNING: no advertised state ...` (result field `note_state`). That is safe for an awake camera: stage 1 is connect + login + close with no Wi-Fi or power write (the same login a single-session wake does first), and `wait_state` returns on the first ~1 s scan that shows 0/2, so an awake body costs one extra connection.
 - UI: the wake progress text says it can take up to ~3 minutes (run 2 took 168 s).
 
@@ -366,6 +366,16 @@ Real-device notes (2026-10-13):
 Not changed: `emulator/` has no BLE model; the BLE camera stub lives in `tests/test_ble_session.py`, extended only with behaviour cited above.
 
 ---
+
+## 9. 2026-10-15: e182ec41 = 01 seen on macOS; wakes while on Wi-Fi
+
+Trace: `/tmp/lumix-server.log` (ble.trace lines 09:09:28-09:11:11) and `logs/camera-2026-10-13.log` lines 21309-21554 (the server camera log that ran into 10-15).
+
+- 09:09:39 `notify subscriptions after registration: 0/10 on`, then SSID, `0d6f1880=03`, ack `00`, `02`, `e182ec40=03`. 0.21 s later: `notify e182ec41 01 (REFUSED: camera state)`, again 1 s later. The code logged `not awaited (0 notify subscriptions ...)` and waited 90 s for Wi-Fi instead.
+- So a failed CCCD write does not stop delivery. `LumixBle` now tracks the chars that delivered anything (`observed`, `notify_observable`), keeps its callback registered after a failed `start_notify`, and waits for `e182ec41` whenever notifications are observable (2 s otherwise). The JSON result carries `notify_seen`.
+- Why the camera refused: it was already on Wi-Fi in a session with us (req_acc ok at 09:09:33) and stuck (playmode `err_critical` at 09:03:12, camcmd `err_busy` since). The APK maps `01` to `msg_cannot_restart_remote_wakeup`: "Due to the state of the camera, this function cannot be used. Make sure the camera is not in operation. When connected to the camera via Wi-Fi, check the connection access point in the Wi-Fi settings." In the remote purposes it resets the purpose and shows that dialog (`HomeActivity.java:1097-1121`, runnable `e` → `ON_BT_CANNOT_REMOTE_WAKEUP`, `T5/b.java:2232`); no retry, no other purpose. Which camera states produce `01` is decided by the body; the APK only shows the generic text.
+- After the refusal the camera left the network (getstate timeout 09:09:47, then Host is down).
+- BLE wakes while the camera is on Wi-Fi did harm every time: 08:29:26 and 08:53:13 `e182ec40=03` → `getstate err_reject` 4 s / 2 s later (the camera dropped our session); 09:09:40 refused. The server and `lumix-ble wake` now refuse a wake while the camera answers `:60606` (`on_wifi`, HTTP 409; `--even-if-on-wifi` overrides; the power cycle checks the camera is off first).
 
 ## Sources
 - Panasonic LUMIX Sync help, Remote Wakeup (Camera Power Operations): https://av.jpn.support.panasonic.com/support/global/cs/soft/lumix_sync/en/DC-S5M2/adv_rem_wu.html

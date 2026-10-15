@@ -49,10 +49,22 @@ INTERVAL_RUNNING = ("run", "rec", "pause")
 # A read-only connect completes (SUBSCRIBE, live view) once the camera has been
 # idle this long (interval_status not rec/pause/off, not recording, not busy).
 READONLY_CLEAR_S = 10.0
+# read-only connect reason for a body that got stuck and never went away since
+WEDGED_READONLY = ("the camera is stuck (it ignores shutter, mode and live view commands); "
+                   "switch it off and on to clear it")
 
 
 class Disconnected(Exception):
     pass
+
+
+def _camera_went_away(e: BaseException) -> bool:
+    """The camera stopped answering (not: we hung up, it rejected the session, a
+    local rate limit). Only after that can a wedged body be un-wedged."""
+    if isinstance(e, Disconnected):
+        text = str(e)
+        return text.startswith("keepalive failed") or text.startswith("no good getstate")
+    return True     # CamError / OSError / timeout: no answer at all
 
 
 @dataclass
@@ -136,6 +148,14 @@ class Camera:
     # 9514-9515); 16:46:58 / 16:50:57 it was sent into the camera's own bounce
     # back to play (lines 9465-9466, 9527-9529).
     STABLE_S = 2.0
+    # How long a taken-but-unwritten shutter blocks rec/play switches. The S5 held
+    # one for 56 s (2026-10-15 09:02:11 -> 09:03:07); after this the guard lets go
+    # (not verified on the body whether a switch is safe then).
+    CAPTURE_PENDING_MAX_S = 120.0
+    # After X_Panasonic_Cam_PRec=err_*, the body drops to playback on its own
+    # (2026-10-12 16:47-16:50); a playmode of ours 5 s after one answered
+    # err_critical and wedged it (2026-10-15 09:03:07 -> 09:03:12).
+    PHOTO_ERROR_SETTLE_S = 10.0
     STABLE_WAIT_S = 8.0            # start_liveview waits this long for a settled rec
     # Automatic return to rec (time-lapse) when the camera left rec on its own:
     # wait (reads only) this long for it to come back by itself, then one recmode;
@@ -231,6 +251,17 @@ class Camera:
         self._auto_rec_sent_at: Optional[float] = None         # auto_rec()'s recmode in this episode
         # last X_Panasonic_Cam_PRec error NOTIFY: (monotonic, value), e.g. err_rec
         self.photo_error: Optional[tuple] = None
+        # monotonic time of a shutter the camera took ("capture -> ok") with no photo
+        # written yet (remaincapacity unchanged, no X_Panasonic_Cam_PRec error).
+        # 2026-10-15 09:02:11 the S5 sat like that for 56 s; the file browser's
+        # stopstream then aborted it (err_rec) and its playmode 5 s later answered
+        # err_critical: wedged until a power cycle.
+        self.capture_pending_at: Optional[float] = None
+        # True once the camera stopped answering after a wedge (switched off, out of
+        # Wi-Fi): only then can a reconnect find it un-wedged. A reconnect to a body
+        # that never went away keeps the wedge (2026-10-15 09:08:41: the reconnect after
+        # a refused poweroff cleared it and sent playmode -> err_busy x3 into it).
+        self._gone_since_wedge = False
         self._reject_probe_at = float("-inf")  # last session probe after an err_reject (monotonic may start near 0)
         self._state_at = float("-inf")     # monotonic time of the last good getstate
         # Set (to the reason) when the connect found the camera mid-operation (an
@@ -279,6 +310,16 @@ class Camera:
             return "the camera is recording video"
         if self.body_busy:
             return "the camera is being operated on the body"
+        now = time.monotonic()
+        if self.capture_pending_at is not None:
+            age = now - self.capture_pending_at
+            if age < self.CAPTURE_PENDING_MAX_S:
+                return ("the camera is still taking a photo (shutter accepted %.0f s ago, nothing written "
+                        "yet; check the camera for a self-timer or focus wait)" % age)
+            self.capture_pending_at = None
+        if self.photo_error is not None and now - self.photo_error[0] < self.PHOTO_ERROR_SETTLE_S:
+            return ("the camera just reported a photo error (%s) and is switching itself; wait %.0f s"
+                    % (self.photo_error[1], self.PHOTO_ERROR_SETTLE_S - (now - self.photo_error[0])))
         return None
 
     async def fresh_state(self, max_age: float = 1.5) -> None:
@@ -442,6 +483,13 @@ class Camera:
             return
         if rep.result not in ("err_busy", "err_critical"):
             return
+        if rep.result == "err_critical" and ("value=playmode" in q or "value=recmode" in q):
+            # every camcmd play/recmode -> err_critical on record was followed by err_busy
+            # until a power cycle: 2026-10-11 22:01:18 and 22:45:28, 2026-10-12 11:56:17,
+            # 2026-10-15 09:03:12 (playmode; the oneshot_af at 09:08:33 then err_busy x5)
+            self._mark_wedged("camcmd %s -> err_critical" % ("playmode" if "value=playmode" in q
+                                                               else "recmode"))
+            return
         self.busy_streak += 1
         # cmd() retries err_busy 5 x 1 s, so 10 = two commands that exhausted
         # LUMIX Sync's whole retry budget while the body is not reported busy
@@ -452,6 +500,7 @@ class Camera:
         if self.wedged or self.body_busy:
             return
         self.wedged, self.wedged_since = True, time.time()
+        self._gone_since_wedge = False
         self.log_event("warn", "camera is stuck answering err_busy to camcmd/startstream "
                                "(shutter, video, mode switch, live view; seen on %s). Only a "
                                "camera power cycle clears it." % why, wedged=True)
@@ -558,6 +607,8 @@ class Camera:
                     await self.listener.unsubscribe()
                 self.listener.sid = None
                 msg = "camera powered off" if self.powered_off else _friendly_error(e, self.ip)
+                if self.wedged and _camera_went_away(e):
+                    self._gone_since_wedge = True    # off / off the network: a power cycle may follow
                 self._set_status("reconnecting", msg)
                 self.log_event("conn", "connection lost: %s" % msg)
                 if failures >= 3 and not self.ip_fixed:
@@ -680,11 +731,20 @@ class Camera:
         self.liveview.camera_ip = ip
         self._settle_open = False
         self.busy_streak = 0
-        self.wedged, self.wedged_since, self.body_busy = False, None, False
+        self.body_busy = False
+        self.capture_pending_at = None
         self._lv_running = False
         self.readonly, self._readonly_idle_since = None, None
         # 1. device description (also proves the camera is there)
-        raw = await t.get_raw(self.cfg.upnp_port, discovery.DDD_PATH, timeout=6)
+        try:
+            raw = await t.get_raw(self.cfg.upnp_port, discovery.DDD_PATH, timeout=6)
+        except BaseException:
+            if self.wedged:
+                self._gone_since_wedge = True    # off / off the network: a power cycle may follow
+            raise
+        if self.wedged and self._gone_since_wedge:
+            self.log_event("conn", "camera was away since it got stuck; assuming it was switched off and on")
+            self.wedged, self.wedged_since = False, None
         ddd = parse_ddd(raw)
         if self.cfg.udn and ddd.get("UDN") and ddd.get("UDN") != self.cfg.udn:
             if not self.ip_fixed:
@@ -730,6 +790,10 @@ class Camera:
         # paused interval run and the recmode after it wedged the camera.
         await self._refresh_state(strict=True)
         busy = self.mid_operation()
+        if self.wedged and not busy:
+            # same body, never off the network since it got stuck: a reconnect doesn't
+            # clear the wedge, and a playmode/SUBSCRIBE into it only collects err_busy
+            busy = WEDGED_READONLY
         if busy:
             await self._readonly_setup(t, busy)
             return
@@ -857,7 +921,7 @@ class Camera:
         ~5 s 'off' finish window). Not verified on the body yet: the SUBSCRIBE +
         live view start right after an interval run ends
         (scripts/real-verify-interval-restart.sh checks it)."""
-        why = self.mid_operation()
+        why = self.mid_operation() or (WEDGED_READONLY if self.wedged else None)
         if why or self.state.get("interval_status") == "off":
             if why and why != self.readonly:
                 self.readonly = why
@@ -1286,6 +1350,8 @@ class Camera:
             if old and old.get("rec") != new.get("rec"):
                 self.rec_started_at = time.time() if new.get("rec") == "on" else None
                 self.log_event("rec", "video recording %s" % ("started" if new.get("rec") == "on" else "stopped"))
+            if old.get("remaincapacity") != new.get("remaincapacity"):
+                self.capture_pending_at = None
             if old and old.get("remaincapacity") != new.get("remaincapacity"):
                 self.log_event("state", "remaining shots %s -> %s" % (old.get("remaincapacity"),
                                                                        new.get("remaincapacity")))
@@ -1414,6 +1480,7 @@ class Camera:
                 # 16:48:32, 16:50:02: capture -> ok, err_rec ~3.7 s later, no photo
                 # written (remaincapacity unchanged), the body drops to playback
                 self.photo_error = (time.monotonic(), value)
+                self.capture_pending_at = None
                 self.log_event("warn", "camera reports a photo recording error (%s): no photo "
                                        "was written" % value)
             if name != "X_Panasonic_Cam_Sync":
@@ -1531,6 +1598,7 @@ class Camera:
                                        "drive to Single (the shutter would start the camera's own "
                                        "interval run)")
             await self._wait_card_write()
+            t_sent = time.monotonic()
             r = await self.cmd("camcmd", value="capture", timeout=15)
             self.log_event("cmd", "capture -> %s" % r.result)
             # the camera needs a moment to write; watch remaincapacity / sd_access
@@ -1541,8 +1609,16 @@ class Camera:
                 if self.state.get("remaincapacity") != before:
                     changed = True
                     break
+            if r.result == "ok" and not changed and not self._photo_error_after(t_sent):
+                self.capture_pending_at = t_sent
+                self.log_event("warn", "capture accepted but no photo written yet; rec/play switches wait "
+                                       "until it is (or the camera reports an error)")
             return {"result": r.result, "remain_before": before,
-                    "remain_after": self.state.get("remaincapacity"), "count_changed": changed}
+                    "remain_after": self.state.get("remaincapacity"), "count_changed": changed,
+                    "pending": self.capture_pending_at is not None}
+
+    def _photo_error_after(self, t: float) -> bool:
+        return self.photo_error is not None and self.photo_error[0] >= t
 
     CARD_WRITE_WAIT_S = 8.0
 

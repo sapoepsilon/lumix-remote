@@ -1999,6 +1999,7 @@ async function bleWake() {
   if (wake.ok) { haptic([8, 30, 8]); toast("Camera is waking up; reconnecting over Wi-Fi"); }
   else if (btleStuck(wake.data, wake.error)) toast(wake.error, true);
   else if (wake.data && wake.data.refused) toast("The camera refused remote wake-up; see the hint", true);
+  else if (wake.data && wake.data.on_wifi) toast("Not sent: the camera is on Wi-Fi already", true);
   else toast("Bluetooth wake failed: " + wake.error, true);
   renderWake();
 }
@@ -2069,6 +2070,11 @@ function renderWake() {
       box.className = "wake-state callout warn";
       box.replaceChildren(el("b", {}, "The camera refused to turn on remotely"),
         el("span", {}, wake.data.hint || "Make sure it isn't busy, then try again."), wakeDetails());
+    } else if (wake.data && wake.data.on_wifi) {
+      // the server refused: the camera answers on Wi-Fi, and a BLE wake then makes it drop us or refuse
+      box.className = "wake-state callout warn";
+      box.replaceChildren(el("b", {}, wake.data.wedged ? "The camera is on Wi-Fi but stuck" : "The camera is on Wi-Fi already"),
+        el("span", {}, wake.error), wakeDetails());
     } else if (wake.needPair) {
       box.className = "wake-state callout warn";
       box.replaceChildren(el("b", {}, "Couldn't turn it on. This computer may not be paired over Bluetooth"),
