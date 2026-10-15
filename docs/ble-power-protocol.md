@@ -21,7 +21,7 @@ Tags: **[APK]** = read from LUMIX Sync code. **[S5]** = seen on our DC-S5 (fw 2.
   - Our failing 2026-10-12 23:19 wake started from state 6 `sleep_pow_off_fast`, and we asked for STA anyway.
 - **When the camera is asleep, LUMIX Sync is built around two BLE connections, not one.** It connects once to wake the body. Then it waits for the camera to advertise `wakeup` (2) and connects again to run the Wi-Fi request (`HomeActivity.java:1230-1259`). Our only "split" success, runs B → C at 13:18/13:26 on 2026-10-12, followed exactly this shape.
 - **The camera reports the result of the Wi-Fi start command on `e182ec41`.** `01` means "Due to the state of the camera, this function cannot be used" [APK]. On macOS every CCCD write fails with "attribute not found", but the camera's notifications arrive anyway (bleak keeps the callback): `18345be1` acks on every wake, and on 2026-10-15 09:09:40 `e182ec41 = 01` with 0/10 subscriptions on (section 9). `e182ec43` and `4cf487c0` have not been seen yet.
-- **There is no BLE power-off for the S5.** The app's only power-off on this generation is Wi-Fi `camcmd poweroff`. A BLE power command (`96c82c33`) exists only on newer bodies.
+- **There is no BLE power-off for the S5, and none in LUMIX Sync at all.** Every "Power OFF" ends in Wi-Fi `camcmd poweroff` over an already-open Wi-Fi session. The `96c82c33 = 03` write on newer bodies is only a pre-check; the camera's answer opens the same Wi-Fi confirm dialog (section 10).
 
 ---
 
@@ -40,7 +40,7 @@ Write types (`I5/g.java:2023-2112`, the same table as `I5/e.java:365-442`):
 | 12 | `18345be0` (5ae57260) | STA SSID, 32 bytes NUL-padded |
 | 16/17 | `bb5d2a8c` / `7b61774f` | XOR-encoded id/name, "APS" bodies only (not S5) |
 | 39 | `7be5fd56` (7be5faae) | BT remote controller: 1 confirm, 2 start, 3 finish |
-| 42 | `96c82c33` (6b005f20) | auto-transfer control; `03` used as a power-off in auto-transfer mode, newer bodies only (`HomeAppSettingActivity.java:191`). **Not in the S5 GATT table.** |
+| 42 | `96c82c33` (6b005f20) | auto-transfer (ImageTransferEx) control, newer bodies only. `02` from four call sites; `03` only as the power-off pre-check (`HomeAppSettingActivity.java:191`), answered on `a31a7a87` (section 10). **Not in the S5 GATT table.** |
 
 Read types (`I5/g.java:1508-1592`):
 
@@ -135,7 +135,7 @@ Purposes 1/6 (auto-transfer, camera-initiated via `e182ec43`):
 - This is not a remote-shooting path. Our `e182ec40 = 01` runs were using the transfer purpose.
 
 ### (d) Power OFF
-- No BLE power-off on the S5. The app's "Power OFF" (`HomeAppSettingActivity.java:191-194`) writes `96c82c33 = 03` only on bodies with the ImageTransferEx characteristic `a31a7a87`. Otherwise it asks for confirmation and uses Wi-Fi `cam.cgi?mode=camcmd&value=poweroff` (`view/setting/a.java:28`).
+- No BLE power-off on the S5. The app's "Turn off the camera" (`HomeAppSettingActivity.java:186-197`) writes `96c82c33 = 03` only when the BLE link is in purpose `01` (auto-transfer) **and** the body has the ImageTransferEx characteristic `a31a7a87`. Even then the write is a pre-check: the camera's `a31a7a87` answer (`2`/`3`) opens the same confirm dialog. Every path ends in Wi-Fi `cam.cgi?mode=camcmd&value=poweroff` (`view/setting/a.java:28`). The entry is only shown while a Wi-Fi camera is connected (`HomeAppSettingActivity.java:337-342`). Full trace in section 10.
 - Panasonic help for another body (BGH1): "If you turn off the camera by pressing the camera ON/OFF button on the camera, [Remote Wakeup] will not work." [doc]. For S5-class bodies the help says to set the switch to OFF [doc].
 
 ### (e) Keepalive and boot wait
@@ -376,6 +376,126 @@ Trace: `/tmp/lumix-server.log` (ble.trace lines 09:09:28-09:11:11) and `logs/cam
 - Why the camera refused: it was already on Wi-Fi in a session with us (req_acc ok at 09:09:33) and stuck (playmode `err_critical` at 09:03:12, camcmd `err_busy` since). The APK maps `01` to `msg_cannot_restart_remote_wakeup`: "Due to the state of the camera, this function cannot be used. Make sure the camera is not in operation. When connected to the camera via Wi-Fi, check the connection access point in the Wi-Fi settings." In the remote purposes it resets the purpose and shows that dialog (`HomeActivity.java:1097-1121`, runnable `e` → `ON_BT_CANNOT_REMOTE_WAKEUP`, `T5/b.java:2232`); no retry, no other purpose. Which camera states produce `01` is decided by the body; the APK only shows the generic text.
 - After the refusal the camera left the network (getstate timeout 09:09:47, then Host is down).
 - BLE wakes while the camera is on Wi-Fi did harm every time: 08:29:26 and 08:53:13 `e182ec40=03` → `getstate err_reject` 4 s / 2 s later (the camera dropped our session); 09:09:40 refused. The server and `lumix-ble wake` now refuse a wake while the camera answers `:60606` (`on_wifi`, HTTP 409; `--even-if-on-wifi` overrides; the power cycle checks the camera is off first).
+
+## 10. Power off on the DC-S5
+
+2026-10-15, read-only. LUMIX Sync 2.0.17 (same APK as above, sha256 re-checked), Java from jadx `sources/`, resources from a separate jadx resource decode (`res/`). Nothing was sent to the camera. GATT reference: our S5 dump taken 2026-10-15 10:03 (9 services, 41 characteristics, identical before and after login; no `96c82c33`, no `a31a7a87`; service `6b005f20` holds only `48669da0`, `da989c59`, `e1392720`).
+
+### Verdict
+- **LUMIX Sync has no BLE-only power-off for any body.** The only power-off request it sends is Wi-Fi `GET http://<camera-ip>/cam.cgi?mode=camcmd&value=poweroff` on the Wi-Fi session that is already open.
+- **On the S5 the path is pure Wi-Fi.** The app writes nothing over BLE for power-off, and the menu entry is hidden unless a Wi-Fi camera is connected.
+- **The previous pass was wrong about the gate.** It is not `rec=on` and `warn_disp=interval_fail`. Those are same-named obfuscated getters in the Wi-Fi `getstate` parser (`p188x5/C2210i.java:284-290, 415-421`). The real gate is BLE purpose `01` plus the presence of `a31a7a87`, see below.
+
+### Call graph, string to wire
+1. Strings: `s_09004` "Turn off the camera" (`res/values/strings.xml:1514`), `s_09019` "Turn OFF the connected device?" (`:1528`), `s_09020` "Power OFF" (`:1529`), `s_09071` "Some images have not been transferred to the smartphone.\nTurn OFF the connected device?" (`:1577`). `ply_action_camera_power_off`, `setup_ask_camera_power_off` and `setup_btn_power_off` (`:951, 1760, 1770`) are referenced only from `R.java`. No layout or code uses them, so they are dead.
+2. Home screen: the menu button `svg_home_menu_btn` has `android:onClick="onClickMenu"` (`res/layout/activity_guidance_menu_list.xml:85-86`). `HomeActivity.onClickMenu` starts `HomeAppSettingActivity` (`HomeActivity.java:4757-4761`).
+3. `s_09004` is used only by the preference `ImageApp.Power.Off` in `res/xml/home_app_setting_preference_activity.xml`. No layout references it.
+4. Visibility: in `onResume` the entry is removed when `H5.b.a()` (the current Wi-Fi camera, a `u5.c`) is null (`HomeAppSettingActivity.java:337-342`, `H5/b.java:15-17`). That object is set only when a Wi-Fi device is connected (`ImageAppTotalService.java:636, 1001`, `HomeActivity.java:2477`, `service/a.java:442`, `service/c.java:567`). It is cleared after a successful power-off (`HomeAppSettingActivity.java:464`).
+5. Tap: the click listener `e` (`HomeAppSettingActivity.java:186-197`, bound at `:296`) runs:
+   - `if (U.b0() && U.l0())` → `U.O(42, {03})`, which is a BLE write of `96c82c33 = 03` (`:190-191`, `H5/a.java:64`, `I5/g.java:2087-2090`).
+   - else → dialog `ON_POWER_OFF_SELECT` (`:194`).
+6. Dialog `ON_POWER_OFF_SELECT` maps to case 199 (`T5/b.java:851`): "Turn OFF the connected device?", positive button "Power OFF" (`s_09020`), negative "Cancel" (`T5/b.java:2096-2099`).
+7. Positive button → `t()` case 2 (`HomeAppSettingActivity.java:603-613`). It sets `NoDeviceDisconnectedMessageKey = true` and calls `view/setting/a.H()`.
+8. `a.H()` starts a thread (`view/setting/a.java:40-42`). If the current camera `i()` is true (`CPRemoteView` and not `MovieRemote`, which covers DSC/ILC bodies like the S5; `p166u5/c.java:118-120, 130-145`), it calls `B5.a.n(null, "poweroff", null)` (`a.java:21-28`).
+9. The URL is `"http://" + ip` + `/cam.cgi?mode=camcmd&value=poweroff` (`B5/a.java:167, 1016-1017`, `B5/n.java:15-29`). It uses the session's normal HTTP client, so the `User-Agent: LUMIX Sync` and `X-SESSION_ID` rules of `docs/lumix-sync-wifi-flow.md` §1 apply.
+10. Result (`HomeAppSettingActivity.java:93-104`):
+    - `ok` → `b2()`: stop the Wi-Fi watcher thread (`service/c.java:761-776`), clear the current device, finish (`HomeAppSettingActivity.java:459-467`).
+    - `err_temperature` → CFexpress temperature dialog.
+    - Anything else → `ON_CAMERA_SETTING_NET_ERROR`.
+    - Nothing is written over BLE afterwards.
+
+**Q1, Home vs settings "Power OFF":** it is the same path. Home → menu → "Turn off the camera" is the only entry point (`HomeAppSettingActivity` is its only listener). "Power OFF" is the confirm button of that dialog. No other screen issues `camcmd poweroff` or `96c82c33 = 03`. The only other `O(42, …)` calls write `02` (`HomeActivity.java:3189`, `P5/e.java:234`, `N5/l.java:98`, `RecursiveSettingActivity.java:200`).
+
+### Q2, the gate: per-session BLE capability, not a model table
+- `U` is the BLE service proxy `com.panasonic.jp.service.e` (`P5/b.java:42`).
+- `b0()` → `service/g.java:777-783` → `ImageAppTotalService.R()` (`:1071-1073`) → `I5/g.y0()` = current purpose is `01` (auto-transfer) (`I5/g.java:2176-2178`).
+- `l0()` → `service/g.java:963-969` → `ImageAppTotalService.b0()` (`:1123-1125`) → `I5/g.H0()` = `f2750z` (`I5/g.java:1470-1472`).
+- `f2750z` is set at service discovery: true if enabling notify on `a31a7a87` in service `6b005f20` does not return `No_GattChar` (`I5/g.java:1147`, `I5/e.java:293`, notify table `I5/g.java:1594-1668`, type 43 at `:1607-1608`). The capability record names it `isImageTransferExSupported` (`I5/e.java:250`). It is reset to false on disconnect (`I5/g.java:1099`).
+- No model-name table, firmware version or capability characteristic takes part in this decision. The only model check is the Wi-Fi `ddd` class in step 8.
+- **DC-S5 result:** `a31a7a87` is absent, so `l0()` is false. The tap always goes straight to the Wi-Fi confirm dialog, whatever the BLE purpose. [APK + S5 GATT]
+
+What `96c82c33 = 03` does on bodies that have it [APK; meaning of the bytes partly inferred]:
+- The camera answers on the `a31a7a87` notify, which is forwarded as `w(value)` (`I5/g.java:558-566`). Value `4` also sets purpose `01`.
+- `2` → the same `ON_POWER_OFF_SELECT` dialog (`view/setting/b.java:261-263, 128-135`).
+- `3` → dialog 291 `s_09071` "Some images have not been transferred…" (`view/setting/b.java:265-268`, `T5/b.java:1219, 2545-2549`).
+- Both positive buttons land in `HomeAppSettingActivity.t()` cases 2/3, which is the same `camcmd poweroff` (`HomeAppSettingActivity.java:608-612`).
+- So `03` is a "may I power off / are transfers pending?" query [?]. Power-off itself is still Wi-Fi.
+
+### Q3, the S5 sequence
+- The power-off path never wakes the camera or starts Wi-Fi. It has no BLE write, no purpose byte and no `accctrl` of its own.
+- It needs a Wi-Fi session that is already up. To get one the user goes through the normal connect flow:
+  - BLE purpose `03` (STA) or `05` (SoftAP, `_fast` sleep states): sections 3(a)-(c).
+  - Then `ddd` → `accctrl req_acc` and the rest of `lumix-sync-wifi-flow.md` §3-4.
+- Then the only power-off traffic is the one GET.
+- **No purpose byte means "power off".** `e182ec40` is written only with `01`, `03`, `05`, `06`:
+  - via `m0()` from `HomeActivity`/`InformationContentActivity`/`liveview/h` (constants `H5/a.java:7-25`);
+  - `03` directly at `CameraSettingActivity.java:625`;
+  - `01`/`06` at `HomeActivity.java:4072-4074`, `PlayActivity.java:643`.
+  - `a1()` accepts `02`/`04` (`I5/g.java:1690-1720`), but no caller sets them.
+- `0d6f1880` is written only with `01`, `02`, `03` (`I5/g.java:354-357, 436-463, 485-488, 649, 737, 795, 814, 839`, `CameraSettingActivity.java:560`).
+- So nothing in the app suggests a purpose that makes the camera power itself off after BLE. Whether firmware accepts an undocumented `e182ec40` value is unknown and not testable from the APK [?].
+
+### Q4, every characteristic in our S5 dump vs the app
+Types are from the write table `I5/g.java:2023-2112`, the read table `:1508-1592` and the notify table `:1594-1668`. **W** = the app writes it. Nothing the app writes is a power, sleep or shutdown command.
+
+| service | characteristic | props on S5 | app use |
+|---|---|---|---|
+| 054ac620-…ac0d | `03e23a31` | read | read type 35, INITIAL_INFORM (XOR key) |
+| | `8d08a420` | write | **W** type 1, MEI0 client id |
+| | `cd7a71a0` | write | **W** type 2, friendly name |
+| | `69e4d998` | read | not referenced |
+| | `e182ec40` | write | **W** type 4, Wi-Fi purpose `01/03/05/06` |
+| | `e182ec41` | notify | type 31, result of `e182ec40` |
+| | `e182ec42` | notify | type 32, forwarded to UI (`I5/g.java:576-581`) |
+| | `e206a5c0` | read | read type 5, camera AP SSID |
+| | `a09fad60` | read | not referenced |
+| | `c97cf1a5` | read | read type 6, camera AP password |
+| | `e182ec43` | notify | type 14, camera-initiated Wi-Fi request |
+| 1d74afe0 | `daff1bc0` | write | **W** type 7, GPS fix |
+| | `37701b80` | notify | type 8, GPS start/stop/send |
+| 34738720 | `ead55e60` | write | **W** type 9, clock |
+| | `4cf487c0` | notify | type 10, camera asks for the clock |
+| 5ae57260 | `0d6f1880` | write | **W** type 11, connect type `01/02/03` |
+| | `18345be1` | notify | type 30, connect-type ack |
+| | `18345be0` | write | **W** type 12, STA SSID |
+| 6b005f20 | `48669da0` | notify | type 13, auto-transfer start/stop (`I5/g.java:515-530`) |
+| | `da989c59` | notify | **not referenced anywhere** |
+| | `e1392720` | read | read type 15, camera IP (transfer purposes) |
+| 7ddc40a0 | `76a2dbc0`, `f90c0fe0`, `0aad9ca0`, `36d3228b`, `1b7ff948`, `7beca6bb` | write | not referenced |
+| | `20f5fffc` | read | not referenced |
+| | `3d22c6be` | read | read type 34, "DAC" string saved to prefs (`I5/g.java:754-760`) |
+| f3b05360 | `cb6b7580`, `9ec00600`, `c73ed840`, `5d346ea0` | write | not referenced |
+| | `9c781c60` | read | not referenced (we read it for the saved SSID) |
+| | `d611b4a0` | notify | type 25, CCCD enabled, no UUID handler |
+| | `da534d0a` | notify | type 29, CCCD enabled, no UUID handler |
+| 054ac620-…0001 | `054ac621/622/623` | read | read types 36/37/38, info |
+| 7be5faae | `7be5fd56` | write | **W** type 39, BT remote controller `01` confirm / `02` start / `03` finish (`HomeActivity.java:4699, 5659, 4425`) |
+| | `7be5fe6e` | notify | type 40, remote-controller ack |
+
+- 15 of the 41 S5 characteristics never appear anywhere in the APK, including 11 writable ones in `7ddc40a0` and `f3b05360`.
+- Any S5 power function there would be undocumented. Probing unknown writables on the real body risks wedging it, so it is not recommended.
+- Characteristics the app knows in `6b005f20` that the S5 lacks: `96c82c33` (W type 42), `a31a7a87` (notify type 43), `c37c7e8d` (read type 41).
+
+### Q5, wedged or busy camera
+- `camcmd` is tried at most 5 times, 1 s apart, on no HTTP reply or `err_busy`. It stops at once if the app has flagged Wi-Fi as disconnected (`B5/a.java:155-157, 1016-1041`, `H5/b.java:19-21`).
+- After that the last result goes to the dialog logic. `err_busy` and anything else except `ok`/`err_temperature` → "network error" dialog (`HomeAppSettingActivity.java:93-104`).
+- If no attempt got any reply, `n()` returns null and `view/setting/a.java:31` calls `.g()` on it. Reading the code, that is a NullPointerException on the worker thread (an app crash) [APK, inference].
+- There is no BLE fallback, no Remote Wakeup retry and no alternative command.
+- A wedged S5 can't be powered off by LUMIX Sync. The hand switch is the only documented way out.
+
+### Minimal real-device test (proposed, not run)
+Pre: switch ON, Bluetooth paired with Remote Wakeup ON, camera idle (not wedged).
+
+| step | what | pass |
+|---|---|---|
+| 1 | Our normal BLE wake (purpose `03`, STA, as run C in section 4) | Camera on the LAN |
+| 2 | `ddd` → `accctrl req_acc` → one `getstate` | `ok` |
+| 3 | `GET /cam.cgi?mode=camcmd&value=poweroff` | `<result>ok</result>` |
+| 4 | Watch the advertisement state byte for 60 s | It moves into the sleep group, and `:60606`/`getstate` stops answering |
+| 5 | BLE wake again | The camera comes back, so Remote Wakeup survives a remote power-off |
+
+- Step 3 matches the 2026-10-12 14:29 run in section 4. That run powered off over Wi-Fi with the switch ON, but the state byte was not logged; step 4 is the missing data.
+- Optional variant: send step 3 without step 2. It tells whether `camcmd` needs an accepted session. LUMIX Sync always has one.
 
 ## Sources
 - Panasonic LUMIX Sync help, Remote Wakeup (Camera Power Operations): https://av.jpn.support.panasonic.com/support/global/cs/soft/lumix_sync/en/DC-S5M2/adv_rem_wu.html
