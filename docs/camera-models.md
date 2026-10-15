@@ -59,7 +59,7 @@ preset, BLE, onboarding UI) reads the profile instead of hard-coding the S5.
    shows them verbatim, with `detail` as the grey second line).
 5. Keep `verified=False` until someone ran it end to end on the body (connect,
    live view, capture, Auto on/off, files). The UI marks unverified profiles.
-6. Add a test in `tests/test_models.py` (selection by `modelNumber`, handshake).
+6. Check selection by `modelNumber` and the handshake on the real body (`scripts/real-camera-smoke.sh`).
 
 ```python
 """Panasonic Lumix DC-XXXX (firmware x.y). Sources: ..."""

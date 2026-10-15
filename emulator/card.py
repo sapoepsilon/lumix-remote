@@ -4,7 +4,7 @@ Object ids, titles, URL prefixes (DO original, DT thumbnail, DL large preview),
 protocolInfo strings, the fixed fake ``size`` attributes on DT/DL (5000 and
 100000, as the real S5 reports them) and the time-lapse containers
 (``<id>DIR`` with ``pana:X_RecGroupType=Interval``) follow the recorded S5
-Browse replies in tests/fixtures/s5_cds_*.xml.
+Browse replies in evidence/real-s5/s5_cds_*.xml.
 
 File bodies are generated on demand and support random access (Range):
 a real JPEG (or a container header) followed by a deterministic filler, the

@@ -128,13 +128,13 @@ flight, and avoids the command patterns that wedge the S5. Notes:
 
 No camera? `emulator/` is a fake DC-S5 that speaks the same protocol (cam.cgi,
 UPnP, GENA events, files, UDP live view) and reproduces the real body's failure
-modes, so the server and UI can be developed and tested without hardware:
+modes, so the server and UI can be developed and demoed without hardware
+(verification happens on a real camera, see below):
 
 ```sh
 .venv/bin/python -m emulator          # cam.cgi :8080, upnp :60606, files :50001
 LUMIX_REMOTE_HOME=/tmp/lumix-emu ./run.sh --camera emu --camera-ip 127.0.0.1 \
   --camera-http-port 8080 --camera-upnp-port 60606 --camera-files-port 50001
-.venv/bin/python -m unittest discover -s tests   # 165 tests, no camera needed
 ```
 
 Details: [docs/emulator.md](docs/emulator.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -473,24 +473,13 @@ back to shooting. It stops at the first sign of a wedge, someone using the body,
 an `err_*` answer, a running timelapse/import or a camera that doesn't connect,
 and then sends nothing more. Log in `logs/smoke-*.log`.
 
-### Tests
+### Verification
 
-```sh
-.venv/bin/python -m unittest discover -s tests
-```
-
-`tests/test_qa_regressions.py` holds the regressions from the emulator QA pass
-(`docs/qa-matrix.md`): camera restart between keepalives, stopstream
-discipline, Auto refused, shooting while browsing, forget/fixed IP, shutdown
-with open browser tabs, readable errors.
-
-`tests/test_cli.py` runs every CLI command against a fake server (aiohttp in a
-background thread), including the WebSocket feed and `server start/stop` with a
-stand-in `run.sh`; no camera needed.
-`tests/test_timelapse_emu.py` runs the real server app against an in-process
-emulator (ephemeral ports, ~90 s): both timelapse engines, busy windows,
-reconnect mid-run via `/emu/power-cycle`, resume after a server restart (clean
-and crashed), import checkpoint + Range resume, power-off quiesce and resume.
+Changes are verified on a real camera only: `scripts/real-camera-smoke.sh`
+(above), `scripts/real-verify-*.sh`, the Bluetooth wake experiment
+(`tools/ble-wake-experiment.py`) and the checklist in
+[docs/qa-real-s5.md](docs/qa-real-s5.md). Real-camera traces cited in the code
+and docs are in `evidence/real-s5/`.
 
 ## HTTP API
 
@@ -684,11 +673,9 @@ lumixcli/         `lumix` command line client (HTTP API only)
 macos/            "Lumix Remote Camera.app" + CoreMediaIO camera extension (webcam; XcodeGen
                   project.yml, built by scripts/build-webcam.sh)
 bin/lumix         CLI wrapper (uses .venv)
-tests/            unit tests: real S5 menu dumps, CLI against a fake server, profiles,
-                  registry/migration, multi-camera routing; test_timelapse_emu.py runs
-                  the server against the emulator (timelapse engines, quiesce)
+evidence/real-s5/ real-camera traces and S5 menu/browse dumps cited by the code and docs
 docs/             protocol research notes
-tools/            stand-alone protocol probe
+tools/            stand-alone protocol probe, BLE wake experiment
 ```
 
 ### Connection sequence (what the server does)

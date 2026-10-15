@@ -25,7 +25,7 @@ the UDP port.
 | `qvga` | 320x184 | 21.5-21.6 | 12.9-13.1 | 1 per frame, ~13.5 KB, 10 IP fragments | yes: 0 unparsable, 0 lost fragments |
 
 Measured with `/api/liveview/stats` counters and 20-60 s reads of
-`/api/liveview.mjpg` (evidence: `tests/fixtures/real-s5-liveview-quality-2026-10-12.json`).
+`/api/liveview.mjpg` (evidence: `evidence/real-s5/real-s5-liveview-quality-2026-10-12.json`).
 On 2026-10-11 the same `vga` stream ran at about 26 fps. The rate is set by the
 camera and its Wi-Fi link, not the Mac. Frames come in bursts: about 0.6 s of
 frames, then a ~0.73 s gap, at both sizes. Pinging the camera took 5-800 ms

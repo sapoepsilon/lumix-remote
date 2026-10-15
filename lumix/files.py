@@ -857,7 +857,7 @@ class FileBrowser:
                 raise
         except Exception as e:
             if getattr(self.cam, "status", "ready") != "ready" and "not connected" in str(e):
-                # chaos seed 39 (tests/test_chaos.py ImportDuringReconnectTest): started
+                # chaos seed 39 (former chaos harness, ImportDuringReconnectTest): started
                 # or resumed while the camera (re)connects; wait for it, don't fail
                 job.state, job.paused_by, job.paused_at = "paused", "reconnect", time.time()
             else:

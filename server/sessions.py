@@ -99,7 +99,7 @@ class CameraSession:
         shutter after a drive-mode quick control, or the body's button). Without a
         job every command answered "stop the timelapse first" while
         /api/timelapse/stop had nothing to stop (chaos seed 2,
-        tests/test_chaos.py). The reconnect hook already adopts such a run; this
+        former chaos harness). The reconnect hook already adopts such a run; this
         does it as soon as getstate shows it. Nothing is sent to the camera."""
         cam, tl = self.cam, self.timelapse
         seen: Optional[float] = None

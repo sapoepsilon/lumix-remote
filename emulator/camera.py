@@ -129,7 +129,7 @@ class EmuConfig:
     # S5 on 2026-10-12, curmenu drivemode enable="no"; worked the evening before)
     drive_locked: bool = False
     # Real S5 2026-10-12 16:46-16:52 "photo fault" (logs/camera-2026-10-12.log
-    # lines 9450-9560 + the server's NOTIFY list; tests/fixtures/
+    # lines 9450-9560 + the server's NOTIFY list; evidence/real-s5/
     # real-s5-photo-fault-wedge-2026-10-12.log). Single drive, interval_status off,
     # 21 good shots @ 30 s, then: mod_Play + play with nothing but reads sent,
     # 13.2 s after the last good capture (16:46:24.6 -> 16:46:37.8, line 9460);
@@ -261,7 +261,7 @@ class EmuCamera:
         self.touch_on = False
         self.interval = {"armed": False, "research": False, "state": "enable", "remain": 0,
                          "group": None, "task": None}
-        # 2026-10-12 11:55 incident (tests/fixtures/real-s5-interval-restart-incident-2026-10-12.log): playmode into a paused
+        # 2026-10-12 11:55 incident (evidence/real-s5/real-s5-interval-restart-incident-2026-10-12.log): playmode into a paused
         # interval run -> ok; the next recmode -> err_critical and camcmd err_busy for
         # good; setsetting -> err_critical, then getsetting err_busy (curmenu still ok)
         self.interval_mode_switched = False
@@ -698,7 +698,7 @@ class EmuCamera:
         iv = self.interval
         if iv["state"] == "rec" and value == "capture" and self._interval_drive():
             # real S5 2026-10-12 11:38:17: shutter during a run -> ok, the run starts
-            # over with the full image count (tests/fixtures/real-s5-interval-2026-10-12.log)
+            # over with the full image count (evidence/real-s5/real-s5-interval-2026-10-12.log)
             self._interval_stop("enable")
             self._interval_start()
             return self._xml("ok")
@@ -857,7 +857,7 @@ class EmuCamera:
         return d[0] == "stopmotion_interval" and d[1] in ("interval", "")
 
     def _interval_ctrl(self, value: str) -> Tuple[str, str, str]:
-        """Real DC-S5 fw 2.03 (2026-10-12, tests/fixtures/real-s5-interval-2026-10-12.log;
+        """Real DC-S5 fw 2.03 (2026-10-12, evidence/real-s5/real-s5-interval-2026-10-12.log;
         cancel's warn is not verified): ``set`` answers err_reject while
         interval_status is ``enable`` (armed by the drive mode); the shutter alone
         starts the run. Running = ``rec``; pause -> ``pause`` (+ warn

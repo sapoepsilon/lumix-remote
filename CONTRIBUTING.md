@@ -8,7 +8,6 @@ Thanks for helping. Bug reports, camera reports and pull requests are all welcom
 git clone https://github.com/sapoepsilon/lumix-remote.git
 cd lumix-remote
 ./run.sh --help                                  # creates .venv and installs aiohttp
-.venv/bin/python -m unittest discover -s tests   # full suite, no camera needed
 ```
 
 No camera? Use the emulator ([docs/emulator.md](docs/emulator.md)):
@@ -25,9 +24,8 @@ Bluetooth section).
 ## Pull requests
 
 - Keep changes focused; one feature or fix per PR.
-- Add or update tests in `tests/`. Protocol behaviour that only shows up on a real
-  body belongs in the emulator too, so it stays covered.
-- Run the whole suite before opening the PR.
+- Verify on a real camera (`scripts/real-camera-smoke.sh`, the `scripts/real-*.sh`
+  checks, [docs/qa-real-s5.md](docs/qa-real-s5.md)) and say in the PR what you ran.
 - Update the README or `docs/` when behaviour or the protocol notes change.
 - Be careful with commands that can wedge a camera (rapid `recmode` switching,
   `SUBSCRIBE` in rec mode); see "Known issues" in the README.

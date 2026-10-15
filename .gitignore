@@ -5,4 +5,5 @@ logs/
 probe-results/
 .DS_Store
 screenshots/*.tmp
-evidence/
+evidence/*
+!evidence/real-s5/

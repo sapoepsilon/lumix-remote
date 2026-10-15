@@ -27,7 +27,7 @@ LUMIX_REMOTE_HOME=/tmp/lumix-qa/home LUMIX_IMPORT_DEST=/tmp/lumix-qa/pictures \
 Evidence: screenshots `evidence/qa-*.png`, scenario transcripts and per-run
 rule checks `evidence/qa-logs/*.out|*.rules1|*.rules2` (emulator 1 / 2),
 CLI transcript `evidence/qa-logs/cli.out`, smoke-script run
-`evidence/qa-logs/smoke.out`, unit tests `evidence/qa-unittest.txt`
+`evidence/qa-logs/smoke.out` (the unit tests were removed on 2026-10-15)
 (`evidence/` is not committed).
 
 Result: **98 rows: 97 pass, 0 fail, 1 not run (B3, real Bluetooth)**. 33 of

@@ -3,7 +3,7 @@
 # camera traffic log (logs/camera-*.log), merged by time. OK getstates are not
 # written to the camera log (1 Hz noise); a request with no reply was not logged
 # at all before this fix. Scrubbed: camera name -> S5-XXXXXX, camera IP -> <cam>,
-# client id -> <id>, SSID payload -> <ssid>. tests/test_wake_settle.py models it.
+# client id -> <id>, SSID payload -> <ssid>.
 
 ## user pressed Power off in the UI
 14:28:42.431 GET stopstream -> ok

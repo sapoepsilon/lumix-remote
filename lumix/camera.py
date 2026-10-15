@@ -43,7 +43,7 @@ LUMIX_SYNC_UA = "LUMIX Sync"   # User-Agent LUMIX Sync sends on every cam.cgi re
 SESSION_PROBE = "mode=getsetting&type=touch_type"   # needs an accepted session
 MID_OPERATION = GUARD_RESULT                         # request withheld by the mid-operation guard
 # getstate interval_status while an in-camera interval run is going. Real DC-S5
-# fw 2.03: rec (running) and pause (tests/fixtures/real-s5-interval-2026-10-12.log);
+# fw 2.03: rec (running) and pause (evidence/real-s5/real-s5-interval-2026-10-12.log);
 # "run" is LUMIX Sync's name for other bodies (docs/lumix-sync-wifi-flow.md s10).
 INTERVAL_RUNNING = ("run", "rec", "pause")
 # A read-only connect completes (SUBSCRIBE, live view) once the camera has been
@@ -291,7 +291,7 @@ class Camera:
                 "end_time": st.get("interval_end_time") if self.interval_running else None}
 
     # ------------------------------------------------- mid-operation guard
-    # 2026-10-12 11:55 (real S5, tests/fixtures/real-s5-interval-restart-incident-2026-10-12.log): an in-camera interval
+    # 2026-10-12 11:55 (real S5, evidence/real-s5/real-s5-interval-restart-incident-2026-10-12.log): an in-camera interval
     # run was paused by the old quiesce, the reconnect sent camcmd playmode (ok),
     # recmode 34 s later -> err_critical, then err_busy for good; the job resume's
     # setsetting interval_shoot_interval -> err_critical. Only a power cycle
@@ -379,7 +379,7 @@ class Camera:
         pause|restart|stop, touch) always pass. The mode-switch rate limit
         sits in CamTransport itself (``ModeSwitchLimiter``)."""
         if self._settle_open and mode in ("camcmd", "stopstream"):
-            # chaos seed 14 (tests/test_chaos.py): a recmode that was waiting for the
+            # chaos seed 14 (former chaos harness): a recmode that was waiting for the
             # mode-switch cap went out inside a reconnect's switch window -> wedge
             why = "the camera is finishing the connection (its own switch after SUBSCRIBE)"
         elif mode == "camcmd" and value in MODE_SWITCHES:
@@ -815,7 +815,7 @@ class Camera:
         await self._subscribe_safely(ip)
         # the camera's switch window opens at the SUBSCRIBE, not before the playmode
         # (which may wait up to MODE_SWITCH_MAX_WAIT_S for the cap): chaos seeds
-        # 206/207, tests/test_chaos.py SettleCountsFromTheSubscribeTest
+        # 206/207, former chaos harness, SettleCountsFromTheSubscribeTest
         sub_at = max(sub_at, self._subscribed_at)
         await asyncio.sleep(0.2)
         # 4. read-only setup, as LUMIX Sync does it
@@ -869,7 +869,7 @@ class Camera:
         lens unpowered) and goes back to sleep when nothing reaches it for ~30 s: on 2026-10-12 14:30:12-14:30:41 we sent nothing
         while waiting (no mod_Play came; the body was already in play), the getstate
         after the wait got no reply and the camera was asleep again
-        (tests/fixtures/real-s5-ble-wake-settle-2026-10-12.log). getstate is a read
+        (evidence/real-s5/real-s5-ble-wake-settle-2026-10-12.log). getstate is a read
         and safe inside the switch window; only camcmd/stopstream wedge there.
         err_reject or 3 failed polls in a row = disconnected, as in the supervisor."""
         deadline = time.monotonic() + left
@@ -1215,7 +1215,7 @@ class Camera:
         if self._lv_running or not q.stopstream_only_if_running:
             # stopstream with no stream running answers err_critical on the S5;
             # clear the flag first so a concurrent stop_liveview() can't send a
-            # second one (chaos seed 98, tests/test_chaos.py NoDoubleStopstreamTest)
+            # second one (chaos seed 98, former chaos harness, NoDoubleStopstreamTest)
             self._lv_running = False
             await self.cmd("stopstream")
         await self._refresh_state()
@@ -1230,7 +1230,7 @@ class Camera:
             if self._last_recmode == RATE_LIMITED and lim is not None and self.liveview_wanted:
                 # withheld locally (never sent): run it once the cap allows instead
                 # of leaving the camera in the play mode we put it in (scenario 13,
-                # tests/test_chaos.py HeldBackRecmodeIsRetriedTest). A switch to
+                # former chaos harness, HeldBackRecmodeIsRetriedTest). A switch to
                 # play on the body clears this (_lv_pending = None on mod_Play).
                 self._lv_pending = "%s, after the mode-switch cap" % reason.split(", after")[0]
                 self._lv_pending_after = time.monotonic() + lim.wait_s() + 0.1
@@ -1625,7 +1625,7 @@ class Camera:
     async def _wait_card_write(self) -> None:
         """Pace the shutter on the card write: while getstate says sd_access on,
         the S5 answers a capture with err_busy (scenario 05: 6-9 of 10 presses in
-        5 s; tests/test_chaos.py ShutterBurstPacedOnCardWritesTest). Reads only."""
+        5 s; former chaos harness, ShutterBurstPacedOnCardWritesTest). Reads only."""
         deadline = time.monotonic() + self.CARD_WRITE_WAIT_S
         await self._refresh_state()
         while self.state.get("sd_access") == "on" and time.monotonic() < deadline:
@@ -1652,7 +1652,7 @@ class Camera:
                 return await self._video(True)
         waited = False
         if self._video_starts:
-            # scenario 07 (tests/test_chaos.py): start + stop sent together; the stop
+            # scenario 07 (former chaos harness): start + stop sent together; the stop
             # must land after the start, never before it
             waited = True
             with contextlib.suppress(asyncio.TimeoutError):

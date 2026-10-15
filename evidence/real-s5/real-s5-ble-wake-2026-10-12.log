@@ -1,7 +1,7 @@
 # Real DC-S5 (fw 2.03), power switch OFF, Bluetooth > Remote Wakeup ON, 2026-10-12.
 # bin/lumix-ble wake from macOS 26 (bleak 3, CoreBluetooth), stderr progress lines.
 # Scrubbed: camera name -> S5-XXXXXX, client ids -> <id-paired> / <id-new>,
-# home SSID payload -> <ssid>. tests/test_ble_session.py replays these.
+# home SSID payload -> <ssid>.
 
 ## run A 13:15:48  -- entry's client id had changed (<id-new>); camera knows <id-paired>
 [  2.33s] found S5-XXXXXX

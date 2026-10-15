@@ -5,7 +5,7 @@ Compiled 2026-10-13. Read-only study: nothing was sent to the camera for this do
 Sources:
 - LUMIX Sync for Android 2.0.17 (`com.panasonic.jp.lumixsync`, versionCode 20017009, sha256 `6986e22f…e377`, the same build as `docs/lumix-sync-wifi-flow.md`), decompiled with jadx 1.5.x and never installed or run. Class names are jadx/obfuscator names, cited as `file:line` in the jadx `sources/` tree. These are facts about the protocol, not copied code.
 - Panasonic Image App 1.10.14 (older app, readable names) for cross-checks.
-- Our BLE traces from 2026-10-11 to 2026-10-13: `tests/fixtures/real-s5-ble-wake*.log`, `probe-results/ble/advwatch*.txt`, the server log, and agent session logs. All are scrubbed here: `<id>` is our MEI0 client id, `<ssid>` is the home SSID payload, `<addr>` is the camera's BT address bytes.
+- Our BLE traces from 2026-10-11 to 2026-10-13: `evidence/real-s5/real-s5-ble-wake*.log`, `probe-results/ble/advwatch*.txt`, the server log, and agent session logs. All are scrubbed here: `<id>` is our MEI0 client id, `<ssid>` is the home SSID payload, `<addr>` is the camera's BT address bytes.
 - Panasonic's LUMIX Sync help pages (Remote Wakeup, Returning from Sleep Mode); links at the end.
 
 Tags: **[APK]** = read from LUMIX Sync code. **[S5]** = seen on our DC-S5 (fw 2.03). **[doc]** = Panasonic help text. **[?]** = inference.
@@ -361,9 +361,9 @@ Run against the real S5 on 2026-10-13 12:19-12:27 with `tools/ble-wake-experimen
 Real-device notes (2026-10-13):
 - The tool's own pre-wake snapshot was 6 s, so its `adv_state_before` was None from state 6 in both runs; it now uses the 100 s window.
 - The "new Wi-Fi network" fallback fired at ~35 s in both runs, including the run that never connected, so it was neighbour churn, not the camera AP. It was dropped from the summary and relabelled `fingerprint_churn` in the event log. No `S5-…` SSID was seen (SSIDs are redacted without Location permission).
-- Open: e182ec41/e182ec43/4cf487c0 stay invisible on macOS; the switch-OFF start case has not been run with this code yet.
+- Open (later corrected, section 9: e182ec41 does arrive): e182ec41/e182ec43/4cf487c0 stay invisible on macOS; the switch-OFF start case has not been run with this code yet.
 
-Not changed: `emulator/` has no BLE model; the BLE camera stub lives in `tests/test_ble_session.py`, extended only with behaviour cited above.
+Not changed: `emulator/` has no BLE model.
 
 ---
 
